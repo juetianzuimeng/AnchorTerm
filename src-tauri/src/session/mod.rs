@@ -1134,13 +1134,18 @@ pub async fn resize(
 async fn resize_inner(rt: &SessionRuntime, cols: u32, rows: u32) -> Result<(), AppError> {
     let cols = cols.max(20);
     let rows = rows.max(5);
-    let (prev_c, prev_r) = rt.term_size();
     rt.set_term_size(cols, rows);
 
-    // Skip no-op / tiny jitter resizes to avoid flooding the interactive shell
-    // with `stty` commands (was racing with user input after connect).
-    if prev_c == cols && prev_r == rows {
-        return Ok(());
+    // Skip if this size was already injected to the remote PTY.
+    // (Local cols/rows are set at connect *before* any stty — do not use those alone.)
+    {
+        let remote = rt
+            .remote_stty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *remote == Some((cols, rows)) {
+            return Ok(());
+        }
     }
 
     let (stdin, alive) = {
@@ -1167,13 +1172,18 @@ async fn resize_inner(rt: &SessionRuntime, cols: u32, rows: u32) -> Result<(), A
         *g = Some(Instant::now());
     }
 
-    // Best-effort remote stty (OpenSSH pipe has no SIGWINCH).
+    // Best-effort remote stty (OpenSSH pipe has no SIGWINCH). Echo is stripped
+    // in on_data via echo_suppress so the user never sees the control command.
     let cmd = format!("stty cols {cols} rows {rows} 2>/dev/null\r");
+    rt.arm_stty_echo_suppress(cols, rows);
     crate::ops_log::log(
         "SSH",
-        &format!("resize → remote stty cols={cols} rows={rows}"),
+        &format!("resize → silent remote stty cols={cols} rows={rows}"),
     );
     let _ = write_stdin(&stdin, &alive, cmd.as_bytes()).await;
+    if let Ok(mut g) = rt.remote_stty.lock() {
+        *g = Some((cols, rows));
+    }
     Ok(())
 }
 

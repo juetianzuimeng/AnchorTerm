@@ -737,29 +737,9 @@ async fn pump_stream<R: AsyncReadExt + Unpin>(
 }
 
 fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
-    crate::ops_log::log(
-        "ECHO",
-        &format!(
-            "remote sid={} len={} hex={} text=\"{}\"",
-            &session_id[..session_id.len().min(8)],
-            data.len(),
-            crate::ops_log::hex_preview(data, 96),
-            crate::ops_log::text_preview(data, 200)
-        ),
-    );
-    // PR2: object payload with session_id (frontend must route by id).
-    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
-    if let Err(e) = app.emit(
-        "session://data",
-        DataEvent {
-            session_id: session_id.to_string(),
-            data_b64: b64,
-        },
-    ) {
-        error!("emit data failed: {e}");
-        crate::ops_log::log("ERR", &format!("emit session://data failed: {e}"));
-    }
     let Some(state) = app.try_state::<AppState>() else {
+        // No state yet — emit raw (should be rare).
+        emit_data_raw(app, session_id, data);
         return;
     };
     let Ok(rt) = state.get_runtime(session_id) else {
@@ -772,9 +752,27 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
         );
         return;
     };
+
+    // Drop remote echo of our silent `stty` injects so the user never sees them.
+    let filtered = rt.filter_outgoing_echo(data);
+    if filtered.is_empty() {
+        return;
+    }
+
+    crate::ops_log::log(
+        "ECHO",
+        &format!(
+            "remote sid={} len={} hex={} text=\"{}\"",
+            &session_id[..session_id.len().min(8)],
+            filtered.len(),
+            crate::ops_log::hex_preview(&filtered, 96),
+            crate::ops_log::text_preview(&filtered, 200)
+        ),
+    );
+    emit_data_raw(app, session_id, &filtered);
+
     if rt.cwd_freeze.load(Ordering::SeqCst) {
-        // Still scan for failures? No — freeze means restore playbook owns cwd.
-        // OSC is ignored; optimistic rollbacks are irrelevant during freeze.
+        // Freeze means restore playbook owns cwd; ignore OSC / cd parse from output.
         return;
     }
     // Release cwd lock before snapshot() — snapshot also locks cwd (non-reentrant).
@@ -783,10 +781,24 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
             Ok(g) => g,
             Err(_) => return,
         };
-        cwd.feed_output(data)
+        cwd.feed_output(&filtered)
     };
     if let Some(ch) = change {
         apply_cwd_change(app, &rt, &ch);
+    }
+}
+
+fn emit_data_raw(app: &AppHandle, session_id: &str, data: &[u8]) {
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
+    if let Err(e) = app.emit(
+        "session://data",
+        DataEvent {
+            session_id: session_id.to_string(),
+            data_b64: b64,
+        },
+    ) {
+        error!("emit data failed: {e}");
+        crate::ops_log::log("ERR", &format!("emit session://data failed: {e}"));
     }
 }
 

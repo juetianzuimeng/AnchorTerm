@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +107,20 @@ pub struct SessionRuntime {
     pub rows: AtomicU32,
     /// Debounce remote `stty` injects (per session).
     pub last_stty: Mutex<Option<Instant>>,
+    /// Last (cols, rows) successfully injected to the remote PTY via `stty`.
+    /// Distinct from local `cols`/`rows` (set at connect before any inject).
+    pub remote_stty: Mutex<Option<(u32, u32)>>,
+    /// Strip our injected `stty …` line from the UI stream (remote line echo).
+    pub echo_suppress: Mutex<Option<EchoSuppress>>,
+}
+
+/// Pending filter for silent control injects (currently `stty` resize).
+pub struct EchoSuppress {
+    /// Exact command text without trailing CR/LF (as typed to the shell).
+    pub pattern: Vec<u8>,
+    /// Carry buffer for matches that span read chunks.
+    pub carry: Vec<u8>,
+    pub until: Instant,
 }
 
 impl SessionRuntime {
@@ -124,7 +138,41 @@ impl SessionRuntime {
             cols: AtomicU32::new(80),
             rows: AtomicU32::new(24),
             last_stty: Mutex::new(None),
+            remote_stty: Mutex::new(None),
+            echo_suppress: Mutex::new(None),
         }
+    }
+
+    /// Arm UI-stream filter before writing a silent `stty` inject.
+    pub fn arm_stty_echo_suppress(&self, cols: u32, rows: u32) {
+        let pattern = format!("stty cols {cols} rows {rows} 2>/dev/null").into_bytes();
+        if let Ok(mut g) = self.echo_suppress.lock() {
+            *g = Some(EchoSuppress {
+                pattern,
+                carry: Vec::new(),
+                until: Instant::now() + Duration::from_secs(3),
+            });
+        }
+    }
+
+    /// Remove injected control-command echo from bytes headed to the terminal UI.
+    pub fn filter_outgoing_echo(&self, data: &[u8]) -> Vec<u8> {
+        let mut g = match self.echo_suppress.lock() {
+            Ok(x) => x,
+            Err(e) => e.into_inner(),
+        };
+        let Some(state) = g.as_mut() else {
+            return data.to_vec();
+        };
+        if Instant::now() > state.until {
+            *g = None;
+            return data.to_vec();
+        }
+        state.carry.extend_from_slice(data);
+        let out = strip_echo_pattern(&mut state.carry, &state.pattern);
+        // Keep suppress armed for the full window so a second identical stty
+        // echo in the same burst is also dropped.
+        out
     }
 
     /// Snapshot for UI. Lock order: `meta` then `cwd`.
@@ -167,6 +215,50 @@ impl SessionRuntime {
             self.rows.load(Ordering::Relaxed).max(5),
         )
     }
+}
+
+/// Strip all occurrences of `pattern` plus following CR/LF from `carry`.
+/// Incomplete suffix of `pattern` is retained in `carry` across chunks.
+pub fn strip_echo_pattern(carry: &mut Vec<u8>, pattern: &[u8]) -> Vec<u8> {
+    if pattern.is_empty() {
+        return std::mem::take(carry);
+    }
+    let mut out = Vec::with_capacity(carry.len());
+    loop {
+        if let Some(pos) = find_slice(carry, pattern) {
+            out.extend_from_slice(&carry[..pos]);
+            let mut end = pos + pattern.len();
+            while end < carry.len() && (carry[end] == b'\r' || carry[end] == b'\n') {
+                end += 1;
+            }
+            let rest = carry[end..].to_vec();
+            *carry = rest;
+            crate::ops_log::log("SSH", "stty echo suppressed from UI stream");
+        } else {
+            // Keep only a *suffix* that is a prefix of `pattern` (possible incomplete match).
+            let max_keep = pattern.len().saturating_sub(1).min(carry.len());
+            let mut keep = 0;
+            for k in (1..=max_keep).rev() {
+                if carry.ends_with(&pattern[..k]) {
+                    keep = k;
+                    break;
+                }
+            }
+            let emit_len = carry.len() - keep;
+            out.extend_from_slice(&carry[..emit_len]);
+            let rest = carry[emit_len..].to_vec();
+            *carry = rest;
+            break;
+        }
+    }
+    out
+}
+
+fn find_slice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Process-wide app state: session map only (no UI focus).
@@ -287,5 +379,33 @@ mod tests {
             .map(|t| t.elapsed() < Duration::from_millis(800))
             .unwrap_or(false);
         assert!(a_recent);
+    }
+
+    #[test]
+    fn strip_stty_echo_single_chunk() {
+        let mut carry = b"hello\nstty cols 80 rows 24 2>/dev/null\r\nworld".to_vec();
+        let pat = b"stty cols 80 rows 24 2>/dev/null";
+        let out = strip_echo_pattern(&mut carry, pat);
+        assert_eq!(String::from_utf8_lossy(&out), "hello\nworld");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn strip_stty_echo_cross_chunk() {
+        let pat = b"stty cols 100 rows 30 2>/dev/null";
+        let mut carry = b"stty cols 100 ro".to_vec();
+        let out1 = strip_echo_pattern(&mut carry, pat);
+        assert!(out1.is_empty(), "incomplete pattern must not emit: {out1:?}");
+        carry.extend_from_slice(b"ws 30 2>/dev/null\r\nok");
+        let out2 = strip_echo_pattern(&mut carry, pat);
+        assert_eq!(String::from_utf8_lossy(&out2), "ok");
+    }
+
+    #[test]
+    fn filter_outgoing_echo_via_runtime() {
+        let rt = SessionRuntime::new("s");
+        rt.arm_stty_echo_suppress(120, 40);
+        let filtered = rt.filter_outgoing_echo(b"stty cols 120 rows 40 2>/dev/null\r\nprompt$ ");
+        assert_eq!(String::from_utf8_lossy(&filtered), "prompt$ ");
     }
 }

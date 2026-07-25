@@ -1307,6 +1307,8 @@ async function connectWithForm(opts: {
         view.applyState("connected", "已连接");
       }
     }
+    // Size sync: only via session://state "connected" → fitAndResize (silent stty).
+    // Avoid a second inject from this path (duplicate stty echo).
     requestAnimationFrame(() => view.fitAndResize());
     view.draftInput.focus();
     if (!opts.keepDialogOpen) {
