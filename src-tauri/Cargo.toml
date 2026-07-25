@@ -1,0 +1,37 @@
+[package]
+name = "anchorterm"
+version = "0.1.0"
+description = "SSH terminal client with reconnect and session state retention"
+authors = ["AnchorTerm"]
+edition = "2021"
+
+[lib]
+name = "anchorterm_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Use ring instead of aws-lc-rs to avoid NASM requirement on Windows.
+russh = { version = "0.62", default-features = false, features = ["flate2", "ring", "rsa"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "6"
+keyring = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+# Decrypt legacy OpenSSL PEM private keys (DES-EDE3-CBC), which russh does not load.
+des = "0.8"
+cbc = "0.1"
+md-5 = "0.10"
+hex = "0.4"
+data-encoding = "2"

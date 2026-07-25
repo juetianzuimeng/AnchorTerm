@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AnchorTerm</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <div id="app">
+      <header class="toolbar">
+        <div class="brand">AnchorTerm</div>
+        <div class="status" id="status-bar">
+          <span class="dot idle" id="status-dot"></span>
+          <span id="status-text">未连接</span>
+          <span class="cwd" id="cwd-text" title="远端工作目录"></span>
+        </div>
+      </header>
+
+      <aside class="sidebar" id="sidebar">
+        <section class="panel">
+          <h2>连接</h2>
+          <label>
+            主机
+            <input id="host" type="text" placeholder="192.168.1.10" autocomplete="off" />
+          </label>
+          <label>
+            端口
+            <input id="port" type="number" value="22" min="1" max="65535" />
+          </label>
+          <label>
+            用户名
+            <input id="username" type="text" placeholder="root" autocomplete="username" />
+          </label>
+          <label>
+            认证方式
+            <select id="auth-type">
+              <option value="password">账号密码</option>
+              <option value="public_key">私钥证书</option>
+            </select>
+          </label>
+          <div id="auth-password-fields">
+            <label>
+              密码
+              <input id="password" type="password" autocomplete="current-password" />
+            </label>
+            <label class="checkbox">
+              <input id="save-password" type="checkbox" />
+              保存密码到系统凭据库
+            </label>
+          </div>
+          <div id="auth-key-fields" class="hidden">
+            <label>
+              私钥路径
+              <input
+                id="private-key-path"
+                type="text"
+                placeholder="C:\Users\you\.ssh\id_ed25519"
+              />
+            </label>
+            <label>
+              私钥口令 (可选)
+              <input id="passphrase" type="password" autocomplete="off" />
+            </label>
+          </div>
+          <div class="actions">
+            <button id="btn-connect" type="button" class="primary">连接</button>
+            <button id="btn-disconnect" type="button" disabled>断开</button>
+          </div>
+          <p class="hint">
+            意外断线会自动重连并尝试恢复 cwd；手动断开不会自动重连。<br />
+            日常命令请用底部<strong>草稿</strong>；运行 top/vim 时切换「TUI 直通」。
+          </p>
+          <p class="error" id="error-msg" hidden></p>
+        </section>
+
+        <section class="panel">
+          <h2>主机配置</h2>
+          <label>
+            显示名称
+            <input id="profile-name" type="text" placeholder="生产机" />
+          </label>
+          <div class="actions">
+            <button id="btn-save-profile" type="button">保存配置</button>
+            <button id="btn-delete-profile" type="button" class="danger">删除</button>
+          </div>
+          <ul id="profile-list" class="profile-list"></ul>
+        </section>
+      </aside>
+
+      <main class="terminal-area">
+        <div id="terminal"></div>
+        <div class="draft-wrap">
+          <ul id="complete-popup" class="complete-popup hidden" role="listbox" aria-label="补全候选"></ul>
+          <div class="draft-bar">
+            <label class="draft-label" for="draft-input">草稿</label>
+            <input
+              id="draft-input"
+              type="text"
+              placeholder="命令在此输入 · Tab 补全 · Enter 发送（断线保留）"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="btn-draft-send" type="button" title="发送草稿行">发送</button>
+            <button
+              id="btn-input-mode"
+              type="button"
+              class="mode-toggle"
+              title="Shell：命令走草稿（默认）。TUI：键盘直通终端（top/vim）"
+            >
+              Shell 模式
+            </button>
+          </div>
+        </div>
+        <div id="overlay" class="overlay hidden">
+          <div class="overlay-card">
+            <div class="spinner"></div>
+            <p id="overlay-text">连接中…</p>
+          </div>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+src-tauri/target/
+
+# Logs / OS
+*.log
+.DS_Store
+Thumbs.db
+
+# Runtime diagnostics (keep 操作日志/README.md only)
+操作日志/*.log
+错误截图/
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Env
+.env
+.env.*
