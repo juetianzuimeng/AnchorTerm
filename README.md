@@ -33,7 +33,7 @@ Windows SSH 终端客户端：真终端（xterm.js）+ **多标签多主机** + 
 | Tab 远端补全 | ✅ | 侧信道 `ssh host 'compgen…'`，不污染交互 PTY |
 | Shell / TUI 直通 | ✅ | 默认草稿；菜单或按钮切 TUI |
 | **多标签同时连多主机** | ✅ | 每 tab 独立 PTY / xterm / 草稿 / cwd / 重连 |
-| 意外断线自动重连 + 恢复 cwd | ✅ | OpenSSH ServerAlive 约 5s×2 发现死链；per-session `restore_target` + 静默 `cd` |
+| 意外断线自动重连 + 恢复 cwd | ✅ | OpenSSH ServerAlive 约 1s×2（约 2s 内更新状态）；网络类失败继续重试，真认证失败才停 |
 | **手动断开后再连接恢复 cwd** | ✅ | 同 tab 复用 `session_id` + 同 host/user |
 | 菜单 + 会话属性/管理器 | ✅ | 无常驻左侧连接栏（PR4） |
 | 操作日志 | ✅ | 开发：`操作日志\`；安装/便携：`%APPDATA%\AnchorTerm\logs\`（可用 `ANCHORTERM_LOG_DIR`）；**每次启动清空 `*.log`**；多会话带 **`sid=`** |

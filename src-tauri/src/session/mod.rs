@@ -603,6 +603,46 @@ fn schedule_seed_login_pwd(app: &AppHandle, rt: Arc<SessionRuntime>, delay_ms: u
     });
 }
 
+/// Permanent credential/key problems — do not spin forever.
+/// Transient network/handshake errors must return false (keep auto-reconnect).
+fn is_permanent_auth_failure(e: &AppError) -> bool {
+    match e {
+        AppError::Auth(msg) => {
+            let l = msg.to_ascii_lowercase();
+            // Explicit network wording in Auth messages → still retry (belt & suspenders).
+            if l.contains("connection closed")
+                || l.contains("connection reset")
+                || l.contains("timed out")
+                || l.contains("network")
+                || l.contains("握手")
+            {
+                return false;
+            }
+            true
+        }
+        // Config/path problems that will not self-heal without user action.
+        AppError::Config(_) => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod permanent_auth_tests {
+    use super::*;
+
+    #[test]
+    fn connect_error_is_not_permanent() {
+        let e = AppError::Connect("网络或握手中断: Connection closed by host".into());
+        assert!(!is_permanent_auth_failure(&e));
+    }
+
+    #[test]
+    fn real_auth_is_permanent() {
+        let e = AppError::Auth("认证失败：公钥被拒绝或私钥口令错误。".into());
+        assert!(is_permanent_auth_failure(&e));
+    }
+}
+
 /// Spawn background reconnect with exponential backoff for a specific session.
 pub fn spawn_reconnect_loop(app: AppHandle, session_id: String) {
     let Some(state) = app.try_state::<AppState>() else {
@@ -702,9 +742,10 @@ async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
                     "ERR",
                     &format!("auto-reconnect failed attempt={attempt} err={e}"),
                 );
-                // Permanent auth failures must not spin forever.
-                let permanent = matches!(e, AppError::Auth(_));
-                if permanent {
+                // Only **real** credential/key failures stop the loop.
+                // Network blips ("Connection closed by host", reset, timeout) are
+                // AppError::Connect and must keep retrying after the cable is back.
+                if is_permanent_auth_failure(&e) {
                     rt.auto_reconnect.store(false, Ordering::SeqCst);
                     set_state(
                         &app,

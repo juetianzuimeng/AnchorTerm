@@ -235,6 +235,8 @@ fn lockdown_private_key_acl(path: &Path) {
     }
 }
 
+/// True when ssh output indicates the connect/auth phase already failed
+/// (used to abort the wait loop early). Includes network errors.
 fn is_auth_failure_text(s: &str) -> bool {
     let l = s.to_ascii_lowercase();
     l.contains("permission denied")
@@ -243,12 +245,23 @@ fn is_auth_failure_text(s: &str) -> bool {
         || l.contains("too open")
         || l.contains("authentication failed")
         || l.contains("connection refused")
+        || l.contains("connection closed")
+        || l.contains("connection reset")
+        || l.contains("broken pipe")
         || l.contains("could not resolve")
         || l.contains("no route to host")
+        || l.contains("network is unreachable")
         || l.contains("connection timed out")
+        || l.contains("operation timed out")
         || l.contains("host key verification failed")
+        || l.contains("kex_exchange_identification")
+        || l.contains("banner exchange")
 }
 
+/// Classify ssh stderr / exit into Auth (usually permanent) vs Connect (retryable).
+///
+/// Important: "Connection closed by … port 22" after a network blip is **not**
+/// a permanent auth failure — auto-reconnect must keep trying.
 fn classify_auth_error(stderr: &str, exit: Option<i32>) -> AppError {
     let l = stderr.to_ascii_lowercase();
     if l.contains("unprotected private key")
@@ -269,7 +282,7 @@ fn classify_auth_error(stderr: &str, exit: Option<i32>) -> AppError {
                 .into(),
         );
     }
-    if l.contains("permission denied") {
+    if l.contains("permission denied") || l.contains("authentication failed") {
         return AppError::Auth(
             "认证失败：公钥被拒绝或私钥口令错误。\
              请确认：1) 私钥与服务器 authorized_keys 匹配；2) 加密私钥已填写正确口令；\
@@ -277,16 +290,40 @@ fn classify_auth_error(stderr: &str, exit: Option<i32>) -> AppError {
                 .into(),
         );
     }
-    if l.contains("connection refused") || l.contains("connection timed out") {
-        return AppError::Connect("无法连接主机（拒绝或超时），请检查 IP/端口/防火墙。".into());
+    if l.contains("host key verification failed") {
+        return AppError::Auth(
+            "主机密钥校验失败（known_hosts）。请确认是否首次连接或服务器已更换密钥。"
+                .into(),
+        );
     }
+
+    // Transient / network — keep auto-reconnect alive.
+    if l.contains("connection closed")
+        || l.contains("connection reset")
+        || l.contains("broken pipe")
+        || l.contains("connection refused")
+        || l.contains("connection timed out")
+        || l.contains("operation timed out")
+        || l.contains("timed out")
+        || l.contains("no route to host")
+        || l.contains("network is unreachable")
+        || l.contains("could not resolve")
+        || l.contains("name or service not known")
+        || l.contains("kex_exchange_identification")
+        || l.contains("banner exchange")
+        || l.contains("software caused connection abort")
+    {
+        let snippet = stderr.chars().take(280).collect::<String>();
+        return AppError::Connect(format!("网络或握手中断: {snippet}"));
+    }
+
     let code = exit
         .map(|c| c.to_string())
         .unwrap_or_else(|| "?".into());
     let snippet = stderr.chars().take(400).collect::<String>();
-    AppError::Auth(format!(
-        "SSH 连接失败 (exit={code}): {snippet}"
-    ))
+    // Default to Connect so exit=255 / empty stderr during flaky networks
+    // does not permanently kill auto-reconnect.
+    AppError::Connect(format!("SSH 连接失败 (exit={code}): {snippet}"))
 }
 
 struct BuiltArgs {
@@ -299,14 +336,13 @@ fn build_ssh_args(params: &ConnectParams) -> Result<BuiltArgs, AppError> {
     // Dead-link detection (e.g. unplugged NIC): plain TCP can stay ESTABLISHED for a
     // long time with no local I/O. OpenSSH client keepalives force a probe so the
     // child exits and we flip UI off "已连接".
-    // Worst-case notice ≈ ServerAliveInterval * ServerAliveCountMax (+ RTT).
-    // 5s × 2 ≈ ~10s after the path is actually dead.
+    // Target: notice within ~2s → ServerAliveInterval=1 × ServerAliveCountMax=2.
     let mut args = vec![
         "-tt".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
         "-o".into(),
-        "ServerAliveInterval=5".into(),
+        "ServerAliveInterval=1".into(),
         "-o".into(),
         "ServerAliveCountMax=2".into(),
         "-o".into(),
@@ -624,7 +660,7 @@ pub async fn connect_openssh(
     let _ = (params.cols, params.rows);
     crate::ops_log::log(
         "SSH",
-        "openssh auth ok; session ready (ServerAliveInterval=5 CountMax=2 TCPKeepAlive=yes)",
+        "openssh auth ok; session ready (ServerAliveInterval=1 CountMax=2 TCPKeepAlive=yes)",
     );
 
     Ok(OpensshTransport {
@@ -974,4 +1010,33 @@ pub async fn openssh_exec(
         return Err(classify_auth_error(&err, output.status.code()));
     }
     Ok(stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_closed_is_connect_not_auth() {
+        let e = classify_auth_error(
+            "Connection closed by 43.106.28.40 port 22",
+            Some(255),
+        );
+        assert!(
+            matches!(e, AppError::Connect(_)),
+            "expected Connect, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn permission_denied_is_auth() {
+        let e = classify_auth_error("Permission denied (publickey).", Some(255));
+        assert!(matches!(e, AppError::Auth(_)), "expected Auth, got {e:?}");
+    }
+
+    #[test]
+    fn reset_by_peer_is_connect() {
+        let e = classify_auth_error("Connection reset by peer", Some(255));
+        assert!(matches!(e, AppError::Connect(_)), "expected Connect, got {e:?}");
+    }
 }
