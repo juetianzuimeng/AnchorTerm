@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "pack:portable": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/pack-portable.ps1",
+    "release:win": "npm run tauri:build && npm run pack:portable"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

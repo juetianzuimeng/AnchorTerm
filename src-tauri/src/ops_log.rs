@@ -1,20 +1,34 @@
-//! Operation / diagnostic log written under the project `操作日志` directory.
+//! Operation / diagnostic log directory resolution and writers.
 //!
-//! Records UI actions (via IPC), SSH lifecycle, stdin writes, and remote echo
-//! so failures can be analyzed offline without a live debugger.
+//! Path priority (DEPLOYMENT §5.2):
+//! 1. Env `ANCHORTERM_LOG_DIR` if set and non-empty
+//! 2. Repo tree `操作日志\` when running from a source checkout (exe under target/…)
+//! 3. Otherwise installed/portable → `%APPDATA%\AnchorTerm\logs\`
+//!
+//! Each app start clears `*.log` in the resolved directory (README and other
+//! non-log files are kept). Never log password / passphrase plaintext.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tracing::info;
 
-/// Fixed project-relative log root (as requested).
-pub const OPS_LOG_DIR: &str = r"C:\zengshangchun\AnchorTerm\操作日志";
+/// How the active log directory was chosen (for diagnostics / UI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogDirSource {
+    Env,
+    DevTree,
+    AppData,
+    Fallback,
+}
 
+static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
+static LOG_SOURCE: OnceLock<LogDirSource> = OnceLock::new();
 static STATE: Mutex<Option<LogState>> = Mutex::new(None);
 
 struct LogState {
@@ -23,20 +37,99 @@ struct LogState {
     latest_path: PathBuf,
 }
 
+/// Resolved ops-log directory (initialized on first access / `init`).
+pub fn log_dir() -> PathBuf {
+    ensure_resolved().0.clone()
+}
+
+pub fn log_dir_source() -> LogDirSource {
+    ensure_resolved().1
+}
+
+fn ensure_resolved() -> (&'static PathBuf, LogDirSource) {
+    let dir = LOG_DIR.get_or_init(resolve_log_dir);
+    let source = *LOG_SOURCE.get().unwrap_or(&LogDirSource::Fallback);
+    (dir, source)
+}
+
+/// Resolve log directory without mutating globals (used by tests).
+pub fn resolve_log_dir_with(
+    env_override: Option<&str>,
+    current_exe: Option<&Path>,
+) -> (PathBuf, LogDirSource) {
+    if let Some(raw) = env_override {
+        let t = raw.trim();
+        if !t.is_empty() {
+            return (PathBuf::from(t), LogDirSource::Env);
+        }
+    }
+
+    if let Some(exe) = current_exe {
+        if let Some(dev) = find_repo_ops_log_dir(exe) {
+            return (dev, LogDirSource::DevTree);
+        }
+    }
+
+    if let Some(base) = dirs::config_dir() {
+        return (base.join("AnchorTerm").join("logs"), LogDirSource::AppData);
+    }
+
+    // Last resort: cwd-relative (should be rare).
+    (
+        PathBuf::from("AnchorTerm-logs"),
+        LogDirSource::Fallback,
+    )
+}
+
+fn resolve_log_dir() -> PathBuf {
+    let env = std::env::var("ANCHORTERM_LOG_DIR").ok();
+    let exe = std::env::current_exe().ok();
+    let (dir, source) = resolve_log_dir_with(
+        env.as_deref(),
+        exe.as_deref(),
+    );
+    let _ = LOG_SOURCE.set(source);
+    dir
+}
+
+/// Walk up from the executable looking for the AnchorTerm repo root
+/// (`package.json` + `src-tauri/`), then use `<root>/操作日志`.
+fn find_repo_ops_log_dir(exe: &Path) -> Option<PathBuf> {
+    let mut dir = exe.parent()?.to_path_buf();
+    for _ in 0..10 {
+        if is_repo_root(&dir) {
+            return Some(dir.join("操作日志"));
+        }
+        // Common layout: …/src-tauri/target/{debug,release}/anchorterm.exe
+        if dir.file_name().and_then(|s| s.to_str()) == Some("src-tauri") {
+            if let Some(parent) = dir.parent() {
+                if is_repo_root(parent) {
+                    return Some(parent.join("操作日志"));
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn is_repo_root(dir: &Path) -> bool {
+    dir.join("package.json").is_file() && dir.join("src-tauri").is_dir()
+}
+
 fn now_stamp() -> String {
-    // Local-ish wall clock via UTC offset is optional; use Unix ms for ordering.
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let secs = d.as_secs();
     let millis = d.subsec_millis();
-    // YYYY-MM-DDTHH:MM:SS.mmmZ (UTC)
     let days = secs / 86400;
     let day_secs = secs % 86400;
     let h = day_secs / 3600;
     let m = (day_secs % 3600) / 60;
     let s = day_secs % 60;
-    // Civil date from days since epoch (proleptic Gregorian)
     let (y, mo, day) = civil_from_days(days as i64);
     format!("{y:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}.{millis:03}Z")
 }
@@ -84,12 +177,12 @@ fn file_session_stamp() -> String {
 /// On every app start, **all previous log files** under the ops dir are removed
 /// so analysis only sees the current run (README.md is kept).
 pub fn init() -> PathBuf {
-    let dir = PathBuf::from(OPS_LOG_DIR);
+    let dir = log_dir();
+    let source = log_dir_source();
     if let Err(e) = fs::create_dir_all(&dir) {
         eprintln!("ops_log: create_dir_all failed: {e}");
     }
 
-    // Wipe prior run artifacts so each restart starts with a clean slate.
     clear_previous_logs(&dir);
 
     let session_path = dir.join(format!("session-{}.log", file_session_stamp()));
@@ -97,8 +190,9 @@ pub fn init() -> PathBuf {
     let latest_path = dir.join("latest.log");
 
     let header = format!(
-        "===== AnchorTerm ops log start {} session={} =====\n",
+        "===== AnchorTerm ops log start {} source={:?} session={} =====\n",
         now_stamp(),
+        source,
         session_path
             .file_name()
             .and_then(|s| s.to_str())
@@ -116,7 +210,11 @@ pub fn init() -> PathBuf {
         });
     }
 
-    info!(path = %session_path.display(), "ops_log initialized (previous logs cleared)");
+    info!(
+        path = %session_path.display(),
+        ?source,
+        "ops_log initialized (previous logs cleared)"
+    );
     session_path
 }
 
@@ -145,7 +243,6 @@ fn clear_previous_logs(dir: &Path) {
             Err(e) => eprintln!("ops_log: remove {} failed: {e}", path.display()),
         }
     }
-    // Also clear empty latest if recreate races; init will rewrite header.
     let _ = removed;
 }
 
@@ -161,8 +258,7 @@ fn append_raw(path: &Path, text: &str) {
 /// `category` examples: UI, SSH, ECHO, STATE, ERR, SYS
 pub fn log(category: &str, message: &str) {
     let line = format!("{} [{}] {}\n", now_stamp(), category, message);
-    // Always try to write even if init was skipped.
-    let dir = PathBuf::from(OPS_LOG_DIR);
+    let dir = log_dir();
     let _ = fs::create_dir_all(&dir);
 
     if let Ok(g) = STATE.lock() {
@@ -175,10 +271,6 @@ pub fn log(category: &str, message: &str) {
     }
     // Fallback before init
     append_raw(&dir.join("latest.log"), &line);
-}
-
-pub fn log_fmt(category: &str, args: std::fmt::Arguments<'_>) {
-    log(category, &format!("{args}"));
 }
 
 /// Hex preview of bytes (truncated).
@@ -216,7 +308,6 @@ pub fn text_preview(data: &[u8], max_chars: usize) -> String {
 
 /// Redact secrets in free-form strings (best-effort).
 pub fn redact(s: &str) -> String {
-    // Never log full private key paths with "passphrase" values; caller should not pass them.
     s.replace("password=", "password=[REDACTED]")
         .replace("passphrase=", "passphrase=[REDACTED]")
 }
@@ -228,6 +319,8 @@ pub struct OpsLogInfo {
     pub dir: String,
     pub latest: String,
     pub session: Option<String>,
+    /// `env` | `dev_tree` | `app_data` | `fallback`
+    pub source: LogDirSource,
 }
 
 #[tauri::command]
@@ -257,7 +350,7 @@ pub fn ops_log(
 
 #[tauri::command]
 pub fn ops_log_info() -> Result<OpsLogInfo, String> {
-    let dir = PathBuf::from(OPS_LOG_DIR);
+    let dir = log_dir();
     let latest = dir.join("latest.log");
     let session = STATE
         .lock()
@@ -267,6 +360,7 @@ pub fn ops_log_info() -> Result<OpsLogInfo, String> {
         dir: dir.display().to_string(),
         latest: latest.display().to_string(),
         session,
+        source: log_dir_source(),
     })
 }
 
@@ -276,4 +370,79 @@ macro_rules! ops {
     ($cat:expr, $($arg:tt)*) => {{
         $crate::ops_log::log($cat, &format!($($arg)*));
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn env_override_wins() {
+        let (dir, src) = resolve_log_dir_with(Some(r"D:\custom\logs"), None);
+        assert_eq!(src, LogDirSource::Env);
+        assert_eq!(dir, PathBuf::from(r"D:\custom\logs"));
+    }
+
+    #[test]
+    fn empty_env_falls_through() {
+        let (dir, src) = resolve_log_dir_with(Some("  "), None);
+        assert_ne!(src, LogDirSource::Env);
+        assert!(!dir.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn dev_tree_from_target_release_layout() {
+        let tmp = std::env::temp_dir().join(format!(
+            "anchorterm-ops-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        let root = tmp.join("repo");
+        let release = root
+            .join("src-tauri")
+            .join("target")
+            .join("release");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(root.join("package.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("src-tauri")).unwrap();
+        let exe = release.join("anchorterm.exe");
+        fs::write(&exe, b"").unwrap();
+
+        let (dir, src) = resolve_log_dir_with(None, Some(&exe));
+        assert_eq!(src, LogDirSource::DevTree);
+        assert_eq!(dir, root.join("操作日志"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn non_repo_exe_uses_appdata_or_fallback() {
+        let tmp = std::env::temp_dir().join(format!(
+            "anchorterm-ops-install-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let exe = tmp.join("anchorterm.exe");
+        fs::write(&exe, b"").unwrap();
+
+        let (dir, src) = resolve_log_dir_with(None, Some(&exe));
+        assert!(
+            matches!(src, LogDirSource::AppData | LogDirSource::Fallback),
+            "expected AppData/Fallback, got {src:?} dir={}",
+            dir.display()
+        );
+        if src == LogDirSource::AppData {
+            assert!(
+                dir.ends_with(Path::new("AnchorTerm").join("logs"))
+                    || dir.to_string_lossy().contains("AnchorTerm"),
+                "dir={}",
+                dir.display()
+            );
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }

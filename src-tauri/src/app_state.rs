@@ -58,13 +58,6 @@ pub struct CwdEvent {
     pub cwd: String,
 }
 
-/// Event payload for `session://error`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ErrorEvent {
-    pub session_id: String,
-    pub message: String,
-}
-
 /// Cached connection parameters for auto-reconnect (kept in memory only).
 #[derive(Clone)]
 pub struct CachedConnect {
@@ -219,8 +212,9 @@ impl AppState {
         map.remove(session_id)
     }
 
-    pub fn session_count(&self) -> usize {
-        self.sessions.lock().expect("sessions lock").len()
+    pub fn list_session_ids(&self) -> Vec<String> {
+        let map = self.sessions.lock().expect("sessions lock");
+        map.keys().cloned().collect()
     }
 
     pub fn list_snapshots(&self) -> Vec<SessionSnapshot> {
@@ -245,14 +239,14 @@ mod tests {
     #[test]
     fn get_or_insert_and_remove() {
         let app = AppState::default();
-        assert_eq!(app.session_count(), 0);
+        assert_eq!(app.list_session_ids().len(), 0);
         let a = app.get_or_insert_runtime("s1").expect("insert");
         let b = app.get_or_insert_runtime("s1").expect("get");
         assert_eq!(a.id, b.id);
-        assert_eq!(app.session_count(), 1);
+        assert_eq!(app.list_session_ids().len(), 1);
         assert!(app.get_runtime("missing").is_err());
         app.remove_runtime("s1");
-        assert_eq!(app.session_count(), 0);
+        assert_eq!(app.list_session_ids().len(), 0);
         assert!(app.get_runtime("s1").is_err());
     }
 
@@ -262,7 +256,7 @@ mod tests {
         let app = AppState::default();
         let rt = app.get_or_insert_runtime("s-keep").unwrap();
         assert!(rt.transport.lock().unwrap().is_none());
-        assert_eq!(app.session_count(), 1);
+        assert_eq!(app.list_session_ids().len(), 1);
         // close removes
         app.remove_runtime("s-keep");
         assert!(app.get_runtime("s-keep").is_err());

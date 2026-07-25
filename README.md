@@ -4,11 +4,14 @@ Windows SSH 终端客户端：真终端（xterm.js）+ **多标签多主机** + 
 
 | 文档 | 说明 |
 |------|------|
+| [docs/INSTALL.md](docs/INSTALL.md) | **最终用户安装**（下载 setup、SmartScreen、OpenSSH、WebView2） |
+| [docs/RELEASE.md](docs/RELEASE.md) | **发布者发版**（版本号、`tauri:build`、产物检查） |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | 部署与安装方案（阶段规划 / 便携包 / CI） |
 | [DESIGN.md](DESIGN.md) | 产品与架构设计（中文） |
 | [docs/PHASE1.md](docs/PHASE1.md) | 第一阶段开工方案 |
 | [docs/UI-MULTI-TAB.md](docs/UI-MULTI-TAB.md) | 多标签 / 菜单化布局功能设计（PR1–PR5） |
 | [docs/ROADMAP-NEXT.md](docs/ROADMAP-NEXT.md) | **下一阶段可选方向**（Jump / 分屏 / SFTP / TUI 恢复等） |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | **部署与安装方案**（安装包 / 便携包 / CI 发版） |
+| [docs/prompts/start-deployment.md](docs/prompts/start-deployment.md) | 新会话提示词：落实部署安装（阶段 A 起） |
 | [docs/CODE-REVIEW-PLAN.md](docs/CODE-REVIEW-PLAN.md) | 分阶段代码评审方案与进度 |
 | [docs/shell-integration.md](docs/shell-integration.md) | 远端 OSC 7 安装（提高 cwd 精度） |
 | [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | 阶段 1 + 多会话验收清单 |
@@ -33,7 +36,7 @@ Windows SSH 终端客户端：真终端（xterm.js）+ **多标签多主机** + 
 | 意外断线自动重连 + 恢复 cwd | ✅ | per-session `restore_target` + 交互 PTY 静默 `cd` |
 | **手动断开后再连接恢复 cwd** | ✅ | 同 tab 复用 `session_id` + 同 host/user |
 | 菜单 + 会话属性/管理器 | ✅ | 无常驻左侧连接栏（PR4） |
-| 操作日志 | ✅ | `操作日志\`；**每次启动清空全部 `*.log`**；多会话带 **`sid=`** |
+| 操作日志 | ✅ | 开发：`操作日志\`；安装/便携：`%APPDATA%\AnchorTerm\logs\`（可用 `ANCHORTERM_LOG_DIR`）；**每次启动清空 `*.log`**；多会话带 **`sid=`** |
 
 ### 架构要点（必读）
 
@@ -111,10 +114,11 @@ russh 仍用于密钥类型/导出；**补全走 OpenSSH 侧信道**。
 
 ### 操作日志
 
-- 目录：`操作日志\`；启动清空 `*.log`  
-- 优先 `latest.log`  
+- 目录解析：`ANCHORTERM_LOG_DIR` → 源码树旁 `操作日志\` → 安装/便携 `%APPDATA%\AnchorTerm\logs\`  
+- 启动清空该目录下 `*.log`；优先 `latest.log`  
 - 多会话：消息中带 **`sid=` 前 8 位**；事件路由失败：`event_route_miss`  
 - **禁止** password / passphrase 明文  
+- 菜单「打开操作日志目录」跟随实际路径
 
 ### 后端模块地图
 
@@ -144,7 +148,23 @@ src-tauri/src/
 
 ---
 
-## 环境要求
+## 安装使用（最终用户）
+
+**无需**安装 Node.js / Rust。使用发布者提供的 NSIS 安装包即可：
+
+1. 下载 `AnchorTerm-*-setup.exe`  
+2. 双击安装（若 SmartScreen 提示「未知发布者」→ **更多信息** → **仍要运行**）  
+3. 从开始菜单启动；系统需有 **OpenSSH 客户端**（`ssh -V`）与 **WebView2**  
+
+完整步骤、依赖与排错见 **[docs/INSTALL.md](docs/INSTALL.md)**。
+
+发布者如何打出安装包见 **[docs/RELEASE.md](docs/RELEASE.md)**。
+
+---
+
+## 从源码开发
+
+### 环境要求
 
 - Windows 10/11  
 - Node.js 18+  
@@ -152,13 +172,24 @@ src-tauri/src/
 - Visual Studio 2022，「使用 C++ 的桌面开发」  
 - Windows OpenSSH 客户端（`ssh.exe`，一般系统自带）
 
-## 快速开始
+### 快速开始
 
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 cd C:\zengshangchun\AnchorTerm
 npm install
 npm run tauri:dev
+```
+
+打 release 安装包 / 便携包（需完整工具链）：
+
+```powershell
+npm run tauri:build
+# 产物：src-tauri\target\release\bundle\nsis\*_x64-setup.exe
+
+npm run pack:portable
+# 或一条龙：npm run release:win
+# 产物：dist-release\AnchorTerm-*-windows-x64-portable.zip
 ```
 
 单元测试：
@@ -190,7 +221,8 @@ cargo test -p anchorterm --lib
 |------|------|
 | 主机列表 | `%APPDATA%\AnchorTerm\profiles.json`（无密码） |
 | 密码 | Windows 凭据管理器，服务名 `AnchorTerm` |
-| 操作日志 | `C:\zengshangchun\AnchorTerm\操作日志\` |
+| 操作日志（开发） | 仓库 `操作日志\` |
+| 操作日志（安装/便携） | `%APPDATA%\AnchorTerm\logs\`（可用 `ANCHORTERM_LOG_DIR` 覆盖） |
 
 ## 阶段 1 承诺边界
 

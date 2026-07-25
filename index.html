@@ -225,5 +225,30 @@
         <button type="button" id="dlg-secret-ok" class="primary">确定</button>
       </footer>
     </dialog>
+
+    <!-- Missing system OpenSSH (startup check) -->
+    <dialog id="dlg-ssh-missing" class="app-dialog" aria-labelledby="dlg-ssh-missing-title">
+      <header class="dlg-header">
+        <h2 id="dlg-ssh-missing-title">需要 OpenSSH 客户端</h2>
+        <button type="button" class="dlg-close" data-dlg-close title="关闭">×</button>
+      </header>
+      <div class="dlg-body">
+        <p id="dlg-ssh-missing-msg" class="hint">
+          未找到 <code>ssh.exe</code>。AnchorTerm 的交互终端依赖系统 OpenSSH，请先安装后再连接。
+        </p>
+        <ol class="install-steps">
+          <li>打开 <strong>设置 → 应用 → 可选功能 → 添加功能</strong></li>
+          <li>搜索并安装 <strong>OpenSSH 客户端</strong></li>
+          <li>或以管理员 PowerShell 执行：
+            <code class="block-code">Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0</code>
+          </li>
+          <li>安装完成后<strong>重新打开</strong> AnchorTerm，在终端执行 <code>ssh -V</code> 确认</li>
+        </ol>
+      </div>
+      <footer class="dlg-footer">
+        <button type="button" id="dlg-ssh-missing-help">打开安装说明</button>
+        <button type="button" data-dlg-close class="primary">知道了</button>
+      </footer>
+    </dialog>
   </body>
 </html>

@@ -4,7 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { openPath } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -1823,31 +1823,75 @@ function setupShortcuts() {
   });
 }
 
+/** Set while shutting down so close-requested handlers do not re-enter. */
+let isQuitting = false;
+
+/**
+ * Dispose all tabs with a per-tab timeout so a stuck IPC cannot block exit forever.
+ */
+async function cleanupAllSessionsForExit() {
+  const ids = [...sessions.keys()];
+  for (const id of ids) {
+    const v = sessions.get(id);
+    if (!v) continue;
+    try {
+      await Promise.race([
+        v.dispose(),
+        new Promise<void>((resolve) => window.setTimeout(resolve, 1500)),
+      ]);
+    } catch {
+      /* ignore */
+    }
+    sessions.delete(id);
+  }
+  sessions.clear();
+  activeSessionId = null;
+}
+
+/**
+ * App exit (menu 退出).
+ *
+ * Must NOT call `window.close()` from inside `onCloseRequested` after
+ * `preventDefault()` — that re-enters the close pipeline and can deadlock
+ * (window stays open / process never dies). Prefer backend `app_quit` → `app.exit(0)`.
+ */
 async function requestExit() {
+  if (isQuitting) {
+    opsLog("SYS", "app_exit_ignored_already_quitting");
+    return;
+  }
   const n = countActiveConnections();
   if (n > 0) {
     const ok = window.confirm(
       `有 ${n} 个会话仍在连接中，退出将全部断开。确定退出？`,
     );
-    if (!ok) return;
-  }
-  // close all sessions
-  const ids = [...sessions.keys()];
-  for (const id of ids) {
-    const v = sessions.get(id);
-    if (v) {
-      try {
-        await v.dispose();
-      } catch {
-        /* ignore */
-      }
-      sessions.delete(id);
+    if (!ok) {
+      opsLog("UI", "app_exit_cancelled", { active: n });
+      return;
     }
   }
+  isQuitting = true;
+  opsLog("SYS", "app_exit_begin", {
+    active: n,
+    tabs: sessions.size,
+    source: "menu_or_api",
+  });
+  await cleanupAllSessionsForExit();
+  opsLog("SYS", "app_exit_cleanup_done");
   try {
-    await getCurrentWindow().close();
-  } catch {
-    window.close();
+    await invoke("app_quit");
+  } catch (e) {
+    opsLog("ERR", "app_quit_invoke_failed", String(e));
+    // Fallback: force-destroy window (does not re-fire closeRequested).
+    try {
+      await getCurrentWindow().destroy();
+    } catch {
+      try {
+        await getCurrentWindow().close();
+      } catch {
+        window.close();
+      }
+    }
   }
 }
 
@@ -2013,15 +2057,42 @@ window.addEventListener("DOMContentLoaded", async () => {
     }, 100);
   });
 
-  // Close on X of window — best effort confirm
+  // Title-bar X / Alt+F4 — Tauri pattern:
+  // await confirm first; only preventDefault if user cancels.
+  // Never call close() again from inside this handler after preventDefault
+  // (re-entrancy deadlock: handler waits on close, close waits on handler).
   try {
     const win = getCurrentWindow();
     await win.onCloseRequested(async (event) => {
+      if (isQuitting) {
+        // Already decided to quit (menu exit / app_quit in flight) — allow.
+        return;
+      }
       const n = countActiveConnections();
       if (n > 0) {
-        event.preventDefault();
-        await requestExit();
+        const ok = window.confirm(
+          `有 ${n} 个会话仍在连接中，退出将全部断开。确定退出？`,
+        );
+        if (!ok) {
+          event.preventDefault();
+          opsLog("UI", "window_close_cancelled", { active: n });
+          return;
+        }
       }
+      // Accept close: cleanup while Tauri waits for this async handler, then
+      // let the default close proceed (do not preventDefault, do not re-close).
+      isQuitting = true;
+      opsLog("SYS", "window_close_accepted", {
+        active: n,
+        tabs: sessions.size,
+        source: "close_requested",
+      });
+      await cleanupAllSessionsForExit();
+      opsLog("SYS", "window_close_cleanup_done");
+      // Ensure process exits even if window teardown leaves runtime tasks alive.
+      invoke("app_quit").catch((e) => {
+        opsLog("ERR", "app_quit_from_close_failed", String(e));
+      });
     });
   } catch {
     /* ignore if API unavailable */
@@ -2029,9 +2100,12 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   try {
     await loadProfiles();
-    const info = await invoke<{ dir: string; latest: string; session?: string }>(
-      "ops_log_info",
-    );
+    const info = await invoke<{
+      dir: string;
+      latest: string;
+      session?: string;
+      source?: string;
+    }>("ops_log_info");
     logsDir = info.dir;
     opsLog("SYS", "ui_ready", {
       ...info,
@@ -2042,4 +2116,45 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (e) {
     showToast(`启动失败: ${e}`);
   }
+
+  // Phase B: surface missing OpenSSH clearly (do not silently fail on connect only).
+  await checkSshOnStartup();
 });
+
+interface SshCheckResult {
+  available: boolean;
+  path?: string | null;
+  message: string;
+  helpUrl?: string | null;
+}
+
+async function checkSshOnStartup() {
+  try {
+    const r = await invoke<SshCheckResult>("check_ssh");
+    if (r.available) {
+      opsLog("SYS", "ssh_check_ok", { path: r.path ?? null });
+      return;
+    }
+    opsLog("SYS", "ssh_check_missing", { message: r.message });
+    showSshMissingDialog(r);
+  } catch (e) {
+    opsLog("ERR", "ssh_check_invoke_failed", String(e));
+  }
+}
+
+function showSshMissingDialog(r: SshCheckResult) {
+  const dlg = $("dlg-ssh-missing") as HTMLDialogElement;
+  const msg = $("dlg-ssh-missing-msg");
+  if (r.message) msg.textContent = r.message;
+
+  const helpBtn = $("dlg-ssh-missing-help") as HTMLButtonElement;
+  const helpUrl =
+    r.helpUrl ||
+    "https://learn.microsoft.com/windows-server/administration/openssh/openssh_install_firstuse";
+  helpBtn.onclick = () => {
+    void openUrl(helpUrl).catch((e) => showToast(`无法打开链接: ${e}`));
+  };
+
+  if (!dlg.open) dlg.showModal();
+  showToast("未检测到系统 OpenSSH（ssh.exe）", 4500);
+}

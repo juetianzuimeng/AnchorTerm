@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
@@ -61,7 +62,8 @@ impl Drop for AskPassMaterial {
     }
 }
 
-fn find_ssh() -> Result<PathBuf, AppError> {
+/// Locate system OpenSSH client. Used by interactive connect and startup check.
+pub fn find_ssh() -> Result<PathBuf, AppError> {
     let candidates = [
         r"C:\Windows\System32\OpenSSH\ssh.exe",
         r"C:\Program Files\Git\usr\bin\ssh.exe",
@@ -72,7 +74,9 @@ fn find_ssh() -> Result<PathBuf, AppError> {
         }
     }
     which_ssh().ok_or_else(|| {
-        AppError::Ssh("未找到 ssh.exe。请安装 Windows OpenSSH 客户端。".into())
+        AppError::Ssh(
+            "未找到 ssh.exe。请安装 Windows「OpenSSH 客户端」可选功能后再连接。".into(),
+        )
     })
 }
 
@@ -89,6 +93,39 @@ fn which_ssh() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Startup / UI probe: is system OpenSSH available?
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshCheckResult {
+    pub available: bool,
+    pub path: Option<String>,
+    pub message: String,
+    /// Optional help URL for installing OpenSSH on Windows.
+    pub help_url: Option<String>,
+}
+
+const OPENSSH_HELP_URL: &str =
+    "https://learn.microsoft.com/windows-server/administration/openssh/openssh_install_firstuse";
+
+#[tauri::command]
+pub fn check_ssh() -> SshCheckResult {
+    match find_ssh() {
+        Ok(p) => SshCheckResult {
+            available: true,
+            path: Some(p.display().to_string()),
+            message: "已找到系统 OpenSSH 客户端".into(),
+            help_url: None,
+        },
+        Err(_) => SshCheckResult {
+            available: false,
+            path: None,
+            message: "未找到 ssh.exe。AnchorTerm 的交互终端依赖系统 OpenSSH 客户端，请先安装后再连接。"
+                .into(),
+            help_url: Some(OPENSSH_HELP_URL.into()),
+        },
+    }
 }
 
 fn make_askpass(secret: &str) -> Result<AskPassMaterial, AppError> {
@@ -517,29 +554,56 @@ pub async fn connect_openssh(
         crate::ops_log::log("SSH", "auth wait ended; accepting live process");
     }
 
-    // Background: wait for later exit (network drop, etc.)
+    // Background: wait for process exit, or kill when `alive` cleared by Disconnect.
+    // (stdin shutdown alone can leave ssh hanging and block app exit on Windows.)
     let app_wait = app.clone();
     let sid_wait = session_id.clone();
     let alive_w = Arc::clone(&alive);
     tokio::spawn(async move {
-        let status = child.wait().await;
+        let mut child = child;
+        let mut forced = false;
+        let status = loop {
+            if !alive_w.load(Ordering::SeqCst) {
+                forced = true;
+                crate::ops_log::log(
+                    "SSH",
+                    &format!(
+                        "ssh child kill (alive=false) sid={}",
+                        &sid_wait[..sid_wait.len().min(8)]
+                    ),
+                );
+                let _ = child.start_kill();
+                break child.wait().await;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+                Err(e) => break Err(e),
+            }
+        };
         alive_w.store(false, Ordering::SeqCst);
         match status {
             Ok(s) => {
                 info!(?s, "ssh child exited");
-                crate::ops_log::log("SSH", &format!("ssh child exited status={s:?}"));
-                // Auth already succeeded earlier; exit now is a real drop.
-                // finish_session will auto-reconnect only if enabled.
+                crate::ops_log::log(
+                    "SSH",
+                    &format!(
+                        "ssh child exited status={s:?} forced_kill={forced}"
+                    ),
+                );
             }
             Err(e) => {
                 warn!(error = %e, "ssh child wait error");
                 crate::ops_log::log("ERR", &format!("ssh child wait error: {e}"));
             }
         }
-        finish_session(app_wait, sid_wait, false).await;
+        // Manual disconnect/close already set UI state; avoid reconnect path.
+        finish_session(app_wait, sid_wait, forced).await;
     });
 
-    // Control: disconnect
+    // Control: disconnect marks alive=false + closes stdin; wait task kills child.
     let alive_c = Arc::clone(&alive);
     let stdin_c = Arc::clone(&stdin);
     tokio::spawn(async move {
@@ -569,22 +633,15 @@ async fn control_loop(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             SessionCommand::Disconnect => {
-                crate::ops_log::log("SSH", "control disconnect: closing stdin");
+                crate::ops_log::log(
+                    "SSH",
+                    "control disconnect: closing stdin; wait task will kill child",
+                );
+                // Clear alive first so the wait task can start_kill promptly.
                 alive.store(false, Ordering::SeqCst);
                 let mut g = stdin.lock().await;
                 let _ = g.shutdown().await;
                 break;
-            }
-            SessionCommand::Complete { reply, .. } => {
-                let _ = reply.send(Err(
-                    "当前使用系统 OpenSSH，暂不支持 Tab 远端补全".into(),
-                ));
-            }
-            SessionCommand::RemotePwd { reply } => {
-                let _ = reply.send(Err("OpenSSH 会话不支持侧信道 pwd".into()));
-            }
-            SessionCommand::RemoteExec { reply, .. } => {
-                let _ = reply.send(Err("OpenSSH 会话不支持侧信道 exec".into()));
             }
         }
     }

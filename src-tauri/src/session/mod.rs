@@ -747,6 +747,33 @@ pub async fn close_session(
     close_session_inner(&state, &app, &session_id).map_err(Into::into)
 }
 
+/// Graceful app shutdown: tear down all sessions, then force-exit the process.
+///
+/// Prefer this over only `Window.close()`: close-requested handlers that
+/// re-enter `close()` can deadlock, and leftover OpenSSH children may keep
+/// the process alive after the window disappears.
+#[tauri::command]
+pub async fn app_quit(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    crate::ops_log::log("SYS", "app_quit begin");
+    let ids = state.list_session_ids();
+    for id in ids {
+        if let Err(e) = close_session_inner(&state, &app, &id) {
+            crate::ops_log::log(
+                "ERR",
+                &format!(
+                    "app_quit close_session failed sid={} err={e}",
+                    &id[..id.len().min(8)]
+                ),
+            );
+        }
+    }
+    crate::ops_log::log("SYS", "app_quit exit(0)");
+    // Give the log a moment to flush to disk.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    app.exit(0);
+    Ok(())
+}
+
 fn close_session_inner(
     state: &AppState,
     app: &AppHandle,

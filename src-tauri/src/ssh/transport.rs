@@ -16,20 +16,6 @@ use crate::auth::AuthMethod;
 use crate::error::AppError;
 use crate::ssh::openssh;
 
-/// Kept for legacy russh complete helpers (unused by interactive OpenSSH path).
-pub(crate) struct ClientHandler;
-
-impl russh::client::Handler for ClientHandler {
-    type Error = russh::Error;
-
-    async fn check_server_key(
-        &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        Ok(true)
-    }
-}
-
 pub struct ConnectParams {
     pub host: String,
     pub port: u16,
@@ -39,20 +25,10 @@ pub struct ConnectParams {
     pub rows: u32,
 }
 
+/// Control messages for the interactive OpenSSH session task.
 pub enum SessionCommand {
+    /// Close stdin and tear down the child process.
     Disconnect,
-    Complete {
-        line: String,
-        cursor: usize,
-        reply: tokio::sync::oneshot::Sender<Result<crate::ssh::complete::CompleteResult, String>>,
-    },
-    RemotePwd {
-        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
-    },
-    RemoteExec {
-        command: String,
-        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
-    },
 }
 
 /// Live interactive session.
@@ -105,31 +81,6 @@ pub async fn write_stdin(
     }
     crate::ops_log::log("SSH", &format!("stdin write ok len={}", data.len()));
     Ok(())
-}
-
-/// Map low-level errors to readable Chinese messages (no secrets).
-pub fn map_connect_error(e: impl ToString) -> AppError {
-    let s = e.to_string();
-    let lower = s.to_lowercase();
-    if lower.contains("timed out") || lower.contains("timeout") {
-        return AppError::Connect("连接超时，请检查主机地址、端口与网络".into());
-    }
-    if lower.contains("connection refused") || lower.contains("connection timed out") {
-        return AppError::Connect("连接被拒绝或超时，请确认 SSH 服务与网络".into());
-    }
-    if lower.contains("permission denied") {
-        return AppError::Auth("认证失败：用户名、密码或私钥不正确".into());
-    }
-    if lower.contains("no route") || lower.contains("network is unreachable") {
-        return AppError::Connect("网络不可达，请检查网络连接".into());
-    }
-    if lower.contains("name or service not known")
-        || lower.contains("could not resolve")
-        || lower.contains("getaddrinfo")
-    {
-        return AppError::Connect("无法解析主机名，请检查主机地址".into());
-    }
-    AppError::Connect(s)
 }
 
 /// Connect interactive session via system OpenSSH.

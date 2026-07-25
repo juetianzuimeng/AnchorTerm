@@ -12,7 +12,14 @@ use app_state::AppState;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let log_path = ops_log::init();
-    ops_log::log("SYS", &format!("app start; session log={}", log_path.display()));
+    ops_log::log(
+        "SYS",
+        &format!(
+            "app start; session log={} source={:?}",
+            log_path.display(),
+            ops_log::log_dir_source()
+        ),
+    );
 
     // Also mirror tracing to stderr (and we call ops_log at key points).
     tracing_subscriber::fmt()
@@ -22,6 +29,12 @@ pub fn run() {
         )
         .init();
 
+    // Probe OpenSSH early (UI also checks); log only — do not abort process.
+    match ssh::openssh::find_ssh() {
+        Ok(p) => ops_log::log("SYS", &format!("ssh available path={}", p.display())),
+        Err(e) => ops_log::log("SYS", &format!("ssh missing: {e}")),
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
@@ -29,6 +42,7 @@ pub fn run() {
             session::connect,
             session::disconnect,
             session::close_session,
+            session::app_quit,
             session::list_sessions,
             session::write_bytes,
             session::submit_line,
@@ -40,6 +54,7 @@ pub fn run() {
             session::delete_profile,
             ops_log::ops_log,
             ops_log::ops_log_info,
+            ssh::openssh::check_ssh,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AnchorTerm");

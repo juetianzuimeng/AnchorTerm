@@ -4,7 +4,7 @@
 |------|------|
 | **文档标题** | 让 AnchorTerm 更容易部署安装 |
 | **日期** | 2026-07-25 |
-| **状态** | 可行方案（待实施） |
+| **状态** | 阶段 A+B 已落地（NSIS + 便携 zip + AppData 日志 + ssh 启动检测）；C/D 待做 |
 | **目标平台** | Windows 10/11 x64（与现产品一致） |
 | **技术底座** | Tauri 2 + Vite + Rust；`tauri.conf.json` 已 `"bundle.active": true` |
 | **读者** | 负责人、发布者、后续开发 / AI 会话 |
@@ -126,8 +126,8 @@ npm run tauri:build
 
 ```text
 src-tauri/target/release/bundle/nsis/AnchorTerm_*_x64-setup.exe
-src-tauri/target/release/bundle/msi/AnchorTerm_*_x64_en-US.msi
-src-tauri/target/release/AnchorTerm.exe   # 亦可打进 zip
+src-tauri/target/release/bundle/msi/AnchorTerm_*_x64_en-US.msi   # 阶段 A 默认未启用 msi
+src-tauri/target/release/anchorterm.exe   # 亦可打进 zip（阶段 B）
 ```
 
 ### 3.3 依赖策略
@@ -245,33 +245,23 @@ jobs:
 ### 5.1 安装后布局（典型）
 
 ```text
-%LOCALAPPDATA%\Programs\AnchorTerm\   # 或安装器选择的目录
-  AnchorTerm.exe
+%LOCALAPPDATA%\AnchorTerm\            # Tauri currentUser 常见路径（亦可能为 Programs\…）
+  anchorterm.exe                      # 可执行文件名与 Cargo package 一致
   (webview / 依赖)
 %APPDATA%\AnchorTerm\
   profiles.json                       # 主机配置（无密码）
 ```
 
-### 5.2 操作日志（现状与建议）
-
-**现状：** 日志写到**源码旁** `操作日志\`（开发友好，安装版不合适）。
-
-**安装版建议（阶段 B 实施）：**
+### 5.2 操作日志（阶段 B 已实施）
 
 | 模式 | 日志目录 |
 |------|----------|
-| 开发（`tauri dev` 或 env） | 仓库内 `操作日志\`（保持现状） |
-| 安装/便携正式运行 | `%APPDATA%\AnchorTerm\logs\` 或 `%LOCALAPPDATA%\AnchorTerm\logs\` |
+| env `ANCHORTERM_LOG_DIR` | 覆盖路径 |
+| 开发（可执行文件位于仓库 `target/…`） | 仓库内 `操作日志\` |
+| 安装/便携 | `%APPDATA%\AnchorTerm\logs\` |
 
-启动时：
-
-1. 若存在 env `ANCHORTERM_LOG_DIR` → 用其路径  
-2. 否则若检测到「安装目录运行」→ AppData logs  
-3. 否则开发树旁 `操作日志\`
-
-菜单「打开操作日志目录」已用 opener，路径随配置走即可。
-
-> 此条属于**小代码改动**，对「可安装」体验很关键，建议放在阶段 B，并同步 [操作日志/README.md](../操作日志/README.md)。
+实现：`src-tauri/src/ops_log.rs`（`resolve_log_dir_with`）。  
+菜单「打开操作日志目录」通过 `ops_log_info` 取实际路径后用 opener 打开。
 
 ### 5.3 配置迁移
 
@@ -355,14 +345,14 @@ jobs:
 
 ## 10. 验收清单（部署专项）
 
-| ID | 步骤 | 期望 |
-|----|------|------|
-| DEP-1 | 开发机 `npm run tauri:build` | 生成 setup.exe，退出码 0 |
-| DEP-2 | 无 Node/Rust 的 Windows 安装 setup | 安装成功，开始菜单可启动 |
-| DEP-3 | 安装后公钥/加密钥连接测试机 | 与 dev 行为一致 |
-| DEP-4 | 卸载（若 NSIS） | 程序移除；AppData 配置仍在（按约定） |
-| DEP-5 | 无 ssh.exe 环境启动 | 明确错误，不白屏崩溃 |
-| DEP-6 | （CI）打 tag | Release 出现安装包资产 |
+| ID | 步骤 | 期望 | 阶段 A 状态 |
+|----|------|------|-------------|
+| DEP-1 | 开发机 `npm run tauri:build` | 生成 setup.exe，退出码 0 | ✅ 已通过（`AnchorTerm_0.1.0_x64-setup.exe`） |
+| DEP-2 | 无 Node/Rust 的 Windows 安装 setup | 安装成功，开始菜单可启动 | ✅ 本机静默安装 + 进程启动冒烟通过 |
+| DEP-3 | 安装后公钥/加密钥连接测试机 | 与 dev 行为一致 | ⬜ 有 SSH 测试机时补做 |
+| DEP-4 | 卸载（若 NSIS） | 程序移除；AppData 配置仍在（按约定） | ⬜ 未强制验收 |
+| DEP-5 | 无 ssh.exe 环境启动 | 明确错误，不白屏崩溃 | ✅ 启动 `check_ssh` + 模态说明 + 帮助链接 |
+| DEP-6 | （CI）打 tag | Release 出现安装包资产 | ⬜ 阶段 C |
 
 ---
 
@@ -385,6 +375,14 @@ jobs:
 - 本方案**正交于** [ROADMAP-NEXT.md](ROADMAP-NEXT.md) 中的 Jump/SFTP/TUI 恢复。  
 - **建议优先做部署**：功能再强，无法安装则无法推广。  
 - 部署稳定后，再开 Jump / 会话树等产品项更合适。
+
+---
+
+## 13. 新会话开工提示词
+
+落实本方案时，可新开 AI/开发会话，整段复制：
+
+**[docs/prompts/start-deployment.md](prompts/start-deployment.md)**
 
 ---
 
