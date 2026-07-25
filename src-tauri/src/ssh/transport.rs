@@ -133,18 +133,23 @@ pub fn map_connect_error(e: impl ToString) -> AppError {
 }
 
 /// Connect interactive session via system OpenSSH.
+///
+/// `session_id` is captured by stdout pumps / `finish_session` so multi-session
+/// can route events (client UUID, required).
 pub async fn connect_session(
     app: AppHandle,
     params: ConnectParams,
+    session_id: String,
 ) -> Result<ActiveTransport, AppError> {
     info!(
         host = %params.host,
         port = params.port,
         user = %params.username,
+        session_id = %session_id,
         "connect via OpenSSH"
     );
 
-    let os = openssh::connect_openssh(app, params).await?;
+    let os = openssh::connect_openssh(app, params, session_id).await?;
 
     Ok(ActiveTransport {
         cmd_tx: os.cmd_tx,

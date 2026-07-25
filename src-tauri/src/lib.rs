@@ -28,6 +28,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             session::connect,
             session::disconnect,
+            session::close_session,
+            session::list_sessions,
             session::write_bytes,
             session::submit_line,
             session::complete_draft,

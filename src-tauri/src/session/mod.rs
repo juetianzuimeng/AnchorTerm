@@ -1,11 +1,19 @@
+//! Session commands and reconnect / cwd-restore playbooks.
+//!
+//! PR2: all session commands require client-generated `session_id`.
+//! Backend has no default / current session.
+
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{debug, info, warn};
 
-use crate::app_state::{AppState, CachedConnect, SessionState};
+use crate::app_state::{
+    AppState, CachedConnect, CwdEvent, SessionRuntime, SessionSnapshot, SessionState,
+};
 use crate::auth::credentials;
 use crate::auth::{AuthMethod, AuthType};
 use crate::config::{
@@ -18,21 +26,33 @@ use crate::ssh::transport::{connect_session, write_stdin, ConnectParams, Session
 
 const BACKOFF_SECS: &[u64] = &[1, 2, 5, 10, 30];
 
-fn emit_state(app: &AppHandle, state: &AppState) {
-    let _ = app.emit("session://state", state.snapshot());
+fn emit_state(app: &AppHandle, rt: &SessionRuntime) {
+    let _ = app.emit("session://state", rt.snapshot());
 }
 
-fn set_state(app: &AppHandle, state: &AppState, next: SessionState, message: Option<String>) {
+fn emit_cwd(app: &AppHandle, rt: &SessionRuntime, path: &str) {
+    let _ = app.emit(
+        "session://cwd",
+        CwdEvent {
+            session_id: rt.id.clone(),
+            cwd: path.to_string(),
+        },
+    );
+}
+
+fn set_state(app: &AppHandle, rt: &SessionRuntime, next: SessionState, message: Option<String>) {
     {
-        let mut meta = state.meta.lock().expect("meta lock");
+        let mut meta = rt.meta.lock().expect("meta lock");
         meta.state = next;
         meta.message = message;
     }
-    emit_state(app, state);
+    emit_state(app, rt);
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ConnectRequest {
+    /// Client-generated UUID (required). Inserted into the map before any emit.
+    pub session_id: String,
     pub host: String,
     pub port: u16,
     pub username: String,
@@ -42,25 +62,43 @@ pub struct ConnectRequest {
     pub profile_id: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ConnectResponse {
+    pub session_id: String,
+}
+
 #[tauri::command]
 pub async fn connect(
     app: AppHandle,
     state: State<'_, AppState>,
     mut req: ConnectRequest,
-) -> Result<(), String> {
-    connect_inner(&app, &state, &mut req, false)
+) -> Result<ConnectResponse, String> {
+    if req.session_id.trim().is_empty() {
+        return Err(AppError::Message("session_id 不能为空".into()).into());
+    }
+    // Insert (or reuse) runtime BEFORE any Connecting emit / SSH spawn.
+    let rt = state
+        .get_or_insert_runtime(req.session_id.trim())
+        .map_err(|e| -> String { e.into() })?;
+    // Normalize stored id from runtime.
+    req.session_id = rt.id.clone();
+
+    connect_inner(&app, rt, &mut req, false)
         .await
-        .map_err(Into::into)
+        .map_err(|e| -> String { e.into() })?;
+    Ok(ConnectResponse {
+        session_id: req.session_id,
+    })
 }
 
 async fn connect_inner(
     app: &AppHandle,
-    state: &AppState,
+    rt: Arc<SessionRuntime>,
     req: &mut ConnectRequest,
     is_reconnect: bool,
 ) -> Result<(), AppError> {
     {
-        let transport = state.transport.lock().expect("transport lock");
+        let transport = rt.transport.lock().expect("transport lock");
         if transport.is_some() {
             return Err(AppError::AlreadyConnected);
         }
@@ -68,10 +106,10 @@ async fn connect_inner(
 
     resolve_password(req)?;
 
-    state.set_term_size(req.cols, req.rows);
+    rt.set_term_size(req.cols, req.rows);
 
     {
-        let mut meta = state.meta.lock().expect("meta lock");
+        let mut meta = rt.meta.lock().expect("meta lock");
         meta.host = Some(req.host.clone());
         meta.username = Some(req.username.clone());
         if !is_reconnect {
@@ -85,14 +123,14 @@ async fn connect_inner(
 
     if !is_reconnect {
         // User-initiated connect: enable auto-reconnect for this session.
-        state.auto_reconnect.store(true, Ordering::SeqCst);
+        rt.auto_reconnect.store(true, Ordering::SeqCst);
         // Invalidate any old reconnect loops.
-        state.reconnect_gen.fetch_add(1, Ordering::SeqCst);
+        rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
 
         // Same host+user as last session + absolute restore path → keep and restore.
         // Different endpoint or no path → clear (fresh login home).
-        let prev = state.cached.lock().ok().and_then(|c| c.clone()).or_else(|| {
-            let meta = state.meta.lock().ok()?;
+        let prev = rt.cached.lock().ok().and_then(|c| c.clone()).or_else(|| {
+            let meta = rt.meta.lock().ok()?;
             Some(CachedConnect {
                 host: meta.host.clone().unwrap_or_default(),
                 port: 22,
@@ -112,14 +150,12 @@ async fn connect_inner(
             .unwrap_or(false);
 
         let keep_path = if same_endpoint {
-            state
-                .restore_target
+            rt.restore_target
                 .lock()
                 .ok()
                 .and_then(|r| r.clone())
                 .or_else(|| {
-                    state
-                        .cwd
+                    rt.cwd
                         .lock()
                         .ok()
                         .and_then(|c| c.last_known().map(|s| s.to_string()))
@@ -131,30 +167,33 @@ async fn connect_inner(
 
         if let Some(path) = keep_path {
             restore_on_user_connect = true;
-            if let Ok(mut rt) = state.restore_target.lock() {
-                *rt = Some(path.clone());
+            if let Ok(mut target) = rt.restore_target.lock() {
+                *target = Some(path.clone());
             }
-            if let Ok(mut cwd) = state.cwd.lock() {
+            if let Ok(mut cwd) = rt.cwd.lock() {
                 cwd.set(path.clone());
             }
             crate::ops_log::log(
                 "CWD",
-                &format!("user reconnect will restore path={path} (same host/user)"),
+                &format!(
+                    "user reconnect will restore path={path} (same host/user) sid={}",
+                    &rt.id[..rt.id.len().min(8)]
+                ),
             );
         } else {
-            if let Ok(mut cwd) = state.cwd.lock() {
+            if let Ok(mut cwd) = rt.cwd.lock() {
                 cwd.clear();
             }
-            if let Ok(mut rt) = state.restore_target.lock() {
-                *rt = None;
+            if let Ok(mut target) = rt.restore_target.lock() {
+                *target = None;
             }
             crate::ops_log::log("CWD", "user connect: no restore target (fresh cwd)");
         }
 
-        state.cwd_freeze.store(false, Ordering::SeqCst);
+        rt.cwd_freeze.store(false, Ordering::SeqCst);
         set_state(
             app,
-            state,
+            &rt,
             SessionState::Connecting,
             Some("正在连接…".into()),
         );
@@ -162,7 +201,7 @@ async fn connect_inner(
 
     // Cache credentials in memory for reconnect (never written to disk here).
     {
-        let mut cached = state.cached.lock().expect("cached lock");
+        let mut cached = rt.cached.lock().expect("cached lock");
         *cached = Some(CachedConnect {
             host: req.host.clone(),
             port: req.port,
@@ -184,12 +223,17 @@ async fn connect_inner(
     crate::ops_log::log(
         "SSH",
         &format!(
-            "connect_inner begin reconnect={is_reconnect} host={} port={} user={} cols={} rows={}",
-            req.host, req.port, req.username, req.cols, req.rows
+            "connect_inner begin sid={} reconnect={is_reconnect} host={} port={} user={} cols={} rows={}",
+            &rt.id[..rt.id.len().min(8)],
+            req.host,
+            req.port,
+            req.username,
+            req.cols,
+            req.rows
         ),
     );
 
-    match connect_session(app.clone(), params).await {
+    match connect_session(app.clone(), params, rt.id.clone()).await {
         Ok(transport) => {
             if let AuthMethod::Password {
                 password: Some(pw),
@@ -206,15 +250,15 @@ async fn connect_inner(
                 }
             }
 
-            *state.transport.lock().expect("transport lock") = Some(transport);
+            *rt.transport.lock().expect("transport lock") = Some(transport);
 
             {
-                let mut meta = state.meta.lock().expect("meta lock");
+                let mut meta = rt.meta.lock().expect("meta lock");
                 meta.attempt = 0;
             }
             set_state(
                 app,
-                state,
+                &rt,
                 SessionState::Connected,
                 Some(if is_reconnect {
                     "重连成功".into()
@@ -243,17 +287,17 @@ async fn connect_inner(
                         "run_restore_playbook start auto_reconnect={is_reconnect} user_restore={restore_on_user_connect}"
                     ),
                 );
-                run_restore_playbook(app, state).await;
+                run_restore_playbook(app, &rt).await;
             } else {
                 // Seed so relative `cd foo` can be resolved after first login.
-                schedule_seed_login_pwd(app, 900);
+                schedule_seed_login_pwd(app, Arc::clone(&rt), 900);
             }
             Ok(())
         }
         Err(e) => {
             crate::ops_log::log("ERR", &format!("connect failed: {e}"));
             if !is_reconnect {
-                set_state(app, state, SessionState::Failed, Some(e.to_string()));
+                set_state(app, &rt, SessionState::Failed, Some(e.to_string()));
             }
             Err(e)
         }
@@ -290,14 +334,14 @@ fn paths_equal(a: &str, b: &str) -> bool {
     trim_slash(a) == trim_slash(b)
 }
 
-fn session_still_connected(state: &AppState) -> bool {
-    let meta = state.meta.lock().expect("meta lock");
+fn session_still_connected(rt: &SessionRuntime) -> bool {
+    let meta = rt.meta.lock().expect("meta lock");
     matches!(meta.state, SessionState::Connected)
 }
 
-async fn send_pty_bytes(state: &AppState, data: Vec<u8>) -> bool {
+async fn send_pty_bytes(rt: &SessionRuntime, data: Vec<u8>) -> bool {
     let (stdin, alive) = {
-        let g = state.transport.lock().expect("transport lock");
+        let g = rt.transport.lock().expect("transport lock");
         match g.as_ref() {
             Some(t) => t.clone_writer(),
             None => return false,
@@ -322,17 +366,16 @@ async fn send_pty_bytes(state: &AppState, data: Vec<u8>) -> bool {
 ///
 /// Note: side-channel `exec pwd` starts a *new* process (always at login $HOME) and
 /// cannot observe the interactive shell cwd — do not use it to "verify" restore.
-async fn run_restore_playbook(app: &AppHandle, state: &AppState) {
+async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     // Prefer path frozen at disconnect — live last_known may already be $HOME
     // from the new login shell's OSC 7.
-    let path = state
+    let path = rt
         .restore_target
         .lock()
         .ok()
         .and_then(|r| r.clone())
         .or_else(|| {
-            state
-                .cwd
+            rt.cwd
                 .lock()
                 .ok()
                 .and_then(|c| c.last_known().map(|s| s.to_string()))
@@ -349,46 +392,62 @@ async fn run_restore_playbook(app: &AppHandle, state: &AppState) {
     }
 
     // Block OSC 7 home reports while we inject the first cd.
-    state.cwd_freeze.store(true, Ordering::SeqCst);
-    if let Ok(mut tracker) = state.cwd.lock() {
+    rt.cwd_freeze.store(true, Ordering::SeqCst);
+    if let Ok(mut tracker) = rt.cwd.lock() {
         tracker.set(path.clone());
     }
-    let _ = app.emit("session://cwd", path.clone());
+    emit_cwd(app, rt, &path);
 
     // Give login shell time to finish .bashrc / print banner before injecting cd.
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
-    if !session_still_connected(state) {
-        state.cwd_freeze.store(false, Ordering::SeqCst);
+    if !session_still_connected(rt) {
+        rt.cwd_freeze.store(false, Ordering::SeqCst);
         return;
     }
 
     // Existence check via side-channel exec is fine (filesystem, not interactive cwd).
-    let dir_ok = query_dir_exists(state, &path).await.unwrap_or(true);
+    let dir_ok = query_dir_exists(rt, &path).await.unwrap_or(true);
     if !dir_ok {
-        warn!(path = %path, "restore target missing on remote");
-        state.cwd_freeze.store(false, Ordering::SeqCst);
-        if let Ok(mut rt) = state.restore_target.lock() {
-            *rt = None;
+        warn!(path = %path, "restore target missing on remote; fall back to login home");
+        rt.cwd_freeze.store(false, Ordering::SeqCst);
+        // Drop poisoned path so the next disconnect does not re-freeze it.
+        if let Ok(mut target) = rt.restore_target.lock() {
+            *target = None;
         }
+        if let Ok(mut tracker) = rt.cwd.lock() {
+            tracker.clear();
+        }
+        emit_cwd(app, rt, "");
         set_state(
             app,
-            state,
+            rt,
             SessionState::Connected,
-            Some(format!("重连成功，但目录已不存在: {path}")),
+            Some(format!(
+                "重连成功；原目录不可用（{path}），已改用登录目录"
+            )),
         );
-        schedule_seed_login_pwd(app, 400);
+        crate::ops_log::log(
+            "CWD",
+            &format!("restore skipped missing path={path}; seeding login pwd"),
+        );
+        // Seed absolute $HOME via side-channel pwd (new process = login home only).
+        if let Some(state) = app.try_state::<AppState>() {
+            if let Ok(arc) = state.get_runtime(&rt.id) {
+                schedule_seed_login_pwd(app, arc, 400);
+            }
+        }
         return;
     }
 
     let cmd = restore_cd_command(&path);
     info!(path = %path, "restore playbook: silent cd (first send)");
 
-    if !send_pty_bytes(state, cmd.clone().into_bytes()).await {
-        state.cwd_freeze.store(false, Ordering::SeqCst);
+    if !send_pty_bytes(rt, cmd.clone().into_bytes()).await {
+        rt.cwd_freeze.store(false, Ordering::SeqCst);
         set_state(
             app,
-            state,
+            rt,
             SessionState::Connected,
             Some(format!("重连成功，但无法发送恢复目录命令: {path}")),
         );
@@ -397,19 +456,19 @@ async fn run_restore_playbook(app: &AppHandle, state: &AppState) {
 
     // Allow the line discipline to run `cd`.
     tokio::time::sleep(Duration::from_millis(550)).await;
-    if !session_still_connected(state) {
-        state.cwd_freeze.store(false, Ordering::SeqCst);
+    if !session_still_connected(rt) {
+        rt.cwd_freeze.store(false, Ordering::SeqCst);
         return;
     }
 
     // Observe OSC 7 (if installed). Side-channel pwd cannot see interactive cwd.
-    state.cwd_freeze.store(false, Ordering::SeqCst);
+    rt.cwd_freeze.store(false, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(800)).await;
-    if !session_still_connected(state) {
+    if !session_still_connected(rt) {
         return;
     }
 
-    let observed = state
+    let observed = rt
         .cwd
         .lock()
         .ok()
@@ -427,47 +486,47 @@ async fn run_restore_playbook(app: &AppHandle, state: &AppState) {
             observed = ?observed,
             "restore: OSC cwd mismatch, one retry"
         );
-        state.cwd_freeze.store(true, Ordering::SeqCst);
-        if !send_pty_bytes(state, cmd.into_bytes()).await {
-            state.cwd_freeze.store(false, Ordering::SeqCst);
+        rt.cwd_freeze.store(true, Ordering::SeqCst);
+        if !send_pty_bytes(rt, cmd.into_bytes()).await {
+            rt.cwd_freeze.store(false, Ordering::SeqCst);
             set_state(
                 app,
-                state,
+                rt,
                 SessionState::Connected,
                 Some(format!("重连成功，二次恢复目录失败: {path}")),
             );
             return;
         }
         tokio::time::sleep(Duration::from_millis(450)).await;
-        state.cwd_freeze.store(false, Ordering::SeqCst);
+        rt.cwd_freeze.store(false, Ordering::SeqCst);
     }
 
     // Bookkeeping: prefer target path for next disconnect restore.
-    if let Ok(mut tracker) = state.cwd.lock() {
+    if let Ok(mut tracker) = rt.cwd.lock() {
         tracker.set(path.clone());
     }
-    if let Ok(mut rt) = state.restore_target.lock() {
-        *rt = Some(path.clone());
+    if let Ok(mut target) = rt.restore_target.lock() {
+        *target = Some(path.clone());
     }
-    let _ = app.emit("session://cwd", path.clone());
+    emit_cwd(app, rt, &path);
     set_state(
         app,
-        state,
+        rt,
         SessionState::Connected,
         Some(format!("已恢复工作目录: {path}")),
     );
     info!(path = %path, retry = need_retry, "restore playbook done");
-    state.cwd_freeze.store(false, Ordering::SeqCst);
+    rt.cwd_freeze.store(false, Ordering::SeqCst);
 }
 
-fn connect_params_from_cache(state: &AppState) -> Result<ConnectParams, String> {
-    let cached = state
+fn connect_params_from_cache(rt: &SessionRuntime) -> Result<ConnectParams, String> {
+    let cached = rt
         .cached
         .lock()
         .expect("cached lock")
         .clone()
         .ok_or_else(|| "无会话凭据缓存".to_string())?;
-    let (cols, rows) = state.term_size();
+    let (cols, rows) = rt.term_size();
     Ok(ConnectParams {
         host: cached.host,
         port: cached.port,
@@ -478,8 +537,8 @@ fn connect_params_from_cache(state: &AppState) -> Result<ConnectParams, String> 
     })
 }
 
-async fn query_remote_pwd(state: &AppState) -> Result<String, String> {
-    let params = connect_params_from_cache(state)?;
+async fn query_remote_pwd(rt: &SessionRuntime) -> Result<String, String> {
+    let params = connect_params_from_cache(rt)?;
     let out = crate::ssh::openssh::openssh_exec(&params, "pwd -P")
         .await
         .map_err(|e| e.to_string())?;
@@ -491,8 +550,8 @@ async fn query_remote_pwd(state: &AppState) -> Result<String, String> {
     }
 }
 
-async fn query_dir_exists(state: &AppState, path: &str) -> Result<bool, String> {
-    let params = connect_params_from_cache(state)?;
+async fn query_dir_exists(rt: &SessionRuntime, path: &str) -> Result<bool, String> {
+    let params = connect_params_from_cache(rt)?;
     let quoted = crate::cwd::shell_single_quote(path);
     let cmd = format!("test -d {quoted} && echo AT_DIR_OK || echo AT_DIR_MISSING");
     let out = crate::ssh::openssh::openssh_exec(&params, &cmd)
@@ -503,25 +562,22 @@ async fn query_dir_exists(state: &AppState, path: &str) -> Result<bool, String> 
 
 /// Seed last_known from a fresh login shell's pwd (initial home). Safe only when
 /// the interactive shell has not yet changed directory.
-fn schedule_seed_login_pwd(app: &AppHandle, delay_ms: u64) {
+fn schedule_seed_login_pwd(app: &AppHandle, rt: Arc<SessionRuntime>, delay_ms: u64) {
     let app = app.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        let Some(state) = app.try_state::<AppState>() else {
-            return;
-        };
-        if state.cwd_freeze.load(Ordering::SeqCst) {
+        if rt.cwd_freeze.load(Ordering::SeqCst) {
             return;
         }
         {
-            let meta = state.meta.lock().expect("meta lock");
+            let meta = rt.meta.lock().expect("meta lock");
             if !matches!(meta.state, SessionState::Connected) {
                 return;
             }
         }
         // Only seed if we still have no absolute path.
         {
-            let cwd = state.cwd.lock().expect("cwd lock");
+            let cwd = rt.cwd.lock().expect("cwd lock");
             if cwd
                 .last_known()
                 .map(|p| p.starts_with('/'))
@@ -530,16 +586,16 @@ fn schedule_seed_login_pwd(app: &AppHandle, delay_ms: u64) {
                 return;
             }
         }
-        match query_remote_pwd(&state).await {
+        match query_remote_pwd(&rt).await {
             Ok(path) => {
-                if let Ok(mut tracker) = state.cwd.lock() {
+                if let Ok(mut tracker) = rt.cwd.lock() {
                     tracker.set(path.clone());
                 }
-                if let Ok(mut rt) = state.restore_target.lock() {
-                    *rt = Some(path.clone());
+                if let Ok(mut target) = rt.restore_target.lock() {
+                    *target = Some(path.clone());
                 }
-                let _ = app.emit("session://cwd", path);
-                let _ = app.emit("session://state", state.snapshot());
+                emit_cwd(&app, &rt, &path);
+                emit_state(&app, &rt);
                 debug!("seeded login pwd");
             }
             Err(e) => debug!(error = %e, "seed login pwd failed"),
@@ -547,79 +603,78 @@ fn schedule_seed_login_pwd(app: &AppHandle, delay_ms: u64) {
     });
 }
 
-/// Spawn background reconnect with exponential backoff.
-pub fn spawn_reconnect_loop(app: AppHandle) {
+/// Spawn background reconnect with exponential backoff for a specific session.
+pub fn spawn_reconnect_loop(app: AppHandle, session_id: String) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
-    if !state.auto_reconnect.load(Ordering::SeqCst) {
+    let Ok(rt) = state.get_runtime(&session_id) else {
+        return;
+    };
+    if !rt.auto_reconnect.load(Ordering::SeqCst) {
         return;
     }
 
-    let gen = state.reconnect_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let gen = rt.reconnect_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let app2 = app.clone();
 
     tokio::spawn(async move {
-        reconnect_loop(app2, gen).await;
+        reconnect_loop(app2, rt, gen).await;
     });
 }
 
-async fn reconnect_loop(app: AppHandle, gen: u64) {
+async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
     let mut attempt: u32 = 0;
 
     loop {
-        let Some(state) = app.try_state::<AppState>() else {
-            return;
-        };
-
-        if state.reconnect_gen.load(Ordering::SeqCst) != gen {
+        if rt.reconnect_gen.load(Ordering::SeqCst) != gen {
             return; // cancelled
         }
-        if !state.auto_reconnect.load(Ordering::SeqCst) {
+        if !rt.auto_reconnect.load(Ordering::SeqCst) {
             return;
         }
         // Already connected by someone else.
-        if state.transport.lock().expect("t").is_some() {
+        if rt.transport.lock().expect("t").is_some() {
             return;
         }
 
         attempt = attempt.saturating_add(1);
-        let delay = BACKOFF_SECS
-            [(attempt as usize - 1).min(BACKOFF_SECS.len() - 1)];
+        let delay = BACKOFF_SECS[(attempt as usize - 1).min(BACKOFF_SECS.len() - 1)];
 
         {
-            let mut meta = state.meta.lock().expect("meta lock");
+            let mut meta = rt.meta.lock().expect("meta lock");
             meta.state = SessionState::Reconnecting;
             meta.attempt = attempt;
             meta.message = Some(format!("重连中 ({attempt})，{delay}s 后重试…"));
         }
-        emit_state(&app, &state);
+        emit_state(&app, &rt);
 
         tokio::time::sleep(Duration::from_secs(delay)).await;
 
-        if state.reconnect_gen.load(Ordering::SeqCst) != gen {
+        if rt.reconnect_gen.load(Ordering::SeqCst) != gen {
             return;
         }
-        if !state.auto_reconnect.load(Ordering::SeqCst) {
+        if !rt.auto_reconnect.load(Ordering::SeqCst) {
             return;
         }
-        if state.transport.lock().expect("t").is_some() {
+        if rt.transport.lock().expect("t").is_some() {
             return;
         }
 
-        let cached = state.cached.lock().expect("cached").clone();
+        let cached = rt.cached.lock().expect("cached").clone();
         let Some(cached) = cached else {
             set_state(
                 &app,
-                &state,
+                &rt,
                 SessionState::Failed,
                 Some("无法自动重连：会话凭据已丢失，请重新连接".into()),
             );
             return;
         };
 
-        let (cols, rows) = state.term_size();
+        let (cols, rows) = rt.term_size();
         let mut req = ConnectRequest {
+            session_id: rt.id.clone(),
             host: cached.host,
             port: cached.port,
             username: cached.username,
@@ -630,12 +685,12 @@ async fn reconnect_loop(app: AppHandle, gen: u64) {
         };
 
         {
-            let mut meta = state.meta.lock().expect("meta lock");
+            let mut meta = rt.meta.lock().expect("meta lock");
             meta.message = Some(format!("重连中 ({attempt})…"));
         }
-        emit_state(&app, &state);
+        emit_state(&app, &rt);
 
-        match connect_inner(&app, &state, &mut req, true).await {
+        match connect_inner(&app, Arc::clone(&rt), &mut req, true).await {
             Ok(()) => {
                 info!(attempt, "auto-reconnect succeeded");
                 crate::ops_log::log("SSH", &format!("auto-reconnect succeeded attempt={attempt}"));
@@ -650,68 +705,138 @@ async fn reconnect_loop(app: AppHandle, gen: u64) {
                 // Permanent auth failures must not spin forever.
                 let permanent = matches!(e, AppError::Auth(_));
                 if permanent {
-                    state.auto_reconnect.store(false, Ordering::SeqCst);
+                    rt.auto_reconnect.store(false, Ordering::SeqCst);
                     set_state(
                         &app,
-                        &state,
+                        &rt,
                         SessionState::Failed,
                         Some(format!("认证失败，已停止自动重连: {e}")),
                     );
                     return;
                 }
                 {
-                    let mut meta = state.meta.lock().expect("meta lock");
+                    let mut meta = rt.meta.lock().expect("meta lock");
                     meta.state = SessionState::Reconnecting;
                     meta.attempt = attempt;
                     meta.message = Some(format!("重连失败 ({attempt}): {e}"));
                 }
-                emit_state(&app, &state);
+                emit_state(&app, &rt);
             }
         }
     }
 }
 
 #[tauri::command]
-pub async fn disconnect(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
-    disconnect_inner(&state, &app).map_err(Into::into)
+pub async fn disconnect(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    session_id: String,
+) -> Result<(), String> {
+    let rt = state.get_runtime(&session_id).map_err(|e| -> String { e.into() })?;
+    disconnect_inner(&rt, &app).map_err(Into::into)
 }
 
-fn disconnect_inner(state: &AppState, app: &AppHandle) -> Result<(), AppError> {
+/// Close tab: cancel reconnect, drop transport (temp key), remove from map.
+/// Order per design §3.4.1.
+#[tauri::command]
+pub async fn close_session(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    session_id: String,
+) -> Result<(), String> {
+    close_session_inner(&state, &app, &session_id).map_err(Into::into)
+}
+
+fn close_session_inner(
+    state: &AppState,
+    app: &AppHandle,
+    session_id: &str,
+) -> Result<(), AppError> {
+    let rt = state.get_runtime(session_id)?;
+    crate::ops_log::log(
+        "UI",
+        &format!(
+            "close_session sid={}",
+            &session_id[..session_id.len().min(8)]
+        ),
+    );
+    // 1–4: cancel reconnect + clear freeze
+    rt.auto_reconnect.store(false, Ordering::SeqCst);
+    rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
+    rt.cwd_freeze.store(false, Ordering::SeqCst);
+    // 5: take transport → Drop SecureKeyMaterial
+    let transport = rt.transport.lock().expect("transport lock").take();
+    if let Some(t) = transport {
+        let _ = t.cmd_tx.send(SessionCommand::Disconnect);
+    }
+    // 7: remove from map last
+    state.remove_runtime(session_id);
+    // Notify UI (optional snapshot of gone session — emit idle then gone)
+    let _ = app.emit(
+        "session://state",
+        SessionSnapshot {
+            session_id: session_id.to_string(),
+            state: SessionState::Idle,
+            host: None,
+            username: None,
+            message: Some("会话已关闭".into()),
+            cwd: None,
+            attempt: None,
+        },
+    );
+    crate::ops_log::log(
+        "STATE",
+        &format!(
+            "close_session removed sid={}",
+            &session_id[..session_id.len().min(8)]
+        ),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_sessions(
+    state: State<'_, AppState>,
+) -> Result<Vec<SessionSnapshot>, String> {
+    Ok(state.list_snapshots())
+}
+
+fn disconnect_inner(rt: &SessionRuntime, app: &AppHandle) -> Result<(), AppError> {
     crate::ops_log::log("UI", "disconnect manual");
     // Disable auto-reconnect for this session (manual disconnect).
-    state.auto_reconnect.store(false, Ordering::SeqCst);
-    state.reconnect_gen.fetch_add(1, Ordering::SeqCst);
+    rt.auto_reconnect.store(false, Ordering::SeqCst);
+    rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
 
     // Freeze absolute cwd so the next user-initiated connect can restore it.
-    freeze_restore_target_from_cwd(state, "manual disconnect");
+    freeze_restore_target_from_cwd(rt, "manual disconnect");
 
-    let transport = state.transport.lock().expect("transport lock").take();
+    let transport = rt.transport.lock().expect("transport lock").take();
     if let Some(t) = transport {
         let _ = t.cmd_tx.send(SessionCommand::Disconnect);
     }
 
     {
-        let mut meta = state.meta.lock().expect("meta lock");
+        let mut meta = rt.meta.lock().expect("meta lock");
         meta.state = SessionState::Idle;
         meta.message = Some("已手动断开".into());
         meta.attempt = 0;
     }
-    emit_state(app, state);
+    emit_state(app, rt);
     crate::ops_log::log("STATE", "idle (manual disconnect)");
     Ok(())
 }
 
 /// Remember absolute cwd for a later reconnect / user re-connect restore.
-fn freeze_restore_target_from_cwd(state: &AppState, reason: &str) {
-    let path = state
+fn freeze_restore_target_from_cwd(rt: &SessionRuntime, reason: &str) {
+    let path = rt
         .cwd
         .lock()
         .ok()
         .and_then(|c| c.last_known().map(|s| s.to_string()))
         .filter(|p| p.starts_with('/'));
     if let Some(path) = path {
-        if let Ok(mut rt) = state.restore_target.lock() {
-            *rt = Some(path.clone());
+        if let Ok(mut target) = rt.restore_target.lock() {
+            *target = Some(path.clone());
         }
         crate::ops_log::log(
             "CWD",
@@ -726,28 +851,33 @@ fn freeze_restore_target_from_cwd(state: &AppState, reason: &str) {
 }
 
 #[tauri::command]
-pub async fn write_bytes(state: State<'_, AppState>, data_b64: String) -> Result<(), String> {
-    write_inner(&state, data_b64).await.map_err(Into::into)
+pub async fn write_bytes(
+    state: State<'_, AppState>,
+    session_id: String,
+    data_b64: String,
+) -> Result<(), String> {
+    let rt = state.get_runtime(&session_id).map_err(|e| -> String { e.into() })?;
+    write_inner(&rt, data_b64).await.map_err(Into::into)
 }
 
-async fn write_inner(state: &AppState, data_b64: String) -> Result<(), AppError> {
+async fn write_inner(rt: &SessionRuntime, data_b64: String) -> Result<(), AppError> {
     use base64::Engine;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(data_b64)
         .map_err(|e| AppError::Message(format!("无效的 base64 输入: {e}")))?;
 
-    // Track cd from submitted lines (fallback when no OSC 7).
+    // Track cd from submitted lines (fallback when no OSC 7). Optimistic — may roll back.
     if let Ok(text) = std::str::from_utf8(&bytes) {
         for line in text.split(['\n', '\r']) {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            if let Ok(mut cwd) = state.cwd.lock() {
-                if let Some(path) = cwd.feed_submitted_line(line) {
-                    if path.starts_with('/') {
-                        if let Ok(mut rt) = state.restore_target.lock() {
-                            *rt = Some(path);
+            if let Ok(mut cwd) = rt.cwd.lock() {
+                if let Some(ch) = cwd.feed_submitted_line(line) {
+                    if let Some(path) = ch.path.filter(|p| p.starts_with('/')) {
+                        if let Ok(mut target) = rt.restore_target.lock() {
+                            *target = Some(path);
                         }
                     }
                 }
@@ -756,7 +886,7 @@ async fn write_inner(state: &AppState, data_b64: String) -> Result<(), AppError>
     }
 
     let (stdin, alive) = {
-        let transport = state.transport.lock().expect("transport lock");
+        let transport = rt.transport.lock().expect("transport lock");
         transport
             .as_ref()
             .ok_or(AppError::NotConnected)?
@@ -771,15 +901,17 @@ async fn write_inner(state: &AppState, data_b64: String) -> Result<(), AppError>
 pub async fn submit_line(
     state: State<'_, AppState>,
     app: AppHandle,
+    session_id: String,
     line: String,
 ) -> Result<(), String> {
-    submit_line_inner(&state, &app, line)
+    let rt = state.get_runtime(&session_id).map_err(|e| -> String { e.into() })?;
+    submit_line_inner(&rt, &app, line)
         .await
         .map_err(Into::into)
 }
 
 async fn submit_line_inner(
-    state: &AppState,
+    rt: &SessionRuntime,
     app: &AppHandle,
     line: String,
 ) -> Result<(), AppError> {
@@ -790,7 +922,7 @@ async fn submit_line_inner(
     }
 
     let (stdin, alive) = {
-        let transport = state.transport.lock().expect("transport lock");
+        let transport = rt.transport.lock().expect("transport lock");
         transport
             .as_ref()
             .ok_or(AppError::NotConnected)?
@@ -817,22 +949,24 @@ async fn submit_line_inner(
     info!("submit_line write ok");
     crate::ops_log::log("CMD", &format!("submit_line ok line=\"{logical}\""));
 
-    // Track cwd from the submitted line (best-effort; OSC 7 remains source of truth).
+    // Track cwd from the submitted line (optimistic; OSC 7 / failure echo may correct).
     // IMPORTANT: release `cwd` before emit_state/snapshot — snapshot() also locks cwd
     // and std::sync::Mutex is not reentrant (deadlock froze the stdout pump after `cd`).
-    let new_cwd = {
-        let mut cwd = state.cwd.lock().expect("cwd lock");
+    let change = {
+        let mut cwd = rt.cwd.lock().expect("cwd lock");
         cwd.feed_submitted_line(logical)
     };
-    if let Some(path) = new_cwd {
-        crate::ops_log::log("CWD", &format!("from_cd_parse path={path}"));
-        if path.starts_with('/') {
-            if let Ok(mut rt) = state.restore_target.lock() {
-                *rt = Some(path.clone());
+    if let Some(ch) = change {
+        if let Some(ref path) = ch.path {
+            crate::ops_log::log("CWD", &format!("from_cd_parse path={path}"));
+            if path.starts_with('/') {
+                if let Ok(mut target) = rt.restore_target.lock() {
+                    *target = Some(path.clone());
+                }
             }
+            emit_cwd(app, rt, path);
         }
-        let _ = app.emit("session://cwd", &path);
-        emit_state(app, state);
+        emit_state(app, rt);
     }
 
     Ok(())
@@ -842,31 +976,33 @@ async fn submit_line_inner(
 #[tauri::command]
 pub async fn complete_draft(
     state: State<'_, AppState>,
+    session_id: String,
     line: String,
     cursor: usize,
 ) -> Result<crate::ssh::complete::CompleteResult, String> {
-    complete_draft_inner(&state, line, cursor).await
+    let rt = state.get_runtime(&session_id).map_err(|e| -> String { e.into() })?;
+    complete_draft_inner(&rt, line, cursor).await
 }
 
 async fn complete_draft_inner(
-    state: &AppState,
+    rt: &SessionRuntime,
     line: String,
     cursor: usize,
 ) -> Result<crate::ssh::complete::CompleteResult, String> {
     {
-        let meta = state.meta.lock().expect("meta lock");
+        let meta = rt.meta.lock().expect("meta lock");
         if !matches!(meta.state, SessionState::Connected) {
             return Err("未连接，无法补全".into());
         }
     }
 
-    let cwd = state
+    let cwd = rt
         .cwd
         .lock()
         .ok()
         .and_then(|c| c.last_known().map(|s| s.to_string()));
 
-    let params = connect_params_from_cache(state)?;
+    let params = connect_params_from_cache(rt)?;
 
     crate::ops_log::log(
         "CMD",
@@ -917,15 +1053,21 @@ async fn complete_draft_inner(
 }
 
 #[tauri::command]
-pub async fn resize(state: State<'_, AppState>, cols: u32, rows: u32) -> Result<(), String> {
-    resize_inner(&state, cols, rows).await.map_err(Into::into)
+pub async fn resize(
+    state: State<'_, AppState>,
+    session_id: String,
+    cols: u32,
+    rows: u32,
+) -> Result<(), String> {
+    let rt = state.get_runtime(&session_id).map_err(|e| -> String { e.into() })?;
+    resize_inner(&rt, cols, rows).await.map_err(Into::into)
 }
 
-async fn resize_inner(state: &AppState, cols: u32, rows: u32) -> Result<(), AppError> {
+async fn resize_inner(rt: &SessionRuntime, cols: u32, rows: u32) -> Result<(), AppError> {
     let cols = cols.max(20);
     let rows = rows.max(5);
-    let (prev_c, prev_r) = state.term_size();
-    state.set_term_size(cols, rows);
+    let (prev_c, prev_r) = rt.term_size();
+    rt.set_term_size(cols, rows);
 
     // Skip no-op / tiny jitter resizes to avoid flooding the interactive shell
     // with `stty` commands (was racing with user input after connect).
@@ -934,18 +1076,17 @@ async fn resize_inner(state: &AppState, cols: u32, rows: u32) -> Result<(), AppE
     }
 
     let (stdin, alive) = {
-        let transport = state.transport.lock().expect("transport lock");
+        let transport = rt.transport.lock().expect("transport lock");
         match transport.as_ref() {
             Some(t) => t.clone_writer(),
             None => return Ok(()),
         }
     };
 
-    // Debounce: only push remote stty if last inject was > 800ms ago.
+    // Debounce: only push remote stty if last inject was > 800ms ago (per session).
     {
         use std::time::{Duration, Instant};
-        static LAST_STTY: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
-        let mut g = LAST_STTY.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = rt.last_stty.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t0) = *g {
             if t0.elapsed() < Duration::from_millis(800) {
                 crate::ops_log::log(
@@ -960,7 +1101,10 @@ async fn resize_inner(state: &AppState, cols: u32, rows: u32) -> Result<(), AppE
 
     // Best-effort remote stty (OpenSSH pipe has no SIGWINCH).
     let cmd = format!("stty cols {cols} rows {rows} 2>/dev/null\r");
-    crate::ops_log::log("SSH", &format!("resize → remote stty cols={cols} rows={rows}"));
+    crate::ops_log::log(
+        "SSH",
+        &format!("resize → remote stty cols={cols} rows={rows}"),
+    );
     let _ = write_stdin(&stdin, &alive, cmd.as_bytes()).await;
     Ok(())
 }
@@ -968,8 +1112,10 @@ async fn resize_inner(state: &AppState, cols: u32, rows: u32) -> Result<(), AppE
 #[tauri::command]
 pub async fn get_session_snapshot(
     state: State<'_, AppState>,
-) -> Result<crate::app_state::SessionSnapshot, String> {
-    Ok(state.snapshot())
+    session_id: String,
+) -> Result<SessionSnapshot, String> {
+    let rt = state.get_runtime(&session_id).map_err(|e| -> String { e.into() })?;
+    Ok(rt.snapshot())
 }
 
 // --- Profile commands ---

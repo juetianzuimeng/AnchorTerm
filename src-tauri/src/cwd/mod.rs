@@ -1,12 +1,39 @@
 //! Working-directory tracking: OSC 7 (primary) + simple `cd` line parsing (fallback).
+//!
+//! Optimistic `cd`/`pushd` updates are rolled back when the remote shell reports
+//! failure (e.g. `bash: cd: tg: No such file or directory`). Without OSC 7 this
+//! is the main defense against a poisoned `restore_target`.
 
 use std::path::{Component, Path};
+
+/// Why `last_known` changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CwdChangeReason {
+    Osc7,
+    CdParse,
+    /// Optimistic cd/pushd rolled back after remote error.
+    CdRollback,
+}
+
+/// A cwd change for UI / restore_target bookkeeping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CwdChange {
+    /// Absolute path after the change, or `None` if unknown after rollback.
+    pub path: Option<String>,
+    pub reason: CwdChangeReason,
+}
 
 /// Tracks remote cwd without logging secrets.
 #[derive(Debug, Default, Clone)]
 pub struct CwdTracker {
     last_known: Option<String>,
+    /// `last_known` before the latest optimistic cd/pushd (for rollback).
+    pre_optimistic: Option<String>,
+    /// Optimistic path still awaiting confirmation / possible failure echo.
+    optimistic_path: Option<String>,
     osc: OscParser,
+    /// Incomplete line buffer for scanning shell error messages (UTF-8 lossy).
+    line_buf: String,
 }
 
 impl CwdTracker {
@@ -22,29 +49,157 @@ impl CwdTracker {
         let p = path.into();
         if !p.is_empty() {
             self.last_known = Some(p);
+            self.clear_optimistic();
         }
     }
 
     pub fn clear(&mut self) {
         self.last_known = None;
+        self.clear_optimistic();
         self.osc = OscParser::default();
+        self.line_buf.clear();
     }
 
-    /// Feed remote stdout/stderr bytes. Returns newly discovered cwd if any.
-    pub fn feed_output(&mut self, data: &[u8]) -> Option<String> {
+    fn clear_optimistic(&mut self) {
+        self.pre_optimistic = None;
+        self.optimistic_path = None;
+    }
+
+    /// Feed remote stdout/stderr bytes.
+    /// Returns a change when OSC 7 reports a path, or when a failed `cd` is rolled back.
+    pub fn feed_output(&mut self, data: &[u8]) -> Option<CwdChange> {
+        // OSC 7 is source of truth — clears any pending optimistic path.
         if let Some(path) = self.osc.push(data) {
             self.last_known = Some(path.clone());
-            return Some(path);
+            self.clear_optimistic();
+            return Some(CwdChange {
+                path: Some(path),
+                reason: CwdChangeReason::Osc7,
+            });
+        }
+
+        // Scan printable text for bash/zsh cd failures.
+        let text = String::from_utf8_lossy(data);
+        self.line_buf.push_str(&text);
+        // Cap buffer to avoid unbounded growth on binary noise.
+        if self.line_buf.len() > 8192 {
+            let keep = self.line_buf.len() - 4096;
+            self.line_buf.drain(..keep);
+        }
+
+        // Process complete lines (split on \n / \r).
+        let mut rolled_back = false;
+        loop {
+            let Some(pos) = self.line_buf.find(['\n', '\r']) else {
+                break;
+            };
+            let head = self.line_buf[..pos].to_string();
+            let mut rest_start = pos;
+            let b = self.line_buf.as_bytes();
+            while rest_start < b.len() && (b[rest_start] == b'\n' || b[rest_start] == b'\r') {
+                rest_start += 1;
+            }
+            self.line_buf = self.line_buf[rest_start..].to_string();
+
+            if looks_like_cd_failure(&head) && self.rollback_optimistic() {
+                rolled_back = true;
+                break;
+            }
+        }
+        // Partial line still in buffer may already contain the full error (rare without \n).
+        if !rolled_back
+            && self.optimistic_path.is_some()
+            && looks_like_cd_failure(&self.line_buf)
+            && self.rollback_optimistic()
+        {
+            self.line_buf.clear();
+            rolled_back = true;
+        }
+
+        if rolled_back {
+            return Some(CwdChange {
+                path: self.last_known.clone(),
+                reason: CwdChangeReason::CdRollback,
+            });
         }
         None
     }
 
     /// Feed a full user-submitted line (without trailing newline).
-    pub fn feed_submitted_line(&mut self, line: &str) -> Option<String> {
+    /// Applies optimistic cwd for `cd`/`pushd` and remembers prior path for rollback.
+    pub fn feed_submitted_line(&mut self, line: &str) -> Option<CwdChange> {
         let path = parse_directory_command(line, self.last_known.as_deref())?;
+        self.pre_optimistic = self.last_known.clone();
+        self.optimistic_path = Some(path.clone());
         self.last_known = Some(path.clone());
-        Some(path)
+        // Reset line scan so old errors don't false-trigger.
+        self.line_buf.clear();
+        Some(CwdChange {
+            path: Some(path),
+            reason: CwdChangeReason::CdParse,
+        })
     }
+
+    /// Roll back last optimistic cd if still pending. Returns true if rolled back.
+    fn rollback_optimistic(&mut self) -> bool {
+        let Some(pending) = self.optimistic_path.take() else {
+            self.pre_optimistic = None;
+            return false;
+        };
+        // Only roll back if nothing else (OSC) already replaced last_known.
+        if self.last_known.as_ref() == Some(&pending) {
+            self.last_known = self.pre_optimistic.take();
+            true
+        } else {
+            self.pre_optimistic = None;
+            false
+        }
+    }
+}
+
+/// Detect bash/zsh style directory-change failures.
+fn looks_like_cd_failure(line: &str) -> bool {
+    // Strip simple CSI sequences for matching (best-effort).
+    let plain = strip_ansi_lite(line);
+    let l = plain.to_ascii_lowercase();
+    // e.g. "-bash: cd: tg: No such file or directory"
+    let is_cdish = l.contains("cd:") || l.contains("pushd:") || l.contains("popd:");
+    if !is_cdish {
+        return false;
+    }
+    l.contains("no such file")
+        || l.contains("not a directory")
+        || l.contains("permission denied")
+        || l.contains("too many arguments")
+}
+
+/// Minimal ANSI CSI stripper for error-line matching.
+fn strip_ansi_lite(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for x in chars.by_ref() {
+                    if x.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else if chars.peek() == Some(&']') {
+                // OSC ... BEL or ST — skip until BEL
+                chars.next();
+                for x in chars.by_ref() {
+                    if x == '\u{07}' {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Escape a path for POSIX `cd -- '...'`.
@@ -134,7 +289,6 @@ impl OscParser {
                         self.state = OscState::Idle;
                     } else if b == 0x1b {
                         self.body.push(0x1b);
-                        // stay OscEsc? treat as another ESC
                         self.state = OscState::OscEsc;
                     } else {
                         self.body.push(0x1b);
@@ -353,7 +507,9 @@ mod tests {
     fn osc7_bel() {
         let mut t = CwdTracker::new();
         let seq = b"\x1b]7;file://host/tmp/demo\x07";
-        assert_eq!(t.feed_output(seq).as_deref(), Some("/tmp/demo"));
+        let ch = t.feed_output(seq).unwrap();
+        assert_eq!(ch.path.as_deref(), Some("/tmp/demo"));
+        assert_eq!(ch.reason, CwdChangeReason::Osc7);
         assert_eq!(t.last_known(), Some("/tmp/demo"));
     }
 
@@ -361,7 +517,10 @@ mod tests {
     fn osc7_st() {
         let mut t = CwdTracker::new();
         let seq = b"\x1b]7;file://localhost/var/log\x1b\\";
-        assert_eq!(t.feed_output(seq).as_deref(), Some("/var/log"));
+        assert_eq!(
+            t.feed_output(seq).unwrap().path.as_deref(),
+            Some("/var/log")
+        );
     }
 
     #[test]
@@ -369,21 +528,27 @@ mod tests {
         let mut t = CwdTracker::new();
         let path = "/tmp/%E4%B8%AD%E6%96%87";
         let seq = format!("\x1b]7;file://h{path}\x07");
-        assert_eq!(t.feed_output(seq.as_bytes()).unwrap(), "/tmp/中文");
+        assert_eq!(t.feed_output(seq.as_bytes()).unwrap().path.unwrap(), "/tmp/中文");
     }
 
     #[test]
     fn osc7_split_chunks() {
         let mut t = CwdTracker::new();
         assert!(t.feed_output(b"\x1b]7;file://x/a").is_none());
-        assert_eq!(t.feed_output(b"bc\x07").as_deref(), Some("/abc"));
+        assert_eq!(
+            t.feed_output(b"bc\x07").unwrap().path.as_deref(),
+            Some("/abc")
+        );
     }
 
     #[test]
     fn cd_absolute() {
         let mut t = CwdTracker::new();
         assert_eq!(
-            t.feed_submitted_line("cd /tmp/foo").as_deref(),
+            t.feed_submitted_line("cd /tmp/foo")
+                .unwrap()
+                .path
+                .as_deref(),
             Some("/tmp/foo")
         );
     }
@@ -392,7 +557,10 @@ mod tests {
     fn cd_quoted_spaces() {
         let mut t = CwdTracker::new();
         assert_eq!(
-            t.feed_submitted_line("cd '/tmp/my dir'").as_deref(),
+            t.feed_submitted_line("cd '/tmp/my dir'")
+                .unwrap()
+                .path
+                .as_deref(),
             Some("/tmp/my dir")
         );
     }
@@ -402,7 +570,10 @@ mod tests {
         let mut t = CwdTracker::new();
         t.set("/home/user");
         assert_eq!(
-            t.feed_submitted_line("cd projects/app").as_deref(),
+            t.feed_submitted_line("cd projects/app")
+                .unwrap()
+                .path
+                .as_deref(),
             Some("/home/user/projects/app")
         );
     }
@@ -412,7 +583,7 @@ mod tests {
         let mut t = CwdTracker::new();
         t.set("/home/user/a");
         assert_eq!(
-            t.feed_submitted_line("cd ..").as_deref(),
+            t.feed_submitted_line("cd ..").unwrap().path.as_deref(),
             Some("/home/user")
         );
     }
@@ -421,7 +592,10 @@ mod tests {
     fn cd_chinese_path() {
         let mut t = CwdTracker::new();
         assert_eq!(
-            t.feed_submitted_line("cd '/data/项目/代码'").as_deref(),
+            t.feed_submitted_line("cd '/data/项目/代码'")
+                .unwrap()
+                .path
+                .as_deref(),
             Some("/data/项目/代码")
         );
         assert_eq!(
@@ -439,5 +613,62 @@ mod tests {
     #[test]
     fn restore_cmd() {
         assert_eq!(restore_cd_command("/tmp/x"), "cd -- '/tmp/x'\r");
+    }
+
+    /// Regression: failed `cd tg` must not poison base for following `cd tg1`.
+    #[test]
+    fn rollback_failed_cd_then_relative_ok() {
+        let mut t = CwdTracker::new();
+        t.set("/home/tguser");
+
+        let ch = t.feed_submitted_line("cd tg").unwrap();
+        assert_eq!(ch.path.as_deref(), Some("/home/tguser/tg"));
+        assert_eq!(ch.reason, CwdChangeReason::CdParse);
+
+        // Same shape as production log.
+        let err = b"-bash: cd: tg: No such file or directory\r\n";
+        let rb = t.feed_output(err).unwrap();
+        assert_eq!(rb.reason, CwdChangeReason::CdRollback);
+        assert_eq!(rb.path.as_deref(), Some("/home/tguser"));
+        assert_eq!(t.last_known(), Some("/home/tguser"));
+
+        let ok = t.feed_submitted_line("cd tg1").unwrap();
+        assert_eq!(ok.path.as_deref(), Some("/home/tguser/tg1"));
+    }
+
+    #[test]
+    fn rollback_does_not_fire_without_optimistic() {
+        let mut t = CwdTracker::new();
+        t.set("/home/tguser");
+        let err = b"-bash: cd: tg: No such file or directory\r\n";
+        assert!(t.feed_output(err).is_none());
+        assert_eq!(t.last_known(), Some("/home/tguser"));
+    }
+
+    #[test]
+    fn osc7_clears_optimistic_without_rollback() {
+        let mut t = CwdTracker::new();
+        t.set("/home/tguser");
+        t.feed_submitted_line("cd tg1").unwrap();
+        let osc = b"\x1b]7;file://host/home/tguser/tg1\x07";
+        let ch = t.feed_output(osc).unwrap();
+        assert_eq!(ch.reason, CwdChangeReason::Osc7);
+        // Failure for old name must not roll back OSC-confirmed path.
+        assert!(t
+            .feed_output(b"-bash: cd: tg: No such file or directory\r\n")
+            .is_none());
+        assert_eq!(t.last_known(), Some("/home/tguser/tg1"));
+    }
+
+    #[test]
+    fn looks_like_cd_failure_samples() {
+        assert!(looks_like_cd_failure(
+            "-bash: cd: tg: No such file or directory"
+        ));
+        assert!(looks_like_cd_failure(
+            "bash: cd: foo: Not a directory"
+        ));
+        assert!(!looks_like_cd_failure("cd tg1"));
+        assert!(!looks_like_cd_failure("ls: cannot access"));
     }
 }

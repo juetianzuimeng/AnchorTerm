@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::app_state::{AppState, SessionSnapshot, SessionState};
+use crate::app_state::{AppState, CwdEvent, DataEvent, SessionSnapshot, SessionState};
 use crate::auth::AuthMethod;
 use crate::error::AppError;
 use crate::ssh::transport::{ConnectParams, SessionCommand};
@@ -317,9 +317,13 @@ fn build_ssh_args(params: &ConnectParams) -> Result<BuiltArgs, AppError> {
 }
 
 /// Connect using system OpenSSH; only returns Ok after auth appears successful.
+///
+/// `session_id` is bound into stdout/stderr pumps and the child-wait task so
+/// `on_data` / `finish_session` never touch a global singleton session.
 pub async fn connect_openssh(
     app: AppHandle,
     params: ConnectParams,
+    session_id: String,
 ) -> Result<OpensshTransport, AppError> {
     let ssh = find_ssh()?;
     let built = build_ssh_args(&params)?;
@@ -328,12 +332,14 @@ pub async fn connect_openssh(
         ssh = %ssh.display(),
         host = %params.host,
         user = %params.username,
+        session_id = %session_id,
         "openssh connect"
     );
     crate::ops_log::log(
         "SSH",
         &format!(
-            "openssh connect begin host={} port={} user={} auth={}",
+            "openssh connect begin sid={} host={} port={} user={} auth={}",
+            &session_id[..session_id.len().min(8)],
             params.host,
             params.port,
             params.username,
@@ -411,16 +417,18 @@ pub async fn connect_openssh(
 
     // stdout → UI + buffer
     let app_out = app.clone();
+    let sid_out = session_id.clone();
     let out_b = Arc::clone(&out_buf);
     tokio::spawn(async move {
-        pump_stream(app_out, stdout, Some(out_b)).await;
+        pump_stream(app_out, sid_out, stdout, Some(out_b)).await;
     });
 
     // stderr → UI + buffer
     let app_err = app.clone();
+    let sid_err = session_id.clone();
     let err_b = Arc::clone(&err_buf);
     tokio::spawn(async move {
-        pump_stream(app_err, stderr, Some(err_b)).await;
+        pump_stream(app_err, sid_err, stderr, Some(err_b)).await;
     });
 
     // ---- Wait for auth success (or fail fast) before reporting Connected ----
@@ -511,6 +519,7 @@ pub async fn connect_openssh(
 
     // Background: wait for later exit (network drop, etc.)
     let app_wait = app.clone();
+    let sid_wait = session_id.clone();
     let alive_w = Arc::clone(&alive);
     tokio::spawn(async move {
         let status = child.wait().await;
@@ -527,7 +536,7 @@ pub async fn connect_openssh(
                 crate::ops_log::log("ERR", &format!("ssh child wait error: {e}"));
             }
         }
-        finish_session(app_wait, false).await;
+        finish_session(app_wait, sid_wait, false).await;
     });
 
     // Control: disconnect
@@ -583,6 +592,7 @@ async fn control_loop(
 
 async fn pump_stream<R: AsyncReadExt + Unpin>(
     app: AppHandle,
+    session_id: String,
     mut stream: R,
     mirror: Option<Arc<Mutex<String>>>,
 ) {
@@ -593,7 +603,10 @@ async fn pump_stream<R: AsyncReadExt + Unpin>(
             Ok(0) => {
                 crate::ops_log::log(
                     "SSH",
-                    &format!("ssh stream EOF (pump end) bytes_read={total}"),
+                    &format!(
+                        "ssh stream EOF (pump end) sid={} bytes_read={total}",
+                        &session_id[..session_id.len().min(8)]
+                    ),
                 );
                 break;
             }
@@ -606,7 +619,7 @@ async fn pump_stream<R: AsyncReadExt + Unpin>(
                         g.push_str(&String::from_utf8_lossy(&buf[..n]));
                     }
                 }
-                on_data(&app, &buf[..n]);
+                on_data(&app, &session_id, &buf[..n]);
             }
             Err(e) => {
                 warn!(error = %e, "ssh stream read error");
@@ -620,85 +633,178 @@ async fn pump_stream<R: AsyncReadExt + Unpin>(
     }
 }
 
-fn on_data(app: &AppHandle, data: &[u8]) {
+fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
     crate::ops_log::log(
         "ECHO",
         &format!(
-            "remote len={} hex={} text=\"{}\"",
+            "remote sid={} len={} hex={} text=\"{}\"",
+            &session_id[..session_id.len().min(8)],
             data.len(),
             crate::ops_log::hex_preview(data, 96),
             crate::ops_log::text_preview(data, 200)
         ),
     );
+    // PR2: object payload with session_id (frontend must route by id).
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
-    if let Err(e) = app.emit("session://data", b64) {
+    if let Err(e) = app.emit(
+        "session://data",
+        DataEvent {
+            session_id: session_id.to_string(),
+            data_b64: b64,
+        },
+    ) {
         error!("emit data failed: {e}");
         crate::ops_log::log("ERR", &format!("emit session://data failed: {e}"));
     }
-    if let Some(state) = app.try_state::<AppState>() {
-        if state.cwd_freeze.load(Ordering::SeqCst) {
-            return;
-        }
-        // Release cwd lock before snapshot() — snapshot also locks cwd (non-reentrant).
-        let new_cwd = {
-            let mut cwd = match state.cwd.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            cwd.feed_output(data)
-        };
-        if let Some(path) = new_cwd {
-            crate::ops_log::log("CWD", &format!("from_osc path={path}"));
-            if path.starts_with('/') {
-                if let Ok(mut rt) = state.restore_target.lock() {
-                    *rt = Some(path.clone());
-                }
-            }
-            let _ = app.emit("session://cwd", &path);
-            let _ = app.emit("session://state", state.snapshot());
-        }
-    }
-}
-
-async fn finish_session(app: AppHandle, manual: bool) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
+    let Ok(rt) = state.get_runtime(session_id) else {
+        crate::ops_log::log(
+            "ERR",
+            &format!(
+                "on_data: session not found sid={}",
+                &session_id[..session_id.len().min(8)]
+            ),
+        );
+        return;
+    };
+    if rt.cwd_freeze.load(Ordering::SeqCst) {
+        // Still scan for failures? No — freeze means restore playbook owns cwd.
+        // OSC is ignored; optimistic rollbacks are irrelevant during freeze.
+        return;
+    }
+    // Release cwd lock before snapshot() — snapshot also locks cwd (non-reentrant).
+    let change = {
+        let mut cwd = match rt.cwd.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        cwd.feed_output(data)
+    };
+    if let Some(ch) = change {
+        apply_cwd_change(app, &rt, &ch);
+    }
+}
+
+/// Apply a cwd tracker change to restore_target + UI events.
+fn apply_cwd_change(
+    app: &AppHandle,
+    rt: &crate::app_state::SessionRuntime,
+    ch: &crate::cwd::CwdChange,
+) {
+    use crate::cwd::CwdChangeReason;
+    match ch.reason {
+        CwdChangeReason::Osc7 => {
+            if let Some(ref path) = ch.path {
+                crate::ops_log::log("CWD", &format!("from_osc path={path}"));
+            }
+        }
+        CwdChangeReason::CdRollback => {
+            crate::ops_log::log(
+                "CWD",
+                &format!(
+                    "cd_rollback path={}",
+                    ch.path.as_deref().unwrap_or("(none)")
+                ),
+            );
+        }
+        CwdChangeReason::CdParse => {
+            // Only emitted from submit_line / write path, not on_data.
+        }
+    }
+
+    match &ch.path {
+        Some(path) if path.starts_with('/') => {
+            if let Ok(mut target) = rt.restore_target.lock() {
+                *target = Some(path.clone());
+            }
+            let _ = app.emit(
+                "session://cwd",
+                CwdEvent {
+                    session_id: rt.id.clone(),
+                    cwd: path.clone(),
+                },
+            );
+        }
+        Some(path) => {
+            // Non-absolute (e.g. ~/x) — emit for UI but do not freeze as restore target.
+            let _ = app.emit(
+                "session://cwd",
+                CwdEvent {
+                    session_id: rt.id.clone(),
+                    cwd: path.clone(),
+                },
+            );
+        }
+        None => {
+            // Rolled back to unknown: clear restore freeze path.
+            if let Ok(mut target) = rt.restore_target.lock() {
+                *target = None;
+            }
+            let _ = app.emit(
+                "session://cwd",
+                CwdEvent {
+                    session_id: rt.id.clone(),
+                    cwd: String::new(),
+                },
+            );
+        }
+    }
+    let _ = app.emit("session://state", rt.snapshot());
+}
+
+async fn finish_session(app: AppHandle, session_id: String, manual: bool) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let Ok(rt) = state.get_runtime(&session_id) else {
+        crate::ops_log::log(
+            "ERR",
+            &format!(
+                "finish_session: session not found sid={}",
+                &session_id[..session_id.len().min(8)]
+            ),
+        );
+        return;
+    };
     let had = {
-        let mut t = state.transport.lock().expect("transport lock");
+        let mut t = rt.transport.lock().expect("transport lock");
         t.take().is_some()
     };
     if !had {
         return;
     }
 
-    let auto = state.auto_reconnect.load(Ordering::SeqCst);
-    let mut meta = state.meta.lock().expect("meta lock");
+    let auto = rt.auto_reconnect.load(Ordering::SeqCst);
+    let mut meta = rt.meta.lock().expect("meta lock");
     let is_manual = manual || matches!(meta.state, SessionState::Idle);
 
     // Always remember absolute cwd on unexpected drop (for auto-reconnect) and
     // also when finishing after manual disconnect path if still available.
-    if let Ok(cwd) = state.cwd.lock() {
-        if let Some(path) = cwd.last_known() {
-            if path.starts_with('/') {
-                if let Ok(mut rt) = state.restore_target.lock() {
-                    *rt = Some(path.to_string());
-                }
-                crate::ops_log::log(
-                    "CWD",
-                    &format!(
-                        "finish_session freeze restore_target path={path} manual={is_manual} auto={auto}"
-                    ),
-                );
-            }
+    // Release cwd before building snapshot below.
+    let frozen_path = {
+        let cwd = rt.cwd.lock().ok();
+        cwd.and_then(|c| c.last_known().map(|s| s.to_string()))
+            .filter(|p| p.starts_with('/'))
+    };
+    if let Some(ref path) = frozen_path {
+        if let Ok(mut target) = rt.restore_target.lock() {
+            *target = Some(path.clone());
         }
+        crate::ops_log::log(
+            "CWD",
+            &format!(
+                "finish_session freeze restore_target path={path} manual={is_manual} auto={auto}"
+            ),
+        );
     }
 
     if is_manual {
         meta.state = SessionState::Idle;
         meta.message = Some("已手动断开".into());
         meta.attempt = 0;
-        state.cwd_freeze.store(false, Ordering::SeqCst);
+        rt.cwd_freeze.store(false, Ordering::SeqCst);
         crate::ops_log::log("STATE", "finish_session idle (manual)");
     } else if auto {
         meta.state = SessionState::Disconnected;
@@ -711,11 +817,12 @@ async fn finish_session(app: AppHandle, manual: bool) {
     }
 
     let snap = SessionSnapshot {
+        session_id: rt.id.clone(),
         state: meta.state.clone(),
         host: meta.host.clone(),
         username: meta.username.clone(),
         message: meta.message.clone(),
-        cwd: state
+        cwd: rt
             .cwd
             .lock()
             .ok()
@@ -726,7 +833,7 @@ async fn finish_session(app: AppHandle, manual: bool) {
     drop(meta);
     let _ = app.emit("session://state", snap);
     if do_reconnect {
-        crate::session::spawn_reconnect_loop(app);
+        crate::session::spawn_reconnect_loop(app, session_id);
     }
 }
 

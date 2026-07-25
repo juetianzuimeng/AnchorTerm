@@ -92,11 +92,12 @@ SSH Transport → Auth · Keepalive · PTY · 字节流
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| **1** | 密码/私钥登录、真终端、配置、断线 UI；随后 cwd+草稿+自动重连 | A/B ✅，C/D 待做 |
-| **2** | AppKind、可选 TUI 恢复 | 未开始 |
-| **3** | Jump、多标签、打磨 | 未开始 |
+| **1** | 密码/私钥登录、真终端、cwd+草稿+自动/手动重连恢复 | ✅ 已交付（见 README 会话沉淀） |
+| **多标签** | 菜单化 UI、多 tab 多主机、session_id 化（[UI-MULTI-TAB.md](docs/UI-MULTI-TAB.md) PR1–PR5） | ✅ **提前交付**（不与 Jump 捆绑） |
+| **2** | AppKind、可选 TUI 重跑恢复 | 未开始 |
+| **3 余项** | Jump Host、分屏、SFTP、会话树等 | 未开始（见 [docs/ROADMAP-NEXT.md](docs/ROADMAP-NEXT.md)） |
 
-详情见 [docs/PHASE1.md](docs/PHASE1.md)。
+详情见 [docs/PHASE1.md](docs/PHASE1.md)、[docs/UI-MULTI-TAB.md](docs/UI-MULTI-TAB.md)、[docs/CODE-REVIEW-PLAN.md](docs/CODE-REVIEW-PLAN.md)、**[docs/ROADMAP-NEXT.md](docs/ROADMAP-NEXT.md)**。
 
 ---
 
@@ -105,13 +106,15 @@ SSH Transport → Auth · Keepalive · PTY · 字节流
 1. PTY 真终端  
 2. 三层：UI · 模拟器 · SSH  
 3. 草稿本地  
-4. CWD：OSC 7 优先 + `cd` 回退；integration 手动文档  
-5. 阶段 1 只保证 cwd + 草稿  
+4. CWD：OSC 7 优先 + `cd` 回退 + 失败回滚；integration 手动文档  
+5. 阶段 1 保证 cwd + 草稿；重连为新 login shell  
 6. 不自研 VT（xterm.js）  
 7. 恢复顺序：PTY → 就绪 → `cd` →（阶段 2）TUI → 草稿  
-8. 技术栈锁定 Tauri 2  
-9. 密码 + 私钥认证；凭据不落明文  
+8. 技术栈锁定 Tauri 2；交互传输 = 系统 OpenSSH  
+9. 密码 + 私钥认证；凭据不落明文；私钥口令连接前弹窗  
 10. 默认自动重连；手动断开不重连  
+11. 多会话：`session_id` 客户端 UUID；disconnect ≠ close；事件 payload 带 sid  
+12. UI：菜单 + 对话框 + 标签栏（无常驻连接侧栏）  
 
 ---
 

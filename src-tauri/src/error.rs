@@ -3,8 +3,12 @@ pub enum AppError {
     #[error("未连接")]
     NotConnected,
 
-    #[error("已有活动会话，请先断开")]
+    /// This session_id already has a live transport.
+    #[error("该会话已连接，请先断开")]
     AlreadyConnected,
+
+    #[error("会话不存在: {0}")]
+    SessionNotFound(String),
 
     #[error("连接失败: {0}")]
     Connect(String),
@@ -33,6 +37,7 @@ impl AppError {
         match self {
             AppError::NotConnected => "NOT_CONNECTED",
             AppError::AlreadyConnected => "ALREADY_CONNECTED",
+            AppError::SessionNotFound(_) => "SESSION_NOT_FOUND",
             AppError::Connect(_) => "CONNECT_FAILED",
             AppError::Auth(_) => "AUTH_FAILED",
             AppError::Ssh(_) => "SSH_ERROR",

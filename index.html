@@ -9,30 +9,114 @@
   </head>
   <body>
     <div id="app">
-      <header class="toolbar">
-        <div class="brand">AnchorTerm</div>
+      <header class="titlebar">
+        <nav class="menubar" id="menubar" role="menubar" aria-label="主菜单">
+          <div class="menu-item" data-menu="file">
+            <button type="button" class="menu-btn" role="menuitem">文件(F)</button>
+            <div class="menu-dropdown" role="menu">
+              <button type="button" data-action="new-session" role="menuitem">新建会话… <span class="accel">Ctrl+N</span></button>
+              <button type="button" data-action="open-manager" role="menuitem">打开会话管理器… <span class="accel">Ctrl+O</span></button>
+              <hr />
+              <button type="button" data-action="exit" role="menuitem">退出</button>
+            </div>
+          </div>
+          <div class="menu-item" data-menu="edit">
+            <button type="button" class="menu-btn" role="menuitem">编辑(E)</button>
+            <div class="menu-dropdown" role="menu">
+              <button type="button" data-action="copy" role="menuitem">复制 <span class="accel">Ctrl+Shift+C</span></button>
+              <button type="button" data-action="paste" role="menuitem">粘贴 <span class="accel">Ctrl+Shift+V</span></button>
+              <button type="button" data-action="clear-draft" role="menuitem">清草稿</button>
+              <button type="button" disabled title="后续版本" role="menuitem">查找</button>
+            </div>
+          </div>
+          <div class="menu-item" data-menu="view">
+            <button type="button" class="menu-btn" role="menuitem">查看(V)</button>
+            <div class="menu-dropdown" role="menu">
+              <button type="button" data-action="toggle-mode" role="menuitem">切换输入模式 <span class="accel">Ctrl+Shift+M</span></button>
+              <button type="button" data-action="clear-screen" role="menuitem">清屏（仅本地）</button>
+              <button type="button" disabled title="后续版本" role="menuitem">字体大小</button>
+            </div>
+          </div>
+          <div class="menu-item" data-menu="session">
+            <button type="button" class="menu-btn" role="menuitem">会话(S)</button>
+            <div class="menu-dropdown" role="menu">
+              <button type="button" data-action="new-session" role="menuitem">新建会话… <span class="accel">Ctrl+N</span></button>
+              <button type="button" data-action="open-manager" role="menuitem">打开… <span class="accel">Ctrl+O</span></button>
+              <hr />
+              <button type="button" data-action="disconnect" role="menuitem">断开</button>
+              <button type="button" data-action="reconnect" role="menuitem">重新连接</button>
+              <button type="button" data-action="close-tab" role="menuitem">关闭标签 <span class="accel">Ctrl+W</span></button>
+              <button type="button" data-action="session-props" role="menuitem">会话属性…</button>
+            </div>
+          </div>
+          <div class="menu-item" data-menu="tools">
+            <button type="button" class="menu-btn" role="menuitem">工具(T)</button>
+            <div class="menu-dropdown" role="menu">
+              <button type="button" data-action="open-logs" role="menuitem">打开操作日志目录</button>
+              <button type="button" disabled title="后续版本" role="menuitem">密钥管理</button>
+            </div>
+          </div>
+          <div class="menu-item" data-menu="help">
+            <button type="button" class="menu-btn" role="menuitem">帮助(H)</button>
+            <div class="menu-dropdown" role="menu">
+              <button type="button" data-action="about" role="menuitem">关于 AnchorTerm</button>
+              <button type="button" data-action="shell-integration" role="menuitem">Shell Integration 说明</button>
+            </div>
+          </div>
+        </nav>
         <div class="status" id="status-bar">
+          <span class="status-host" id="status-host" title="当前会话"></span>
           <span class="dot idle" id="status-dot"></span>
           <span id="status-text">未连接</span>
           <span class="cwd" id="cwd-text" title="远端工作目录"></span>
         </div>
       </header>
 
-      <aside class="sidebar" id="sidebar">
-        <section class="panel">
-          <h2>连接</h2>
+      <div class="tab-bar" id="tab-bar" role="tablist" aria-label="会话标签">
+        <div class="tab-bar-tabs" id="tab-bar-tabs"></div>
+        <button type="button" id="btn-new-tab" class="tab-new" title="新建会话 (Ctrl+N)">+</button>
+      </div>
+
+      <main class="workspace" id="workspace">
+        <div id="session-views"></div>
+        <div id="empty-state" class="empty-state">
+          <p class="empty-title">尚未打开会话</p>
+          <p class="empty-hint">通过菜单「文件 → 新建会话」或下方按钮开始</p>
+          <div class="empty-actions">
+            <button type="button" id="btn-empty-new" class="primary">新建会话</button>
+            <button type="button" id="btn-empty-manager">打开已保存会话</button>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- Session properties dialog -->
+    <dialog id="dlg-session-props" class="app-dialog" aria-labelledby="dlg-props-title">
+      <form method="dialog" id="form-session-props">
+        <header class="dlg-header">
+          <h2 id="dlg-props-title">会话属性</h2>
+          <button type="button" class="dlg-close" data-dlg-close title="关闭">×</button>
+        </header>
+        <div class="dlg-body">
+          <p class="error" id="dlg-props-error" hidden></p>
+          <label>
+            显示名称
+            <input id="profile-name" type="text" placeholder="生产机（可选）" autocomplete="off" />
+          </label>
           <label>
             主机
-            <input id="host" type="text" placeholder="192.168.1.10" autocomplete="off" />
+            <input id="host" type="text" placeholder="192.168.1.10" autocomplete="off" required />
           </label>
-          <label>
-            端口
-            <input id="port" type="number" value="22" min="1" max="65535" />
-          </label>
-          <label>
-            用户名
-            <input id="username" type="text" placeholder="root" autocomplete="username" />
-          </label>
+          <div class="dlg-row">
+            <label>
+              端口
+              <input id="port" type="number" value="22" min="1" max="65535" />
+            </label>
+            <label>
+              用户名
+              <input id="username" type="text" placeholder="root" autocomplete="username" required />
+            </label>
+          </div>
           <label>
             认证方式
             <select id="auth-type">
@@ -64,62 +148,82 @@
               <input id="passphrase" type="password" autocomplete="off" />
             </label>
           </div>
-          <div class="actions">
-            <button id="btn-connect" type="button" class="primary">连接</button>
-            <button id="btn-disconnect" type="button" disabled>断开</button>
-          </div>
-          <p class="hint">
-            意外断线会自动重连并尝试恢复 cwd；手动断开不会自动重连。<br />
-            日常命令请用底部<strong>草稿</strong>；运行 top/vim 时切换「TUI 直通」。
-          </p>
-          <p class="error" id="error-msg" hidden></p>
-        </section>
-
-        <section class="panel">
-          <h2>主机配置</h2>
-          <label>
-            显示名称
-            <input id="profile-name" type="text" placeholder="生产机" />
-          </label>
-          <div class="actions">
-            <button id="btn-save-profile" type="button">保存配置</button>
-            <button id="btn-delete-profile" type="button" class="danger">删除</button>
-          </div>
-          <ul id="profile-list" class="profile-list"></ul>
-        </section>
-      </aside>
-
-      <main class="terminal-area">
-        <div id="terminal"></div>
-        <div class="draft-wrap">
-          <ul id="complete-popup" class="complete-popup hidden" role="listbox" aria-label="补全候选"></ul>
-          <div class="draft-bar">
-            <label class="draft-label" for="draft-input">草稿</label>
-            <input
-              id="draft-input"
-              type="text"
-              placeholder="命令在此输入 · Tab 补全 · Enter 发送（断线保留）"
-              autocomplete="off"
-              spellcheck="false"
-            />
-            <button id="btn-draft-send" type="button" title="发送草稿行">发送</button>
-            <button
-              id="btn-input-mode"
-              type="button"
-              class="mode-toggle"
-              title="Shell：命令走草稿（默认）。TUI：键盘直通终端（top/vim）"
-            >
-              Shell 模式
-            </button>
-          </div>
         </div>
-        <div id="overlay" class="overlay hidden">
-          <div class="overlay-card">
-            <div class="spinner"></div>
-            <p id="overlay-text">连接中…</p>
-          </div>
-        </div>
-      </main>
-    </div>
+        <footer class="dlg-footer" id="dlg-props-footer">
+          <!-- buttons filled by JS per mode -->
+        </footer>
+      </form>
+    </dialog>
+
+    <!-- Session manager -->
+    <dialog id="dlg-session-manager" class="app-dialog dlg-wide" aria-labelledby="dlg-mgr-title">
+      <header class="dlg-header">
+        <h2 id="dlg-mgr-title">会话管理器</h2>
+        <button type="button" class="dlg-close" data-dlg-close title="关闭">×</button>
+      </header>
+      <div class="dlg-body">
+        <p class="hint">双击或选中后点「打开」将<strong>新建标签</strong>连接。删除配置不会关闭已打开的标签。</p>
+        <ul id="mgr-profile-list" class="mgr-list" role="listbox"></ul>
+      </div>
+      <footer class="dlg-footer">
+        <button type="button" id="mgr-btn-new">新建…</button>
+        <button type="button" id="mgr-btn-edit">编辑…</button>
+        <button type="button" id="mgr-btn-delete" class="danger">删除</button>
+        <span class="dlg-spacer"></span>
+        <button type="button" id="mgr-btn-open" class="primary">打开</button>
+        <button type="button" data-dlg-close>关闭</button>
+      </footer>
+    </dialog>
+
+    <dialog id="dlg-about" class="app-dialog" aria-labelledby="dlg-about-title">
+      <header class="dlg-header">
+        <h2 id="dlg-about-title">关于 AnchorTerm</h2>
+        <button type="button" class="dlg-close" data-dlg-close title="关闭">×</button>
+      </header>
+      <div class="dlg-body">
+        <p><strong>AnchorTerm</strong></p>
+        <p class="hint">版本 0.1.0 · Windows SSH 终端客户端</p>
+        <p class="hint">真终端 · 多标签 · 断线恢复工作目录 · 草稿与 Tab 补全</p>
+      </div>
+      <footer class="dlg-footer">
+        <button type="button" data-dlg-close class="primary">确定</button>
+      </footer>
+    </dialog>
+
+    <dialog id="dlg-shell-help" class="app-dialog" aria-labelledby="dlg-shell-title">
+      <header class="dlg-header">
+        <h2 id="dlg-shell-title">Shell Integration（OSC 7）</h2>
+        <button type="button" class="dlg-close" data-dlg-close title="关闭">×</button>
+      </header>
+      <div class="dlg-body">
+        <p class="hint">
+          在远端 shell 安装 OSC 7 可提高工作目录跟踪精度。未安装时，应用通过解析
+          <code>cd</code> 与失败回滚跟踪目录。详见仓库
+          <code>docs/shell-integration.md</code>。
+        </p>
+      </div>
+      <footer class="dlg-footer">
+        <button type="button" data-dlg-close class="primary">知道了</button>
+      </footer>
+    </dialog>
+
+    <!-- Secret prompt: private key passphrase / login password (never saved to disk) -->
+    <dialog id="dlg-secret" class="app-dialog" aria-labelledby="dlg-secret-title">
+      <header class="dlg-header">
+        <h2 id="dlg-secret-title">需要凭据</h2>
+        <button type="button" class="dlg-close" id="dlg-secret-x" title="取消">×</button>
+      </header>
+      <div class="dlg-body">
+        <p class="hint" id="dlg-secret-hint"></p>
+        <label>
+          <span id="dlg-secret-label">口令</span>
+          <input id="dlg-secret-input" type="password" autocomplete="off" />
+        </label>
+      </div>
+      <footer class="dlg-footer">
+        <button type="button" id="dlg-secret-cancel">取消</button>
+        <button type="button" id="dlg-secret-ok" class="primary">确定</button>
+      </footer>
+    </dialog>
   </body>
 </html>
