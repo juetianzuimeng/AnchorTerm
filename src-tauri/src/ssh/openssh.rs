@@ -296,14 +296,21 @@ struct BuiltArgs {
 }
 
 fn build_ssh_args(params: &ConnectParams) -> Result<BuiltArgs, AppError> {
+    // Dead-link detection (e.g. unplugged NIC): plain TCP can stay ESTABLISHED for a
+    // long time with no local I/O. OpenSSH client keepalives force a probe so the
+    // child exits and we flip UI off "已连接".
+    // Worst-case notice ≈ ServerAliveInterval * ServerAliveCountMax (+ RTT).
+    // 5s × 2 ≈ ~10s after the path is actually dead.
     let mut args = vec![
         "-tt".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
         "-o".into(),
-        "ServerAliveInterval=15".into(),
+        "ServerAliveInterval=5".into(),
         "-o".into(),
-        "ServerAliveCountMax=3".into(),
+        "ServerAliveCountMax=2".into(),
+        "-o".into(),
+        "TCPKeepAlive=yes".into(),
         "-o".into(),
         "NumberOfPasswordPrompts=1".into(),
         "-p".into(),
@@ -615,7 +622,10 @@ pub async fn connect_openssh(
     // multiple stty floods after login raced with user commands and left the
     // shell in a bad state (command echo + 2004l, then no new prompt).
     let _ = (params.cols, params.rows);
-    crate::ops_log::log("SSH", "openssh auth ok; session ready");
+    crate::ops_log::log(
+        "SSH",
+        "openssh auth ok; session ready (ServerAliveInterval=5 CountMax=2 TCPKeepAlive=yes)",
+    );
 
     Ok(OpensshTransport {
         cmd_tx,
