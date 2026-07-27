@@ -930,6 +930,19 @@ fn apply_cwd_change(
             if let Ok(mut target) = rt.restore_target.lock() {
                 *target = Some(path.clone());
             }
+            // Persist for tab-close → later connect to same host+user.
+            {
+                let meta = rt.meta.lock().ok();
+                if let Some(meta) = meta {
+                    if let (Some(host), Some(user)) =
+                        (meta.host.as_deref(), meta.username.as_deref())
+                    {
+                        if !host.is_empty() && !user.is_empty() {
+                            crate::config::save_last_cwd(host, user, path);
+                        }
+                    }
+                }
+            }
             let _ = app.emit(
                 "session://cwd",
                 CwdEvent {
@@ -1002,6 +1015,13 @@ async fn finish_session(app: AppHandle, session_id: String, manual: bool) {
     if let Some(ref path) = frozen_path {
         if let Ok(mut target) = rt.restore_target.lock() {
             *target = Some(path.clone());
+        }
+        {
+            let host = meta.host.clone().unwrap_or_default();
+            let user = meta.username.clone().unwrap_or_default();
+            if !host.is_empty() && !user.is_empty() {
+                crate::config::save_last_cwd(&host, &user, path);
+            }
         }
         crate::ops_log::log(
             "CWD",

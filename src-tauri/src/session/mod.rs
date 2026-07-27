@@ -127,18 +127,12 @@ async fn connect_inner(
         // Invalidate any old reconnect loops.
         rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
 
-        // Same host+user as last session + absolute restore path → keep and restore.
-        // Different endpoint or no path → clear (fresh login home).
-        let prev = rt.cached.lock().ok().and_then(|c| c.clone()).or_else(|| {
-            let meta = rt.meta.lock().ok()?;
-            Some(CachedConnect {
-                host: meta.host.clone().unwrap_or_default(),
-                port: 22,
-                username: meta.username.clone().unwrap_or_default(),
-                auth: req.auth.clone(),
-                profile_id: None,
-            })
-        });
+        // Restore path priority:
+        // 1) In-memory restore_target / last_known when this runtime already
+        //    belonged to the same host+user (manual disconnect → same tab)
+        // 2) Persisted last_cwd for host+user (tab closed / app restart)
+        // Different endpoint on same tab → ignore memory, still try disk for the new pair.
+        let prev = rt.cached.lock().ok().and_then(|c| c.clone());
         let same_endpoint = prev
             .as_ref()
             .map(|p| {
@@ -149,7 +143,7 @@ async fn connect_inner(
             })
             .unwrap_or(false);
 
-        let keep_path = if same_endpoint {
+        let memory_path = if same_endpoint {
             rt.restore_target
                 .lock()
                 .ok()
@@ -165,6 +159,16 @@ async fn connect_inner(
             None
         };
 
+        let persisted = config::load_last_cwd(&req.host, &req.username);
+        let keep_path = memory_path.clone().or_else(|| persisted.clone());
+        let path_source = if memory_path.is_some() {
+            "memory"
+        } else if persisted.is_some() {
+            "persisted"
+        } else {
+            "none"
+        };
+
         if let Some(path) = keep_path {
             restore_on_user_connect = true;
             if let Ok(mut target) = rt.restore_target.lock() {
@@ -176,7 +180,9 @@ async fn connect_inner(
             crate::ops_log::log(
                 "CWD",
                 &format!(
-                    "user reconnect will restore path={path} (same host/user) sid={}",
+                    "user reconnect will restore path={path} source={path_source} host={} user={} sid={}",
+                    req.host,
+                    req.username,
                     &rt.id[..rt.id.len().min(8)]
                 ),
             );
@@ -187,7 +193,13 @@ async fn connect_inner(
             if let Ok(mut target) = rt.restore_target.lock() {
                 *target = None;
             }
-            crate::ops_log::log("CWD", "user connect: no restore target (fresh cwd)");
+            crate::ops_log::log(
+                "CWD",
+                &format!(
+                    "user connect: no restore target (fresh cwd) host={} user={}",
+                    req.host, req.username
+                ),
+            );
         }
 
         rt.cwd_freeze.store(false, Ordering::SeqCst);
@@ -451,6 +463,9 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
         if let Ok(mut tracker) = rt.cwd.lock() {
             tracker.clear();
         }
+        if let Some((host, user)) = endpoint_from_rt(rt) {
+            config::clear_last_cwd(&host, &user);
+        }
         emit_cwd(app, rt, "");
         set_state(
             app,
@@ -546,6 +561,7 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     if let Ok(mut target) = rt.restore_target.lock() {
         *target = Some(path.clone());
     }
+    persist_last_cwd_for_rt(rt, &path);
     emit_cwd(app, rt, &path);
     set_state(
         app,
@@ -936,6 +952,8 @@ fn close_session_inner(
             &session_id[..session_id.len().min(8)]
         ),
     );
+    // Persist last absolute cwd before tearing down (tab close → later reconnect).
+    freeze_restore_target_from_cwd(&rt, "close tab");
     // 1–4: cancel reconnect + clear freeze/mute
     rt.auto_reconnect.store(false, Ordering::SeqCst);
     rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
@@ -1016,6 +1034,7 @@ fn freeze_restore_target_from_cwd(rt: &SessionRuntime, reason: &str) {
         if let Ok(mut target) = rt.restore_target.lock() {
             *target = Some(path.clone());
         }
+        persist_last_cwd_for_rt(rt, &path);
         crate::ops_log::log(
             "CWD",
             &format!("freeze restore_target path={path} reason={reason}"),
@@ -1026,6 +1045,34 @@ fn freeze_restore_target_from_cwd(rt: &SessionRuntime, reason: &str) {
             &format!("freeze restore_target skipped (no absolute cwd) reason={reason}"),
         );
     }
+}
+
+/// Write absolute cwd to disk keyed by host+user (survives tab close).
+fn persist_last_cwd_for_rt(rt: &SessionRuntime, path: &str) {
+    if !path.starts_with('/') {
+        return;
+    }
+    let (host, username) = {
+        let meta = match rt.meta.lock() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        (
+            meta.host.clone().unwrap_or_default(),
+            meta.username.clone().unwrap_or_default(),
+        )
+    };
+    if host.is_empty() || username.is_empty() {
+        return;
+    }
+    config::save_last_cwd(&host, &username, path);
+}
+
+fn endpoint_from_rt(rt: &SessionRuntime) -> Option<(String, String)> {
+    let meta = rt.meta.lock().ok()?;
+    let host = meta.host.clone().filter(|h| !h.is_empty())?;
+    let username = meta.username.clone().filter(|u| !u.is_empty())?;
+    Some((host, username))
 }
 
 #[tauri::command]
@@ -1141,6 +1188,7 @@ async fn submit_line_inner(
                 if let Ok(mut target) = rt.restore_target.lock() {
                     *target = Some(path.clone());
                 }
+                persist_last_cwd_for_rt(rt, path);
             }
             emit_cwd(app, rt, path);
         }

@@ -1,3 +1,4 @@
+pub mod last_cwd;
 pub mod profile;
 
 use std::fs;
@@ -5,6 +6,8 @@ use std::path::PathBuf;
 
 use crate::config::profile::{HostProfile, ProfileStore};
 use crate::error::AppError;
+
+pub use last_cwd::{clear_last_cwd, load_last_cwd, save_last_cwd};
 
 pub fn config_dir() -> Result<PathBuf, AppError> {
     let base = dirs::config_dir().ok_or_else(|| {
