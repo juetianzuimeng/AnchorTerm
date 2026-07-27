@@ -233,6 +233,16 @@ async fn connect_inner(
         ),
     );
 
+    // Hide OpenSSH timeouts + remote login MOTD/banner during reconnect paths.
+    // First-time connect keeps banner visible. Always set explicitly so a cancelled
+    // auto-reconnect loop cannot leave mute stuck on for a fresh login.
+    let suppress_login_noise = is_reconnect || restore_on_user_connect;
+    rt.set_ui_mute(suppress_login_noise);
+    if suppress_login_noise {
+        // Block OSC title/home reports until restore playbook owns the path.
+        rt.cwd_freeze.store(true, Ordering::SeqCst);
+    }
+
     match connect_session(app.clone(), params, rt.id.clone()).await {
         Ok(transport) => {
             if let AuthMethod::Password {
@@ -280,7 +290,7 @@ async fn connect_inner(
             // - Auto-reconnect (unexpected drop)
             // - Manual disconnect → user connect again on same host/user
             // First connect to a host (or different user): seed login $HOME via exec pwd.
-            if is_reconnect || restore_on_user_connect {
+            if suppress_login_noise {
                 crate::ops_log::log(
                     "SSH",
                     &format!(
@@ -289,7 +299,11 @@ async fn connect_inner(
                 );
                 run_restore_playbook(app, &rt).await;
             } else {
-                // Seed so relative `cd foo` can be resolved after first login.
+                rt.set_ui_mute(false);
+                // Immediate local seed so relative `cd` works even if side-channel
+                // `pwd` times out (common under flaky networks). Side-channel may
+                // refine the path shortly after.
+                seed_provisional_home(app, &rt);
                 schedule_seed_login_pwd(app, Arc::clone(&rt), 900);
             }
             Ok(())
@@ -297,8 +311,11 @@ async fn connect_inner(
         Err(e) => {
             crate::ops_log::log("ERR", &format!("connect failed: {e}"));
             if !is_reconnect {
+                // User-initiated connect failed: show terminal again for retry.
+                rt.set_ui_mute(false);
                 set_state(app, &rt, SessionState::Failed, Some(e.to_string()));
             }
+            // Auto-reconnect keep muted through further attempts.
             Err(e)
         }
     }
@@ -366,6 +383,9 @@ async fn send_pty_bytes(rt: &SessionRuntime, data: Vec<u8>) -> bool {
 ///
 /// Note: side-channel `exec pwd` starts a *new* process (always at login $HOME) and
 /// cannot observe the interactive shell cwd — do not use it to "verify" restore.
+///
+/// UI stream is muted for the whole playbook (login MOTD + silent `cd`); a clean
+/// prompt is elicited when mute is lifted.
 async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     // Prefer path frozen at disconnect — live last_known may already be $HOME
     // from the new login shell's OSC 7.
@@ -383,11 +403,22 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
 
     let Some(path) = path else {
         info!("restore playbook: no cwd to restore");
+        crate::ops_log::log(
+            "CWD",
+            "restore skipped: no restore_target/last_known (cwd never tracked as absolute)",
+        );
+        // Still wait out MOTD then show a clean prompt.
+        end_reconnect_ui_mute(rt).await;
         return;
     };
 
     if !path.starts_with('/') {
         info!(path = %path, "skip restore cd for non-absolute path");
+        crate::ops_log::log(
+            "CWD",
+            &format!("restore skipped: non-absolute path={path}"),
+        );
+        end_reconnect_ui_mute(rt).await;
         return;
     }
 
@@ -399,10 +430,12 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     emit_cwd(app, rt, &path);
 
     // Give login shell time to finish .bashrc / print banner before injecting cd.
+    // Banner is muted (ui_mute); we only wait so `cd` lands on a ready shell.
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
     if !session_still_connected(rt) {
         rt.cwd_freeze.store(false, Ordering::SeqCst);
+        rt.set_ui_mute(false);
         return;
     }
 
@@ -437,6 +470,7 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
                 schedule_seed_login_pwd(app, arc, 400);
             }
         }
+        end_reconnect_ui_mute(rt).await;
         return;
     }
 
@@ -451,6 +485,7 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
             SessionState::Connected,
             Some(format!("重连成功，但无法发送恢复目录命令: {path}")),
         );
+        end_reconnect_ui_mute(rt).await;
         return;
     }
 
@@ -458,6 +493,7 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     tokio::time::sleep(Duration::from_millis(550)).await;
     if !session_still_connected(rt) {
         rt.cwd_freeze.store(false, Ordering::SeqCst);
+        rt.set_ui_mute(false);
         return;
     }
 
@@ -465,6 +501,7 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     rt.cwd_freeze.store(false, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(800)).await;
     if !session_still_connected(rt) {
+        rt.set_ui_mute(false);
         return;
     }
 
@@ -495,6 +532,7 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
                 SessionState::Connected,
                 Some(format!("重连成功，二次恢复目录失败: {path}")),
             );
+            end_reconnect_ui_mute(rt).await;
             return;
         }
         tokio::time::sleep(Duration::from_millis(450)).await;
@@ -517,6 +555,19 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     );
     info!(path = %path, retry = need_retry, "restore playbook done");
     rt.cwd_freeze.store(false, Ordering::SeqCst);
+    end_reconnect_ui_mute(rt).await;
+}
+
+/// Lift reconnect UI mute and request a fresh prompt (banner/MOTD stayed hidden).
+async fn end_reconnect_ui_mute(rt: &SessionRuntime) {
+    // Allow any trailing muted banner/cd echo to settle before we re-enable the stream.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    rt.set_ui_mute(false);
+    if !session_still_connected(rt) {
+        return;
+    }
+    // Empty Enter → shell redraws prompt with restored cwd; no command runs.
+    let _ = send_pty_bytes(rt, b"\r".to_vec()).await;
 }
 
 fn connect_params_from_cache(rt: &SessionRuntime) -> Result<ConnectParams, String> {
@@ -558,6 +609,50 @@ async fn query_dir_exists(rt: &SessionRuntime, path: &str) -> Result<bool, Strin
         .await
         .map_err(|e| e.to_string())?;
     Ok(out.contains("AT_DIR_OK"))
+}
+
+/// Local best-effort home from SSH username so relative `cd` tracking works
+/// without waiting for (or depending on) a side-channel `pwd`.
+fn seed_provisional_home(app: &AppHandle, rt: &SessionRuntime) {
+    let username = rt
+        .meta
+        .lock()
+        .ok()
+        .and_then(|m| m.username.clone())
+        .filter(|u| !u.is_empty());
+    let Some(username) = username else {
+        crate::ops_log::log("CWD", "provisional home skipped: no username");
+        return;
+    };
+    let Some(home) = crate::cwd::provisional_login_home(&username) else {
+        crate::ops_log::log(
+            "CWD",
+            &format!("provisional home skipped: invalid username={username}"),
+        );
+        return;
+    };
+    let seeded = {
+        let mut cwd = match rt.cwd.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        cwd.seed_provisional_home(&home)
+    };
+    if seeded {
+        if let Ok(mut target) = rt.restore_target.lock() {
+            if target.as_ref().map(|p| !p.starts_with('/')).unwrap_or(true) {
+                *target = Some(home.clone());
+            }
+        }
+        emit_cwd(app, rt, &home);
+        emit_state(app, rt);
+        crate::ops_log::log("CWD", &format!("provisional home seeded path={home}"));
+    } else {
+        crate::ops_log::log(
+            "CWD",
+            &format!("provisional home not applied (already absolute) hint={home}"),
+        );
+    }
 }
 
 /// Seed last_known from a fresh login shell's pwd (initial home). Safe only when
@@ -665,15 +760,22 @@ pub fn spawn_reconnect_loop(app: AppHandle, session_id: String) {
 
 async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
     let mut attempt: u32 = 0;
+    // Keep terminal quiet for the whole auto-reconnect cycle (timeouts + MOTD).
+    rt.set_ui_mute(true);
+    // Preserve frozen restore path across reconnect attempts.
+    rt.cwd_freeze.store(true, Ordering::SeqCst);
 
     loop {
         if rt.reconnect_gen.load(Ordering::SeqCst) != gen {
-            return; // cancelled
-        }
-        if !rt.auto_reconnect.load(Ordering::SeqCst) {
+            // Cancelled (manual disconnect / new connect / close). New owner sets mute.
             return;
         }
-        // Already connected by someone else.
+        if !rt.auto_reconnect.load(Ordering::SeqCst) {
+            rt.set_ui_mute(false);
+            rt.cwd_freeze.store(false, Ordering::SeqCst);
+            return;
+        }
+        // Already connected by someone else (restore playbook owns unmute).
         if rt.transport.lock().expect("t").is_some() {
             return;
         }
@@ -695,6 +797,8 @@ async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
             return;
         }
         if !rt.auto_reconnect.load(Ordering::SeqCst) {
+            rt.set_ui_mute(false);
+            rt.cwd_freeze.store(false, Ordering::SeqCst);
             return;
         }
         if rt.transport.lock().expect("t").is_some() {
@@ -703,6 +807,8 @@ async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
 
         let cached = rt.cached.lock().expect("cached").clone();
         let Some(cached) = cached else {
+            rt.set_ui_mute(false);
+            rt.cwd_freeze.store(false, Ordering::SeqCst);
             set_state(
                 &app,
                 &rt,
@@ -747,6 +853,8 @@ async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
                 // AppError::Connect and must keep retrying after the cable is back.
                 if is_permanent_auth_failure(&e) {
                     rt.auto_reconnect.store(false, Ordering::SeqCst);
+                    rt.set_ui_mute(false);
+                    rt.cwd_freeze.store(false, Ordering::SeqCst);
                     set_state(
                         &app,
                         &rt,
@@ -828,10 +936,11 @@ fn close_session_inner(
             &session_id[..session_id.len().min(8)]
         ),
     );
-    // 1–4: cancel reconnect + clear freeze
+    // 1–4: cancel reconnect + clear freeze/mute
     rt.auto_reconnect.store(false, Ordering::SeqCst);
     rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
     rt.cwd_freeze.store(false, Ordering::SeqCst);
+    rt.set_ui_mute(false);
     // 5: take transport → Drop SecureKeyMaterial
     let transport = rt.transport.lock().expect("transport lock").take();
     if let Some(t) = transport {
@@ -874,6 +983,7 @@ fn disconnect_inner(rt: &SessionRuntime, app: &AppHandle) -> Result<(), AppError
     // Disable auto-reconnect for this session (manual disconnect).
     rt.auto_reconnect.store(false, Ordering::SeqCst);
     rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
+    rt.set_ui_mute(false);
 
     // Freeze absolute cwd so the next user-initiated connect can restore it.
     freeze_restore_target_from_cwd(rt, "manual disconnect");
@@ -1106,9 +1216,12 @@ async fn complete_draft_inner(
             crate::ops_log::log(
                 "CMD",
                 &format!(
-                    "complete_draft ok candidates={} line=\"{}\"",
+                    "complete_draft ok candidates={} filled=\"{}\" cursor={} token_range=[{},{})",
                     r.candidates.len(),
-                    crate::ops_log::text_preview(r.line.as_bytes(), 80)
+                    crate::ops_log::text_preview(r.line.as_bytes(), 160),
+                    r.cursor,
+                    r.token_start,
+                    r.token_end
                 ),
             );
         }

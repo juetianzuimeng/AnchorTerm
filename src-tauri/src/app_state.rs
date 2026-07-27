@@ -103,6 +103,10 @@ pub struct SessionRuntime {
     pub reconnect_gen: AtomicU64,
     /// While true, ignore OSC 7 cwd updates (prevents new shell $HOME from wiping restore target).
     pub cwd_freeze: AtomicBool,
+    /// While true, do not emit remote bytes to the terminal UI.
+    /// Used during auto-reconnect / user re-connect so OpenSSH timeouts and
+    /// login MOTD/banner do not pollute scrollback; silent restore `cd` stays hidden.
+    pub ui_mute: AtomicBool,
     pub cols: AtomicU32,
     pub rows: AtomicU32,
     /// Debounce remote `stty` injects (per session).
@@ -135,12 +139,29 @@ impl SessionRuntime {
             auto_reconnect: AtomicBool::new(true),
             reconnect_gen: AtomicU64::new(0),
             cwd_freeze: AtomicBool::new(false),
+            ui_mute: AtomicBool::new(false),
             cols: AtomicU32::new(80),
             rows: AtomicU32::new(24),
             last_stty: Mutex::new(None),
             remote_stty: Mutex::new(None),
             echo_suppress: Mutex::new(None),
         }
+    }
+
+    pub fn set_ui_mute(&self, mute: bool) {
+        self.ui_mute.store(mute, Ordering::SeqCst);
+        crate::ops_log::log(
+            "SSH",
+            if mute {
+                "ui_mute on (suppress terminal stream)"
+            } else {
+                "ui_mute off"
+            },
+        );
+    }
+
+    pub fn is_ui_muted(&self) -> bool {
+        self.ui_mute.load(Ordering::SeqCst)
     }
 
     /// Arm UI-stream filter before writing a silent `stty` inject.

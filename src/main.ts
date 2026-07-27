@@ -85,7 +85,17 @@ interface CompleteUiState {
   index: number;
   tokenStart: number;
   tokenEnd: number;
+  /**
+   * Line used as the cycle base (after common-prefix / last cycle apply).
+   * Replacement is always `baseLine[0..tokenStart) + candidate + baseLine[tokenEnd..)`.
+   */
   baseLine: string;
+  /**
+   * Exact draft text after the last completion apply/cycle.
+   * If the user types further, this diverges and we must re-query instead of
+   * cycling the stale list (see tgservice-info → tgservice-all… bug).
+   */
+  appliedLine: string;
   busy: boolean;
 }
 
@@ -136,6 +146,70 @@ function bytesToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
   }
   return btoa(binary);
+}
+
+// ---------------------------------------------------------------------------
+// Draft command history (per host+user, survives tab close / app restart)
+// ---------------------------------------------------------------------------
+
+const CMD_HISTORY_STORE_KEY = "anchorterm.cmdHistory.v1";
+const CMD_HISTORY_MAX = 500;
+/** Max distinct host+user buckets kept in localStorage. */
+const CMD_HISTORY_BUCKETS_MAX = 40;
+
+function cmdHistoryKey(username: string, host: string): string {
+  return `${username.trim()}@${host.trim().toLowerCase()}`;
+}
+
+function loadAllCmdHistories(): Record<string, string[]> {
+  try {
+    const raw = localStorage.getItem(CMD_HISTORY_STORE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const out: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof k === "string" && Array.isArray(v)) {
+        out[k] = v.filter((x): x is string => typeof x === "string");
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function saveAllCmdHistories(map: Record<string, string[]>) {
+  try {
+    localStorage.setItem(CMD_HISTORY_STORE_KEY, JSON.stringify(map));
+  } catch (e) {
+    opsLog("ERR", "cmd_history_persist_failed", { error: String(e) });
+  }
+}
+
+function loadCmdHistory(username: string, host: string): string[] {
+  if (!username.trim() || !host.trim()) return [];
+  const list = loadAllCmdHistories()[cmdHistoryKey(username, host)];
+  return Array.isArray(list) ? list.slice() : [];
+}
+
+function persistCmdHistory(username: string, host: string, list: string[]) {
+  if (!username.trim() || !host.trim()) return;
+  const key = cmdHistoryKey(username, host);
+  const all = loadAllCmdHistories();
+  // Drop then re-insert so this key becomes most-recently-used (insertion order).
+  delete all[key];
+  all[key] = list.slice(-CMD_HISTORY_MAX);
+  const keys = Object.keys(all);
+  if (keys.length > CMD_HISTORY_BUCKETS_MAX) {
+    const drop = keys.length - CMD_HISTORY_BUCKETS_MAX;
+    for (let i = 0; i < drop; i++) {
+      delete all[keys[i]];
+    }
+  }
+  saveAllCmdHistories(all);
 }
 
 function base64ToBytes(b64: string): Uint8Array {
@@ -517,6 +591,17 @@ class SessionView {
   pendingDraft: string | null = null;
   completeUi: CompleteUiState | null = null;
 
+  /**
+   * Shell draft history for this tab's current host+user.
+   * Backed by localStorage so close-tab / re-open same endpoint keeps history.
+   * Oldest → newest. Browsing with ↑/↓ when complete popup is closed.
+   */
+  private cmdHistory: string[] = [];
+  /** `null` = editing live draft; otherwise index into `cmdHistory`. */
+  private histIndex: number | null = null;
+  /** Snapshot of the in-progress draft when the user first presses ↑. */
+  private histLiveDraft = "";
+
   rootEl: HTMLElement;
   termHost: HTMLElement;
   draftInput: HTMLInputElement;
@@ -541,6 +626,7 @@ class SessionView {
     this.host = opts.host;
     this.username = opts.username;
     this.profileId = opts.profileId ?? null;
+    this.cmdHistory = loadCmdHistory(this.username, this.host);
 
     this.rootEl = document.createElement("div");
     this.rootEl.className = "session-view";
@@ -571,7 +657,7 @@ class SessionView {
     this.draftInput.type = "text";
     this.draftInput.className = "draft-input";
     this.draftInput.placeholder =
-      "命令在此输入 · Tab 补全 · Enter 发送（断线保留）";
+      "命令在此输入 · ↑↓ 历史 · Tab 补全 · Enter 发送（断线保留）";
     this.draftInput.autocomplete = "off";
     this.draftInput.spellcheck = false;
 
@@ -585,8 +671,47 @@ class SessionView {
     this.btnMode.type = "button";
     this.btnMode.className = "btn-input-mode";
     this.btnMode.textContent = "Shell 模式";
+    this.btnMode.title = "点击切换 Shell 模式 / TUI 直通";
 
-    draftBar.append(label, this.draftInput, this.btnSend, this.btnMode);
+    const modeControls = document.createElement("div");
+    modeControls.className = "mode-controls";
+    const modeHelp = document.createElement("button");
+    modeHelp.type = "button";
+    modeHelp.className = "mode-help";
+    modeHelp.setAttribute("aria-label", "输入模式说明");
+    modeHelp.textContent = "?";
+    modeHelp.tabIndex = 0;
+    const modeTip = document.createElement("div");
+    modeTip.className = "mode-help-tip";
+    modeTip.setAttribute("role", "tooltip");
+    modeTip.innerHTML = [
+      "<strong>输入模式说明</strong>",
+      "<p><b>Shell 模式</b>（默认）</p>",
+      "<ul>",
+      "<li>在底部「草稿」框输入命令，Enter 发送</li>",
+      "<li>支持 Tab 补全、↑↓ 历史、断线保留草稿</li>",
+      "<li>终端区主要显示输出；普通按键进草稿框，不直接进 SSH</li>",
+      "</ul>",
+      "<p><b>TUI 直通</b></p>",
+      "<ul>",
+      "<li>按键直接发给远端终端（适合 vim / htop / less 等）</li>",
+      "<li>不使用草稿的补全与本地历史（由远端程序自己处理）</li>",
+      "<li>交互式全屏程序请用此模式</li>",
+      "</ul>",
+      "<p class=\"mode-help-tip-foot\">点击「Shell 模式 / TUI 直通」按钮可切换。</p>",
+    ].join("");
+    modeControls.append(this.btnMode, modeHelp, modeTip);
+    // Keep tip open while hovering the help control itself.
+    modeHelp.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      modeControls.classList.toggle("tip-pinned");
+    });
+    modeHelp.addEventListener("blur", () => {
+      modeControls.classList.remove("tip-pinned");
+    });
+
+    draftBar.append(label, this.draftInput, this.btnSend, modeControls);
     draftWrap.append(this.completePopup, draftBar);
 
     this.overlay = document.createElement("div");
@@ -680,11 +805,13 @@ class SessionView {
     if (this.inputMode === "shell") {
       this.btnMode.textContent = "Shell 模式";
       this.btnMode.classList.remove("raw");
+      this.btnMode.title = "当前：Shell 模式 · 点击切换为 TUI 直通";
       this.termHost.classList.add("shell-mode");
       this.term.options.disableStdin = true;
     } else {
       this.btnMode.textContent = "TUI 直通";
       this.btnMode.classList.add("raw");
+      this.btnMode.title = "当前：TUI 直通 · 点击切换为 Shell 模式";
       this.termHost.classList.remove("shell-mode");
       this.term.options.disableStdin = false;
       if (this.isLive()) this.term.focus();
@@ -708,7 +835,24 @@ class SessionView {
   clearDraft() {
     this.draft = { text: "", cursor: 0 };
     this.draftInput.value = "";
+    this.histIndex = null;
+    this.histLiveDraft = "";
     this.hideCompletePopup();
+  }
+
+  /**
+   * Reload history when host/user changes (same-tab reconnect or new endpoint).
+   * Call after assigning `this.host` / `this.username`.
+   */
+  rebindCmdHistory() {
+    this.cmdHistory = loadCmdHistory(this.username, this.host);
+    this.histIndex = null;
+    this.histLiveDraft = "";
+    opsLog("CMD", "history_rebind", {
+      key: cmdHistoryKey(this.username, this.host),
+      n: this.cmdHistory.length,
+      sid: this.sessionId.slice(0, 8),
+    });
   }
 
   setError(msg: string | null) {
@@ -819,11 +963,106 @@ class SessionView {
           return;
         }
       }
+      // Command history (only when completion popup is not active).
+      if (e.key === "ArrowUp" && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        this.historyStep(-1);
+        return;
+      }
+      if (e.key === "ArrowDown" && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        this.historyStep(1);
+        return;
+      }
       if (e.key === "Enter") {
         e.preventDefault();
         void this.sendDraftLine();
       }
     });
+    // Typing while browsing history leaves browse mode so further ↑ starts
+    // from the latest entry again (bash-like).
+    this.draftInput.addEventListener("input", () => {
+      if (this.histIndex !== null) {
+        this.histIndex = null;
+        this.histLiveDraft = "";
+      }
+      this.syncDraftFromInput();
+      // User continued typing after a multi-candidate complete (e.g. filled
+      // "tgservice-" then typed "info"). Drop the stale popup so the next Tab
+      // re-queries with the new prefix instead of cycling old candidates.
+      if (
+        this.completeUi &&
+        !this.completeUi.busy &&
+        this.draft.text !== this.completeUi.appliedLine
+      ) {
+        opsLog("CMD", "complete_invalidate_on_edit", {
+          applied: previewText(this.completeUi.appliedLine, 120),
+          now: previewText(this.draft.text, 120),
+          sid: this.sessionId.slice(0, 8),
+        });
+        this.hideCompletePopup();
+      }
+    });
+  }
+
+  /** Push a successfully-submitted (or queued) command into host+user history. */
+  private pushHistory(line: string) {
+    const logical = line.replace(/[\r\n]+$/g, "").trimEnd();
+    if (!logical.trim()) return;
+    const last = this.cmdHistory[this.cmdHistory.length - 1];
+    if (last === logical) {
+      this.histIndex = null;
+      this.histLiveDraft = "";
+      return;
+    }
+    this.cmdHistory.push(logical);
+    if (this.cmdHistory.length > CMD_HISTORY_MAX) {
+      this.cmdHistory.splice(0, this.cmdHistory.length - CMD_HISTORY_MAX);
+    }
+    this.histIndex = null;
+    this.histLiveDraft = "";
+    persistCmdHistory(this.username, this.host, this.cmdHistory);
+  }
+
+  /**
+   * Browse local draft history. `delta` -1 = older (↑), +1 = newer (↓).
+   * Does not talk to the remote shell's HISTFILE.
+   */
+  private historyStep(delta: number) {
+    this.hideCompletePopup();
+    if (this.cmdHistory.length === 0) return;
+
+    if (delta < 0) {
+      // Older
+      if (this.histIndex === null) {
+        this.syncDraftFromInput();
+        this.histLiveDraft = this.draft.text;
+        this.histIndex = this.cmdHistory.length - 1;
+      } else if (this.histIndex > 0) {
+        this.histIndex -= 1;
+      } else {
+        return; // already at oldest
+      }
+    } else {
+      // Newer
+      if (this.histIndex === null) return;
+      if (this.histIndex < this.cmdHistory.length - 1) {
+        this.histIndex += 1;
+      } else {
+        // Past newest → restore in-progress draft
+        this.histIndex = null;
+        this.draft.text = this.histLiveDraft;
+        this.draft.cursor = this.histLiveDraft.length;
+        this.histLiveDraft = "";
+        this.restoreDraftToInput();
+        return;
+      }
+    }
+
+    const line = this.cmdHistory[this.histIndex!];
+    this.draft.text = line;
+    this.draft.cursor = line.length;
+    this.restoreDraftToInput();
   }
 
   private syncDraftFromInput() {
@@ -853,10 +1092,27 @@ class SessionView {
     const base = this.completeUi.baseLine;
     const start = this.completeUi.tokenStart;
     const end = this.completeUi.tokenEnd;
+    const before = this.draftInput.value;
     const next = base.slice(0, start) + name + base.slice(end);
+    const suffixLeft = base.slice(end);
     this.draft.text = next;
     this.draft.cursor = start + name.length;
+    this.completeUi.appliedLine = next;
+    // Keep token span in sync with the newly applied candidate for next cycle.
+    this.completeUi.tokenEnd = start + name.length;
+    this.completeUi.baseLine = next;
     this.restoreDraftToInput();
+    opsLog("CMD", "complete_cycle", {
+      index: this.completeUi.index,
+      n,
+      candidate: previewText(name, 80),
+      base: previewText(base, 120),
+      tokenRange: [start, end],
+      suffixAfterToken: previewText(suffixLeft, 40),
+      before: previewText(before, 120),
+      after: previewText(next, 120),
+      sid: this.sessionId.slice(0, 8),
+    });
   }
 
   private renderCompletePopup() {
@@ -885,21 +1141,42 @@ class SessionView {
     this.syncDraftFromInput();
     const line = this.draft.text;
     const cursor = this.draftInput.selectionStart ?? line.length;
+    // Only cycle the open list when the user has NOT edited the draft since
+    // the last apply. Otherwise re-query with the refined prefix (bash-like).
     if (
       this.completeUi &&
       this.completeUi.candidates.length > 1 &&
       !this.completeUi.busy
     ) {
-      this.cycleCandidate(1);
-      return;
+      if (line === this.completeUi.appliedLine) {
+        opsLog("CMD", "complete_tab_cycle_existing", {
+          n: this.completeUi.candidates.length,
+          index: this.completeUi.index,
+          sid: this.sessionId.slice(0, 8),
+        });
+        this.cycleCandidate(1);
+        return;
+      }
+      opsLog("CMD", "complete_requery_after_edit", {
+        applied: previewText(this.completeUi.appliedLine, 120),
+        now: previewText(line, 120),
+        sid: this.sessionId.slice(0, 8),
+      });
+      this.hideCompletePopup();
     }
     if (this.completeUi?.busy) return;
+    opsLog("CMD", "complete_request", {
+      line: previewText(line, 160),
+      cursor,
+      sid: this.sessionId.slice(0, 8),
+    });
     this.completeUi = {
       candidates: [],
       index: 0,
       tokenStart: 0,
       tokenEnd: cursor,
       baseLine: line,
+      appliedLine: line,
       busy: true,
     };
     try {
@@ -909,7 +1186,33 @@ class SessionView {
         cursor,
       });
       this.setError(null);
+      const r = result as CompleteResult & {
+        tokenStart?: number;
+        tokenEnd?: number;
+        token_start?: number;
+        token_end?: number;
+      };
+      const tokenStart = r.tokenStart ?? r.token_start ?? 0;
+      const tokenEnd = r.tokenEnd ?? r.token_end ?? cursor;
+      const n = result.candidates?.length ?? 0;
+      opsLog("CMD", "complete_result", {
+        before: previewText(line, 160),
+        after: previewText(result.line, 160),
+        cursorIn: cursor,
+        cursorOut: result.cursor,
+        tokenRange: [tokenStart, tokenEnd],
+        n,
+        candidatesPreview: (result.candidates || [])
+          .slice(0, 12)
+          .map((c) => previewText(c, 40)),
+        filledCommand: previewText(result.line, 200),
+        sid: this.sessionId.slice(0, 8),
+      });
       if (!result.candidates || result.candidates.length === 0) {
+        opsLog("CMD", "complete_empty", {
+          line: previewText(line, 120),
+          sid: this.sessionId.slice(0, 8),
+        });
         this.hideCompletePopup();
         this.writeToTerm("\x07");
         return;
@@ -917,24 +1220,34 @@ class SessionView {
       this.draft.text = result.line;
       this.draft.cursor = result.cursor;
       this.restoreDraftToInput();
+      // Log the final draft field value after auto-fill (what the user sees).
+      opsLog("CMD", "complete_filled", {
+        kind: n === 1 ? "single" : "multi_or_prefix",
+        command: previewText(this.draftInput.value, 200),
+        cursor: this.draftInput.selectionStart,
+        n,
+        sid: this.sessionId.slice(0, 8),
+      });
       if (result.candidates.length === 1) {
         this.hideCompletePopup();
         return;
       }
-      const r = result as CompleteResult & {
-        tokenStart?: number;
-        tokenEnd?: number;
-      };
       this.completeUi = {
         candidates: result.candidates,
         index: 0,
-        tokenStart: r.tokenStart ?? r.token_start,
-        tokenEnd: r.tokenEnd ?? r.token_end,
+        tokenStart,
+        tokenEnd,
         baseLine: result.line,
+        appliedLine: result.line,
         busy: false,
       };
       this.renderCompletePopup();
     } catch (e) {
+      opsLog("ERR", "complete_failed", {
+        error: String(e),
+        line: previewText(line, 120),
+        sid: this.sessionId.slice(0, 8),
+      });
       this.hideCompletePopup();
       this.setError(String(e));
     }
@@ -956,6 +1269,8 @@ class SessionView {
     }
     if (!this.isLive()) {
       this.pendingDraft = line;
+      // Still remember for ↑ history after the user reconnects.
+      this.pushHistory(line);
       this.setError("当前未连接：草稿已保留，重连成功后将自动发送");
       return;
     }
@@ -969,6 +1284,8 @@ class SessionView {
       line: previewText(logical),
       sid: this.sessionId.slice(0, 8),
     });
+    // Record history before clear so ↑ works even if IPC fails later.
+    this.pushHistory(logical);
     this.draft.text = "";
     this.draft.cursor = 0;
     this.restoreDraftToInput();
@@ -1227,6 +1544,7 @@ async function connectWithForm(opts: {
     view = existing;
     view.host = host;
     view.username = username;
+    view.rebindCmdHistory();
     opsLog("UI", "connect_reuse_tab", { sid: view.sessionId.slice(0, 8) });
   } else {
     if (sessions.size >= MAX_TABS) {

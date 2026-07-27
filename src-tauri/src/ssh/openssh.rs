@@ -759,17 +759,39 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
         return;
     }
 
-    crate::ops_log::log(
-        "ECHO",
-        &format!(
-            "remote sid={} len={} hex={} text=\"{}\"",
-            &session_id[..session_id.len().min(8)],
-            filtered.len(),
-            crate::ops_log::hex_preview(&filtered, 96),
-            crate::ops_log::text_preview(&filtered, 200)
-        ),
-    );
-    emit_data_raw(app, session_id, &filtered);
+    // OpenSSH client keepalive noise (often appears on drop / failed reconnect).
+    // Status bar already covers disconnect/reconnect; keep scrollback clean.
+    let filtered = strip_openssh_client_noise(&filtered);
+    if filtered.is_empty() {
+        return;
+    }
+
+    // Reconnect / cwd-restore: mute MOTD, Last login, timeout spam, silent cd echo.
+    // Still track cwd when not frozen (OSC 7 may arrive during muted login).
+    let muted = rt.is_ui_muted();
+    if !muted {
+        crate::ops_log::log(
+            "ECHO",
+            &format!(
+                "remote sid={} len={} hex={} text=\"{}\"",
+                &session_id[..session_id.len().min(8)],
+                filtered.len(),
+                crate::ops_log::hex_preview(&filtered, 96),
+                crate::ops_log::text_preview(&filtered, 200)
+            ),
+        );
+        emit_data_raw(app, session_id, &filtered);
+    } else {
+        crate::ops_log::log(
+            "ECHO",
+            &format!(
+                "muted sid={} len={} text=\"{}\"",
+                &session_id[..session_id.len().min(8)],
+                filtered.len(),
+                crate::ops_log::text_preview(&filtered, 120)
+            ),
+        );
+    }
 
     if rt.cwd_freeze.load(Ordering::SeqCst) {
         // Freeze means restore playbook owns cwd; ignore OSC / cd parse from output.
@@ -785,6 +807,75 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
     };
     if let Some(ch) = change {
         apply_cwd_change(app, &rt, &ch);
+    }
+}
+
+/// Drop OpenSSH client diagnostic lines that are not remote shell output.
+/// e.g. `Timeout, server 1.2.3.4 not responding.`
+fn strip_openssh_client_noise(data: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(data);
+    // Fast path: nothing matching.
+    if !text.contains("Timeout, server") {
+        return data.to_vec();
+    }
+    let mut out = String::with_capacity(text.len());
+    // Normalize to \n for line decisions, then rewrite with original endings preserved
+    // by scanning the original string with a simple line walker.
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Find end of line (exclusive of line ending bytes).
+        let mut j = i;
+        while j < bytes.len() && bytes[j] != b'\n' && bytes[j] != b'\r' {
+            j += 1;
+        }
+        let line = &text[i..j];
+        // Consume one line ending: \r\n, \n, or lone \r.
+        let mut k = j;
+        if k < bytes.len() && bytes[k] == b'\r' {
+            k += 1;
+            if k < bytes.len() && bytes[k] == b'\n' {
+                k += 1;
+            }
+        } else if k < bytes.len() && bytes[k] == b'\n' {
+            k += 1;
+        }
+        let ending = &text[j..k];
+        let trimmed = line.trim();
+        let is_timeout =
+            trimmed.starts_with("Timeout, server") && trimmed.contains("not responding");
+        if !is_timeout {
+            out.push_str(line);
+            out.push_str(ending);
+        }
+        i = k;
+    }
+    out.into_bytes()
+}
+
+#[cfg(test)]
+mod noise_filter_tests {
+    use super::strip_openssh_client_noise;
+
+    #[test]
+    fn strips_timeout_lines() {
+        let raw = b"Timeout, server 43.106.28.40 not responding.\r\nTimeout, server 43.106.28.40 not responding.\r\n";
+        let out = strip_openssh_client_noise(raw);
+        assert!(out.is_empty(), "got {:?}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn keeps_shell_output() {
+        let raw = b"ls\r\nfile.txt\r\n";
+        let out = strip_openssh_client_noise(raw);
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn strips_timeout_keeps_neighbors() {
+        let raw = b"hello\r\nTimeout, server 1.2.3.4 not responding.\r\nworld\r\n";
+        let out = strip_openssh_client_noise(raw);
+        assert_eq!(String::from_utf8_lossy(&out), "hello\r\nworld\r\n");
     }
 }
 
@@ -813,6 +904,11 @@ fn apply_cwd_change(
         CwdChangeReason::Osc7 => {
             if let Some(ref path) = ch.path {
                 crate::ops_log::log("CWD", &format!("from_osc path={path}"));
+            }
+        }
+        CwdChangeReason::OscTitle => {
+            if let Some(ref path) = ch.path {
+                crate::ops_log::log("CWD", &format!("from_osc_title path={path}"));
             }
         }
         CwdChangeReason::CdRollback => {
@@ -913,6 +1009,13 @@ async fn finish_session(app: AppHandle, session_id: String, manual: bool) {
                 "finish_session freeze restore_target path={path} manual={is_manual} auto={auto}"
             ),
         );
+    } else {
+        crate::ops_log::log(
+            "CWD",
+            &format!(
+                "finish_session freeze skipped (no absolute cwd) manual={is_manual} auto={auto}"
+            ),
+        );
     }
 
     if is_manual {
@@ -924,10 +1027,17 @@ async fn finish_session(app: AppHandle, session_id: String, manual: bool) {
     } else if auto {
         meta.state = SessionState::Disconnected;
         meta.message = Some("连接已断开，准备重连…".into());
+        // Mute immediately so trailing OpenSSH timeout lines don't hit the UI
+        // before the reconnect loop arms mute.
+        rt.set_ui_mute(true);
+        // Freeze cwd so the new login shell's OSC title (`~`) cannot wipe
+        // restore_target before the restore playbook runs.
+        rt.cwd_freeze.store(true, Ordering::SeqCst);
         crate::ops_log::log("STATE", "finish_session disconnected → will reconnect");
     } else {
         meta.state = SessionState::Disconnected;
         meta.message = Some("连接已断开".into());
+        rt.set_ui_mute(false);
         crate::ops_log::log("STATE", "finish_session disconnected (no auto reconnect)");
     }
 

@@ -1,8 +1,11 @@
-//! Working-directory tracking: OSC 7 (primary) + simple `cd` line parsing (fallback).
+//! Working-directory tracking: OSC 7 (primary) + OSC 0/2 title path + `cd` parse.
 //!
 //! Optimistic `cd`/`pushd` updates are rolled back when the remote shell reports
 //! failure (e.g. `bash: cd: tg: No such file or directory`). Without OSC 7 this
 //! is the main defense against a poisoned `restore_target`.
+//!
+//! Many stock bash setups never emit OSC 7; they only put `~/subdir` in the
+//! window title (OSC 0). We parse that as a fallback so reconnect can restore.
 
 use std::path::{Component, Path};
 
@@ -10,6 +13,8 @@ use std::path::{Component, Path};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CwdChangeReason {
     Osc7,
+    /// From OSC 0 / OSC 2 window title (`user@host: ~/path`).
+    OscTitle,
     CdParse,
     /// Optimistic cd/pushd rolled back after remote error.
     CdRollback,
@@ -27,6 +32,8 @@ pub struct CwdChange {
 #[derive(Debug, Default, Clone)]
 pub struct CwdTracker {
     last_known: Option<String>,
+    /// Best-effort `$HOME` (from provisional seed, OSC, or absolute path guess).
+    home_hint: Option<String>,
     /// `last_known` before the latest optimistic cd/pushd (for rollback).
     pre_optimistic: Option<String>,
     /// Optimistic path still awaiting confirmation / possible failure echo.
@@ -45,16 +52,48 @@ impl CwdTracker {
         self.last_known.as_deref()
     }
 
+    pub fn home_hint(&self) -> Option<&str> {
+        self.home_hint.as_deref()
+    }
+
     pub fn set(&mut self, path: impl Into<String>) {
         let p = path.into();
         if !p.is_empty() {
+            if p.starts_with('/') {
+                if let Some(home) = guess_home_from_path(&p) {
+                    self.home_hint = Some(home);
+                }
+            }
             self.last_known = Some(p);
             self.clear_optimistic();
         }
     }
 
+    /// Seed login `$HOME` without a side-channel (e.g. `/home/{user}`).
+    /// Enables relative `cd` tracking when OSC 7 / remote `pwd` seed is unavailable.
+    pub fn seed_provisional_home(&mut self, home: impl Into<String>) -> bool {
+        let home = home.into();
+        if !home.starts_with('/') {
+            return false;
+        }
+        self.home_hint = Some(home.clone());
+        // Only fill last_known when empty — do not clobber a better path.
+        if self
+            .last_known
+            .as_ref()
+            .map(|p| p.starts_with('/'))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        self.last_known = Some(home);
+        self.clear_optimistic();
+        true
+    }
+
     pub fn clear(&mut self) {
         self.last_known = None;
+        self.home_hint = None;
         self.clear_optimistic();
         self.osc = OscParser::default();
         self.line_buf.clear();
@@ -65,17 +104,62 @@ impl CwdTracker {
         self.optimistic_path = None;
     }
 
+    fn effective_home(&self) -> Option<String> {
+        if let Some(h) = &self.home_hint {
+            return Some(h.clone());
+        }
+        self.last_known
+            .as_deref()
+            .and_then(guess_home_from_path)
+    }
+
     /// Feed remote stdout/stderr bytes.
-    /// Returns a change when OSC 7 reports a path, or when a failed `cd` is rolled back.
+    /// Returns a change when OSC 7 / title path reports a path, or when a failed `cd` is rolled back.
     pub fn feed_output(&mut self, data: &[u8]) -> Option<CwdChange> {
         // OSC 7 is source of truth — clears any pending optimistic path.
-        if let Some(path) = self.osc.push(data) {
-            self.last_known = Some(path.clone());
-            self.clear_optimistic();
-            return Some(CwdChange {
-                path: Some(path),
-                reason: CwdChangeReason::Osc7,
-            });
+        match self.osc.push(data) {
+            Some(OscHit::Osc7(path)) => {
+                if path.starts_with('/') {
+                    if let Some(home) = guess_home_from_path(&path) {
+                        self.home_hint = Some(home);
+                    }
+                }
+                self.last_known = Some(path.clone());
+                self.clear_optimistic();
+                return Some(CwdChange {
+                    path: Some(path),
+                    reason: CwdChangeReason::Osc7,
+                });
+            }
+            Some(OscHit::Title(raw)) => {
+                let home = self.effective_home();
+                if let Some(path) = expand_shell_path(&raw, home.as_deref()) {
+                    // Ignore pure-home title if we already track a deeper absolute path
+                    // (title can lag; do not clobber a subdirectory with stale `~`).
+                    let already_abs = self
+                        .last_known
+                        .as_ref()
+                        .map(|p| p.starts_with('/'))
+                        .unwrap_or(false);
+                    let is_just_home = home.as_deref() == Some(path.as_str());
+                    if already_abs && is_just_home {
+                        // keep deeper path
+                    } else if self.last_known.as_deref() != Some(path.as_str()) {
+                        if path.starts_with('/') {
+                            if let Some(h) = guess_home_from_path(&path) {
+                                self.home_hint = Some(h);
+                            }
+                        }
+                        self.last_known = Some(path.clone());
+                        self.clear_optimistic();
+                        return Some(CwdChange {
+                            path: Some(path),
+                            reason: CwdChangeReason::OscTitle,
+                        });
+                    }
+                }
+            }
+            None => {}
         }
 
         // Scan printable text for bash/zsh cd failures.
@@ -242,8 +326,8 @@ enum OscState {
 }
 
 impl OscParser {
-    fn push(&mut self, data: &[u8]) -> Option<String> {
-        let mut found = None;
+    fn push(&mut self, data: &[u8]) -> Option<OscHit> {
+        let mut found: Option<OscHit> = None;
         for &b in data {
             match self.state {
                 OscState::Idle => {
@@ -264,8 +348,8 @@ impl OscParser {
                 OscState::Osc => {
                     if b == 0x07 {
                         // BEL
-                        if let Some(p) = parse_osc7_payload(&self.body) {
-                            found = Some(p);
+                        if let Some(hit) = parse_osc_payload(&self.body) {
+                            found = merge_osc_hit(found, hit);
                         }
                         self.body.clear();
                         self.state = OscState::Idle;
@@ -282,8 +366,8 @@ impl OscParser {
                 OscState::OscEsc => {
                     if b == b'\\' {
                         // ST terminator
-                        if let Some(p) = parse_osc7_payload(&self.body) {
-                            found = Some(p);
+                        if let Some(hit) = parse_osc_payload(&self.body) {
+                            found = merge_osc_hit(found, hit);
                         }
                         self.body.clear();
                         self.state = OscState::Idle;
@@ -302,11 +386,95 @@ impl OscParser {
     }
 }
 
-/// Full OSC payload after `ESC ]`, e.g. `7;file://host/path`
-fn parse_osc7_payload(body: &[u8]) -> Option<String> {
+fn merge_osc_hit(prev: Option<OscHit>, next: OscHit) -> Option<OscHit> {
+    match (prev, next) {
+        // OSC 7 always wins over title.
+        (_, n @ OscHit::Osc7(_)) => Some(n),
+        (Some(o @ OscHit::Osc7(_)), OscHit::Title(_)) => Some(o),
+        (_, n) => Some(n),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OscHit {
+    Osc7(String),
+    /// Raw path fragment from window title (may be `~`, `~/x`, or absolute).
+    Title(String),
+}
+
+/// Full OSC payload after `ESC ]`, e.g. `7;file://host/path` or `0;user@host: ~/x`.
+fn parse_osc_payload(body: &[u8]) -> Option<OscHit> {
     let s = std::str::from_utf8(body).ok()?;
-    let rest = s.strip_prefix("7;")?;
-    parse_file_url(rest.trim())
+    if let Some(rest) = s.strip_prefix("7;") {
+        return parse_file_url(rest.trim()).map(OscHit::Osc7);
+    }
+    // OSC 0 (icon+title) / OSC 2 (title only): bash often sets `user@host: cwd`.
+    if let Some(rest) = s
+        .strip_prefix("0;")
+        .or_else(|| s.strip_prefix("2;"))
+    {
+        return parse_title_cwd(rest.trim()).map(OscHit::Title);
+    }
+    None
+}
+
+/// Extract cwd from a window title like `tguser@host: ~/tg1/logs` or `host: /tmp`.
+fn parse_title_cwd(title: &str) -> Option<String> {
+    // Prefer the segment after the last `: ` (common bash PS1 title form).
+    let path = if let Some((_, rhs)) = title.rsplit_once(": ") {
+        rhs.trim()
+    } else if let Some((_, rhs)) = title.rsplit_once(':') {
+        rhs.trim()
+    } else {
+        return None;
+    };
+    if path.is_empty() {
+        return None;
+    }
+    // Reject obvious non-paths (e.g. `vim: file.txt` without leading ~ or /).
+    if !(path.starts_with('/') || path.starts_with('~') || path == "~") {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// Expand `~` / `~/…` using a known home, or pass through absolute paths.
+pub fn expand_shell_path(path: &str, home: Option<&str>) -> Option<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    if path == "~" {
+        return home.map(|h| normalize_abs(h));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = home?;
+        return Some(normalize_abs(&format!("{home}/{rest}")));
+    }
+    if path.starts_with('/') {
+        return Some(normalize_abs(path));
+    }
+    None
+}
+
+/// Best-effort login home without probing the remote (used when side-channel `pwd` fails).
+pub fn provisional_login_home(username: &str) -> Option<String> {
+    let u = username.trim();
+    if u.is_empty() || u.contains('/') || u.contains('\\') || u.contains('\0') {
+        return None;
+    }
+    // Reject characters that cannot appear in a normal Unix login name path segment.
+    if !u
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return None;
+    }
+    if u == "root" {
+        Some("/root".into())
+    } else {
+        Some(format!("/home/{u}"))
+    }
 }
 
 fn parse_file_url(s: &str) -> Option<String> {
@@ -439,10 +607,17 @@ fn resolve_path(target: &str, current: Option<&str>) -> Option<String> {
         return None;
     }
     if target == "~" {
-        return None;
+        return current.and_then(guess_home_from_path).or_else(|| {
+            current
+                .filter(|c| c.starts_with('/'))
+                .map(|c| c.to_string())
+        });
     }
     if let Some(rest) = target.strip_prefix("~/") {
-        // Logical home-relative path — restore may fail without absolute home.
+        if let Some(home) = current.and_then(guess_home_from_path) {
+            return Some(normalize_abs(&format!("{home}/{rest}")));
+        }
+        // No absolute base yet — keep logical form (restore needs absolute later).
         return Some(format!("~/{rest}"));
     }
 
@@ -452,6 +627,7 @@ fn resolve_path(target: &str, current: Option<&str>) -> Option<String> {
 
     let cur = current?;
     if cur.starts_with('~') {
+        // Relative under unresolved home — cannot form absolute.
         return None;
     }
     let joined = Path::new(cur).join(target);
@@ -670,5 +846,80 @@ mod tests {
         ));
         assert!(!looks_like_cd_failure("cd tg1"));
         assert!(!looks_like_cd_failure("ls: cannot access"));
+    }
+
+    #[test]
+    fn provisional_home_enables_relative_cd() {
+        let mut t = CwdTracker::new();
+        assert!(t.seed_provisional_home("/home/tguser"));
+        assert_eq!(t.last_known(), Some("/home/tguser"));
+        assert_eq!(t.home_hint(), Some("/home/tguser"));
+        assert_eq!(
+            t.feed_submitted_line("cd tg1").unwrap().path.as_deref(),
+            Some("/home/tguser/tg1")
+        );
+        assert_eq!(
+            t.feed_submitted_line("cd logs").unwrap().path.as_deref(),
+            Some("/home/tguser/tg1/logs")
+        );
+    }
+
+    #[test]
+    fn provisional_login_home_user_and_root() {
+        assert_eq!(
+            provisional_login_home("tguser").as_deref(),
+            Some("/home/tguser")
+        );
+        assert_eq!(provisional_login_home("root").as_deref(), Some("/root"));
+        assert!(provisional_login_home("../evil").is_none());
+    }
+
+    #[test]
+    fn osc_title_expands_tilde_with_home_hint() {
+        let mut t = CwdTracker::new();
+        assert!(t.seed_provisional_home("/home/tguser"));
+        // Stock bash: OSC 0 title with ~/path (no OSC 7).
+        let seq = b"\x1b]0;tguser@iZhost: ~/tg1/logs\x07";
+        let ch = t.feed_output(seq).unwrap();
+        assert_eq!(ch.reason, CwdChangeReason::OscTitle);
+        assert_eq!(ch.path.as_deref(), Some("/home/tguser/tg1/logs"));
+        assert_eq!(t.last_known(), Some("/home/tguser/tg1/logs"));
+    }
+
+    #[test]
+    fn osc_title_home_does_not_clobber_deeper_path() {
+        let mut t = CwdTracker::new();
+        t.set("/home/tguser/tg1/logs");
+        let seq = b"\x1b]0;tguser@host: ~\x07";
+        assert!(t.feed_output(seq).is_none());
+        assert_eq!(t.last_known(), Some("/home/tguser/tg1/logs"));
+    }
+
+    #[test]
+    fn expand_shell_path_tilde() {
+        assert_eq!(
+            expand_shell_path("~/tg1", Some("/home/tguser")).as_deref(),
+            Some("/home/tguser/tg1")
+        );
+        assert_eq!(
+            expand_shell_path("~", Some("/home/tguser")).as_deref(),
+            Some("/home/tguser")
+        );
+        assert_eq!(
+            expand_shell_path("/tmp/x", None).as_deref(),
+            Some("/tmp/x")
+        );
+    }
+
+    /// Regression from production log: no seed/OSC7 → relative cd was dropped.
+    #[test]
+    fn relative_cd_without_base_is_none_until_seeded() {
+        let mut t = CwdTracker::new();
+        assert!(t.feed_submitted_line("cd tg1").is_none());
+        t.seed_provisional_home("/home/tguser");
+        assert_eq!(
+            t.feed_submitted_line("cd tg1").unwrap().path.as_deref(),
+            Some("/home/tguser/tg1")
+        );
     }
 }
