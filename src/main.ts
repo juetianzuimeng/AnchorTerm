@@ -4,7 +4,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { openPath, openUrl } from "@tauri-apps/plugin-opener";
+import {
+  openPath,
+  openUrl,
+  revealItemInDir,
+} from "@tauri-apps/plugin-opener";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -2075,17 +2079,43 @@ async function handleMenuAction(action: string) {
         openPropsDialog("edit-runtime", { sessionId: active.sessionId });
       }
       break;
-    case "open-logs":
-      if (logsDir) {
+    case "open-logs": {
+      // Prefer native backend open (explorer/xdg-open) — plugin-opener's
+      // `openPath` needs path scope and is not in opener:default.
+      try {
+        const dir = await invoke<string>("open_ops_log_dir");
+        logsDir = dir;
+        opsLog("UI", "open_logs ok", { dir, via: "open_ops_log_dir" });
+        break;
+      } catch (e0) {
+        opsLog("ERR", "open_logs backend failed", { error: String(e0) });
+      }
+      try {
+        if (!logsDir) {
+          const info = await invoke<{ dir: string }>("ops_log_info");
+          logsDir = info.dir || null;
+        }
+        if (!logsDir) {
+          showToast("日志目录未知");
+          break;
+        }
         try {
           await openPath(logsDir);
-        } catch (e) {
-          showToast(`无法打开日志目录: ${e}`);
+          opsLog("UI", "open_logs ok", { dir: logsDir, via: "openPath" });
+        } catch (e1) {
+          opsLog("ERR", "open_logs openPath failed", { error: String(e1) });
+          await revealItemInDir(logsDir);
+          opsLog("UI", "open_logs ok", {
+            dir: logsDir,
+            via: "revealItemInDir",
+          });
         }
-      } else {
-        showToast("日志目录未知");
+      } catch (e) {
+        opsLog("ERR", "open_logs failed", { error: String(e) });
+        showToast(`无法打开日志目录: ${e}`);
       }
       break;
+    }
     case "about":
       ($("dlg-about") as HTMLDialogElement).showModal();
       break;

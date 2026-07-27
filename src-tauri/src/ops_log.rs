@@ -364,6 +364,46 @@ pub fn ops_log_info() -> Result<OpsLogInfo, String> {
     })
 }
 
+/// Open the resolved ops-log directory in the system file manager.
+///
+/// Uses a native shell command so it does not depend on `plugin-opener` path
+/// scopes (opener:default does not allow `open_path`).
+#[tauri::command]
+pub fn open_ops_log_dir() -> Result<String, String> {
+    let dir = log_dir();
+    fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
+    let path_str = dir.display().to_string();
+
+    #[cfg(windows)]
+    {
+        // `explorer <dir>` opens the folder. spawn (do not wait): explorer often
+        // returns non-zero even on success.
+        std::process::Command::new("explorer")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("无法启动资源管理器: {e}"))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("无法打开 Finder: {e}"))?;
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| format!("无法打开文件管理器: {e}"))?;
+    }
+
+    log("UI", &format!("open_ops_log_dir path={path_str}"));
+    Ok(path_str)
+}
+
 /// Convenience macros-like helpers used from Rust modules.
 #[macro_export]
 macro_rules! ops {

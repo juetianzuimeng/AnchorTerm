@@ -54,6 +54,7 @@ pub fn run() {
             session::delete_profile,
             ops_log::ops_log,
             ops_log::ops_log_info,
+            ops_log::open_ops_log_dir,
             ssh::openssh::check_ssh,
         ])
         .run(tauri::generate_context!())
