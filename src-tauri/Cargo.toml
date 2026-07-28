@@ -2,8 +2,9 @@
 name = "anchorterm"
 version = "0.1.0"
 description = "SSH terminal client with reconnect and session state retention"
-authors = ["AnchorTerm"]
+authors = ["zengshangchun"]
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "anchorterm_lib"
