@@ -40,6 +40,12 @@ pub struct SecureKeyMaterial {
     path: PathBuf,
 }
 
+impl SecureKeyMaterial {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 impl Drop for SecureKeyMaterial {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -219,7 +225,17 @@ fn lockdown_private_key_acl(path: &Path) {
     ];
 
     for args in &steps {
-        match std::process::Command::new("icacls").args(args).output() {
+        // Without CREATE_NO_WINDOW, each icacls flashes a black console on Tab
+        // complete (prepare_secure_key runs per side-channel ssh).
+        let mut cmd = std::process::Command::new("icacls");
+        cmd.args(args);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.output() {
             Ok(o) if o.status.success() => {}
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr);
@@ -333,6 +349,16 @@ struct BuiltArgs {
 }
 
 fn build_ssh_args(params: &ConnectParams) -> Result<BuiltArgs, AppError> {
+    build_ssh_args_inner(params, None)
+}
+
+/// Build ssh argv. When `side_key_cache` is set (side-channel exec), reuse a
+/// single decrypted temp key for the whole session so Tab complete does not
+/// re-run `icacls` three times per keystroke.
+fn build_ssh_args_inner(
+    params: &ConnectParams,
+    side_key_cache: Option<&std::sync::Mutex<Option<SecureKeyMaterial>>>,
+) -> Result<BuiltArgs, AppError> {
     // Dead-link detection (e.g. unplugged NIC): plain TCP can stay ESTABLISHED for a
     // long time with no local I/O. OpenSSH client keepalives force a probe so the
     // child exits and we flip UI off "已连接".
@@ -371,20 +397,61 @@ fn build_ssh_args(params: &ConnectParams) -> Result<BuiltArgs, AppError> {
         } => {
             // Decrypt in-app and export clear OpenSSH key — no SSH_ASKPASS needed.
             // (Windows OpenSSH cannot spawn our askpass .cmd under CREATE_NO_WINDOW.)
-            let secure = prepare_secure_key(
-                Path::new(private_key_path),
-                passphrase.as_deref(),
-            )?;
+            let key_path = if let Some(cache) = side_key_cache {
+                let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+                if g.is_none() {
+                    let t0 = std::time::Instant::now();
+                    *g = Some(prepare_secure_key(
+                        Path::new(private_key_path),
+                        passphrase.as_deref(),
+                    )?);
+                    crate::ops_log::log(
+                        "SSH",
+                        &format!(
+                            "side-channel key prepared (cached for session) ms={}",
+                            t0.elapsed().as_millis()
+                        ),
+                    );
+                } else {
+                    crate::ops_log::log("SSH", "side-channel key reused (no icacls)");
+                }
+                g.as_ref()
+                    .map(|k| k.path().display().to_string())
+                    .ok_or_else(|| AppError::Ssh("side-channel key missing".into()))?
+            } else {
+                let secure = prepare_secure_key(
+                    Path::new(private_key_path),
+                    passphrase.as_deref(),
+                )?;
+                let p = secure.path().display().to_string();
+                args.push("-i".into());
+                args.push(p);
+                args.push("-o".into());
+                args.push("IdentitiesOnly=yes".into());
+                args.push("-o".into());
+                args.push("PreferredAuthentications=publickey".into());
+                args.push("-o".into());
+                args.push("PasswordAuthentication=no".into());
+                return Ok(BuiltArgs {
+                    args: {
+                        let mut a = args;
+                        a.push(format!("{}@{}", params.username, params.host));
+                        a
+                    },
+                    askpass: None,
+                    secure_key: Some(secure),
+                });
+            };
             args.push("-i".into());
-            args.push(secure.path.display().to_string());
+            args.push(key_path);
             args.push("-o".into());
             args.push("IdentitiesOnly=yes".into());
             args.push("-o".into());
             args.push("PreferredAuthentications=publickey".into());
             args.push("-o".into());
             args.push("PasswordAuthentication=no".into());
-            // No askpass: key is already unencrypted.
-            (None, Some(secure))
+            // Cache owns the SecureKeyMaterial; do not Drop it after this exec.
+            (None, None)
         }
     };
 
@@ -1087,8 +1154,26 @@ pub async fn openssh_exec(
     params: &ConnectParams,
     remote_command: &str,
 ) -> Result<String, AppError> {
+    openssh_exec_inner(params, remote_command, None).await
+}
+
+/// Side-channel exec that reuses a per-session decrypted key (Tab complete, pwd).
+pub async fn openssh_exec_with_key_cache(
+    params: &ConnectParams,
+    remote_command: &str,
+    key_cache: &std::sync::Mutex<Option<SecureKeyMaterial>>,
+) -> Result<String, AppError> {
+    openssh_exec_inner(params, remote_command, Some(key_cache)).await
+}
+
+async fn openssh_exec_inner(
+    params: &ConnectParams,
+    remote_command: &str,
+    side_key_cache: Option<&std::sync::Mutex<Option<SecureKeyMaterial>>>,
+) -> Result<String, AppError> {
     let ssh = find_ssh()?;
-    let built = build_ssh_args(params)?;
+    let t0 = std::time::Instant::now();
+    let built = build_ssh_args_inner(params, side_key_cache)?;
     let mut args = built.args;
     // Non-interactive exec: no -tt
     args.retain(|a| a != "-tt");
@@ -1112,9 +1197,19 @@ pub async fn openssh_exec(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        // Hide console for ssh.exe (and reduce flash when parent is GUI).
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
     }
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "side-channel ssh spawn cmd_len={} key_cached={}",
+            remote_command.len(),
+            side_key_cache.is_some()
+        ),
+    );
 
     let output = cmd
         .output()
@@ -1125,6 +1220,15 @@ pub async fn openssh_exec(
     drop(built.secure_key);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "side-channel ssh done ms={} status={:?} stdout_len={}",
+            t0.elapsed().as_millis(),
+            output.status,
+            stdout.len()
+        ),
+    );
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
         // Tab-complete scripts may exit non-zero while still printing useful

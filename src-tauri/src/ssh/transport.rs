@@ -16,6 +16,7 @@ use crate::auth::AuthMethod;
 use crate::error::AppError;
 use crate::ssh::openssh;
 
+#[derive(Clone)]
 pub struct ConnectParams {
     pub host: String,
     pub port: u16,

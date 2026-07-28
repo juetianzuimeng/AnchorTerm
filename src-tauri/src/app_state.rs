@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::AuthMethod;
 use crate::cwd::CwdTracker;
 use crate::error::AppError;
+use crate::ssh::openssh::SecureKeyMaterial;
 use crate::ssh::transport::ActiveTransport;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +117,9 @@ pub struct SessionRuntime {
     pub remote_stty: Mutex<Option<(u32, u32)>>,
     /// Strip our injected `stty …` line from the UI stream (remote line echo).
     pub echo_suppress: Mutex<Option<EchoSuppress>>,
+    /// Decrypted temp key reused by side-channel `ssh` (Tab complete / pwd).
+    /// Avoids re-running icacls on every Tab (which flashed black consoles).
+    pub side_channel_key: Mutex<Option<SecureKeyMaterial>>,
 }
 
 /// Pending filter for silent control injects (currently `stty` resize).
@@ -145,6 +149,16 @@ impl SessionRuntime {
             last_stty: Mutex::new(None),
             remote_stty: Mutex::new(None),
             echo_suppress: Mutex::new(None),
+            side_channel_key: Mutex::new(None),
+        }
+    }
+
+    /// Drop cached side-channel key (new connect / auth change / close).
+    pub fn clear_side_channel_key(&self) {
+        if let Ok(mut g) = self.side_channel_key.lock() {
+            if g.take().is_some() {
+                crate::ops_log::log("SSH", "side-channel key cache cleared");
+            }
         }
     }
 

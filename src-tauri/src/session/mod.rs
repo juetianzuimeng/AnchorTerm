@@ -126,6 +126,8 @@ async fn connect_inner(
         rt.auto_reconnect.store(true, Ordering::SeqCst);
         // Invalidate any old reconnect loops.
         rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
+        // New credentials / endpoint → do not reuse old decrypted temp key.
+        rt.clear_side_channel_key();
 
         // Restore path priority:
         // 1) In-memory restore_target / last_known when this runtime already
@@ -606,9 +608,13 @@ fn connect_params_from_cache(rt: &SessionRuntime) -> Result<ConnectParams, Strin
 
 async fn query_remote_pwd(rt: &SessionRuntime) -> Result<String, String> {
     let params = connect_params_from_cache(rt)?;
-    let out = crate::ssh::openssh::openssh_exec(&params, "pwd -P")
-        .await
-        .map_err(|e| e.to_string())?;
+    let out = crate::ssh::openssh::openssh_exec_with_key_cache(
+        &params,
+        "pwd -P",
+        &rt.side_channel_key,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     let path = out.lines().next().unwrap_or("").trim().to_string();
     if path.starts_with('/') {
         Ok(path)
@@ -621,9 +627,13 @@ async fn query_dir_exists(rt: &SessionRuntime, path: &str) -> Result<bool, Strin
     let params = connect_params_from_cache(rt)?;
     let quoted = crate::cwd::shell_single_quote(path);
     let cmd = format!("test -d {quoted} && echo AT_DIR_OK || echo AT_DIR_MISSING");
-    let out = crate::ssh::openssh::openssh_exec(&params, &cmd)
-        .await
-        .map_err(|e| e.to_string())?;
+    let out = crate::ssh::openssh::openssh_exec_with_key_cache(
+        &params,
+        &cmd,
+        &rt.side_channel_key,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(out.contains("AT_DIR_OK"))
 }
 
@@ -954,11 +964,12 @@ fn close_session_inner(
     );
     // Persist last absolute cwd before tearing down (tab close → later reconnect).
     freeze_restore_target_from_cwd(&rt, "close tab");
-    // 1–4: cancel reconnect + clear freeze/mute
+    // 1–4: cancel reconnect + clear freeze/mute + side-channel key
     rt.auto_reconnect.store(false, Ordering::SeqCst);
     rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
     rt.cwd_freeze.store(false, Ordering::SeqCst);
     rt.set_ui_mute(false);
+    rt.clear_side_channel_key();
     // 5: take transport → Drop SecureKeyMaterial
     let transport = rt.transport.lock().expect("transport lock").take();
     if let Some(t) = transport {
@@ -1207,11 +1218,11 @@ pub async fn complete_draft(
     cursor: usize,
 ) -> Result<crate::ssh::complete::CompleteResult, String> {
     let rt = state.get_runtime(&session_id).map_err(|e| -> String { e.into() })?;
-    complete_draft_inner(&rt, line, cursor).await
+    complete_draft_inner(rt, line, cursor).await
 }
 
 async fn complete_draft_inner(
-    rt: &SessionRuntime,
+    rt: Arc<SessionRuntime>,
     line: String,
     cursor: usize,
 ) -> Result<crate::ssh::complete::CompleteResult, String> {
@@ -1228,7 +1239,8 @@ async fn complete_draft_inner(
         .ok()
         .and_then(|c| c.last_known().map(|s| s.to_string()));
 
-    let params = connect_params_from_cache(rt)?;
+    let params = connect_params_from_cache(&rt)?;
+    let rt_exec = Arc::clone(&rt);
 
     crate::ops_log::log(
         "CMD",
@@ -1243,18 +1255,26 @@ async fn complete_draft_inner(
         cwd,
         line,
         cursor,
-        |command| async move {
-            crate::ops_log::log(
-                "SSH",
-                &format!(
-                    "complete side-channel exec cmd_len={} preview=\"{}\"",
-                    command.len(),
-                    crate::ops_log::text_preview(command.as_bytes(), 100)
-                ),
-            );
-            crate::ssh::openssh::openssh_exec(&params, &command)
+        move |command| {
+            let params = params.clone();
+            let rt_exec = Arc::clone(&rt_exec);
+            async move {
+                crate::ops_log::log(
+                    "SSH",
+                    &format!(
+                        "complete side-channel exec cmd_len={} preview=\"{}\"",
+                        command.len(),
+                        crate::ops_log::text_preview(command.as_bytes(), 100)
+                    ),
+                );
+                crate::ssh::openssh::openssh_exec_with_key_cache(
+                    &params,
+                    &command,
+                    &rt_exec.side_channel_key,
+                )
                 .await
                 .map_err(|e| e.to_string())
+            }
         },
     )
     .await;
