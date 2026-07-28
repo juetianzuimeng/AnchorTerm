@@ -836,19 +836,24 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
     // Reconnect / cwd-restore: mute MOTD, Last login, timeout spam, silent cd echo.
     // Still track cwd when not frozen (OSC 7 may arrive during muted login).
     let muted = rt.is_ui_muted();
+    // Huge remote dumps (grep/tail of multi-MB logs) used to log every 8KB chunk
+    // thrice to disk + UI IPC — freezing the app during reconnect. Rate-limit.
+    let log_echo = filtered.len() <= 512 || rt.take_echo_log_slot();
     if !muted {
-        crate::ops_log::log(
-            "ECHO",
-            &format!(
-                "remote sid={} len={} hex={} text=\"{}\"",
-                &session_id[..session_id.len().min(8)],
-                filtered.len(),
-                crate::ops_log::hex_preview(&filtered, 96),
-                crate::ops_log::text_preview(&filtered, 200)
-            ),
-        );
+        if log_echo {
+            crate::ops_log::log(
+                "ECHO",
+                &format!(
+                    "remote sid={} len={} hex={} text=\"{}\"",
+                    &session_id[..session_id.len().min(8)],
+                    filtered.len(),
+                    crate::ops_log::hex_preview(&filtered, 96),
+                    crate::ops_log::text_preview(&filtered, 200)
+                ),
+            );
+        }
         emit_data_raw(app, session_id, &filtered);
-    } else {
+    } else if log_echo {
         crate::ops_log::log(
             "ECHO",
             &format!(
@@ -1120,12 +1125,21 @@ async fn finish_session(app: AppHandle, session_id: String, manual: bool) {
         // Freeze cwd so the new login shell's OSC title (`~`) cannot wipe
         // restore_target before the restore playbook runs.
         rt.cwd_freeze.store(true, Ordering::SeqCst);
-        crate::ops_log::log("STATE", "finish_session disconnected → will reconnect");
+        // Invalidate any restore playbook still awaiting side-channel / sleeps.
+        let g = rt.bump_restore_gen();
+        crate::ops_log::log(
+            "STATE",
+            &format!("finish_session disconnected → will reconnect restore_gen={g}"),
+        );
     } else {
         meta.state = SessionState::Disconnected;
         meta.message = Some("连接已断开".into());
         rt.set_ui_mute(false);
-        crate::ops_log::log("STATE", "finish_session disconnected (no auto reconnect)");
+        let g = rt.bump_restore_gen();
+        crate::ops_log::log(
+            "STATE",
+            &format!("finish_session disconnected (no auto reconnect) restore_gen={g}"),
+        );
     }
 
     let snap = SessionSnapshot {

@@ -135,6 +135,21 @@ function opsLog(
   invoke("ops_log", { category, message, detail: d }).catch(() => {});
 }
 
+/** Per-session budget for large ui_receive ops-log lines (reset every 2s). */
+const uiEchoLogBudget = new Map<string, { n: number; resetAt: number }>();
+
+function shouldLogUiEcho(sid: string): boolean {
+  const now = Date.now();
+  let b = uiEchoLogBudget.get(sid);
+  if (!b || now >= b.resetAt) {
+    b = { n: 20, resetAt: now + 2000 };
+    uiEchoLogBudget.set(sid, b);
+  }
+  if (b.n <= 0) return false;
+  b.n -= 1;
+  return true;
+}
+
 function previewText(s: string, max = 160): string {
   const one = s
     .replace(/\r/g, "\\r")
@@ -2270,12 +2285,16 @@ async function setupEvents() {
       const b64 = p.data_b64 || p.dataB64 || "";
       if (!b64) return;
       const bytes = base64ToBytes(b64);
-      const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-      opsLog("ECHO", "ui_receive", {
-        len: bytes.length,
-        text: previewText(text, 200),
-        sid: sid.slice(0, 8),
-      });
+      // Throttle ECHO IPC logging: multi-MB grep freezes UI if every 8KB chunk
+      // round-trips to the backend ops log.
+      if (bytes.length <= 512 || shouldLogUiEcho(sid)) {
+        const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+        opsLog("ECHO", "ui_receive", {
+          len: bytes.length,
+          text: previewText(text, 200),
+          sid: sid.slice(0, 8),
+        });
+      }
       view.writeToTerm(bytes);
     } catch (e) {
       console.error("session://data decode failed", e);

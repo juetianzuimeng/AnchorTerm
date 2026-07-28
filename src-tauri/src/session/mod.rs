@@ -275,6 +275,8 @@ async fn connect_inner(
             }
 
             *rt.transport.lock().expect("transport lock") = Some(transport);
+            // Fresh PTY → allow a burst of ECHO diagnostics again.
+            rt.refill_echo_log_budget();
 
             {
                 let mut meta = rt.meta.lock().expect("meta lock");
@@ -312,6 +314,19 @@ async fn connect_inner(
                     ),
                 );
                 run_restore_playbook(app, &rt).await;
+                // If the PTY died mid-restore, do **not** report Ok — the reconnect
+                // loop must keep retrying (log: false "重连成功" while transport=None).
+                if !session_still_connected(&rt)
+                    || rt.transport.lock().map(|t| t.is_none()).unwrap_or(true)
+                {
+                    crate::ops_log::log(
+                        "SSH",
+                        "connect_inner: transport gone after restore; treating as connect failure",
+                    );
+                    return Err(AppError::Connect(
+                        "连接在恢复工作目录过程中断开".into(),
+                    ));
+                }
             } else {
                 rt.set_ui_mute(false);
                 // Immediate local seed so relative `cd` works even if side-channel
@@ -400,7 +415,17 @@ async fn send_pty_bytes(rt: &SessionRuntime, data: Vec<u8>) -> bool {
 ///
 /// UI stream is muted for the whole playbook (login MOTD + silent `cd`); a clean
 /// prompt is elicited when mute is lifted.
+///
+/// Captures `restore_gen` at entry: if the session drops mid-playbook, finish_session
+/// bumps the gen and we must **not** call `set_state(Connected)` on a dead PTY.
 async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
+    let gen = rt.restore_gen.load(Ordering::SeqCst);
+
+    /// Abort if disconnected or a newer reconnect invalidated this playbook.
+    fn restore_still_valid(rt: &SessionRuntime, gen: u64) -> bool {
+        rt.restore_gen_matches(gen) && session_still_connected(rt)
+    }
+
     // Prefer path frozen at disconnect — live last_known may already be $HOME
     // from the new login shell's OSC 7.
     let path = rt
@@ -421,8 +446,11 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
             "CWD",
             "restore skipped: no restore_target/last_known (cwd never tracked as absolute)",
         );
-        // Still wait out MOTD then show a clean prompt.
-        end_reconnect_ui_mute(rt).await;
+        if restore_still_valid(rt, gen) {
+            end_reconnect_ui_mute(rt).await;
+        } else {
+            abort_stale_restore(rt, gen, "no path");
+        }
         return;
     };
 
@@ -432,7 +460,11 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
             "CWD",
             &format!("restore skipped: non-absolute path={path}"),
         );
-        end_reconnect_ui_mute(rt).await;
+        if restore_still_valid(rt, gen) {
+            end_reconnect_ui_mute(rt).await;
+        } else {
+            abort_stale_restore(rt, gen, "non-absolute");
+        }
         return;
     }
 
@@ -447,14 +479,18 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     // Banner is muted (ui_mute); we only wait so `cd` lands on a ready shell.
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
-    if !session_still_connected(rt) {
-        rt.cwd_freeze.store(false, Ordering::SeqCst);
-        rt.set_ui_mute(false);
+    if !restore_still_valid(rt, gen) {
+        abort_stale_restore(rt, gen, "after banner wait");
         return;
     }
 
     // Existence check via side-channel exec is fine (filesystem, not interactive cwd).
+    // This can take several seconds on a flaky network — re-check gen after.
     let dir_ok = query_dir_exists(rt, &path).await.unwrap_or(true);
+    if !restore_still_valid(rt, gen) {
+        abort_stale_restore(rt, gen, "after dir_exists");
+        return;
+    }
     if !dir_ok {
         warn!(path = %path, "restore target missing on remote; fall back to login home");
         rt.cwd_freeze.store(false, Ordering::SeqCst);
@@ -496,6 +532,10 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
 
     if !send_pty_bytes(rt, cmd.clone().into_bytes()).await {
         rt.cwd_freeze.store(false, Ordering::SeqCst);
+        if !restore_still_valid(rt, gen) {
+            abort_stale_restore(rt, gen, "send cd failed / disconnected");
+            return;
+        }
         set_state(
             app,
             rt,
@@ -508,17 +548,16 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
 
     // Allow the line discipline to run `cd`.
     tokio::time::sleep(Duration::from_millis(550)).await;
-    if !session_still_connected(rt) {
-        rt.cwd_freeze.store(false, Ordering::SeqCst);
-        rt.set_ui_mute(false);
+    if !restore_still_valid(rt, gen) {
+        abort_stale_restore(rt, gen, "after cd wait");
         return;
     }
 
     // Observe OSC 7 (if installed). Side-channel pwd cannot see interactive cwd.
     rt.cwd_freeze.store(false, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(800)).await;
-    if !session_still_connected(rt) {
-        rt.set_ui_mute(false);
+    if !restore_still_valid(rt, gen) {
+        abort_stale_restore(rt, gen, "after osc wait");
         return;
     }
 
@@ -543,6 +582,10 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
         rt.cwd_freeze.store(true, Ordering::SeqCst);
         if !send_pty_bytes(rt, cmd.into_bytes()).await {
             rt.cwd_freeze.store(false, Ordering::SeqCst);
+            if !restore_still_valid(rt, gen) {
+                abort_stale_restore(rt, gen, "retry cd failed / disconnected");
+                return;
+            }
             set_state(
                 app,
                 rt,
@@ -554,6 +597,10 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
         }
         tokio::time::sleep(Duration::from_millis(450)).await;
         rt.cwd_freeze.store(false, Ordering::SeqCst);
+        if !restore_still_valid(rt, gen) {
+            abort_stale_restore(rt, gen, "after retry wait");
+            return;
+        }
     }
 
     // Bookkeeping: prefer target path for next disconnect restore.
@@ -576,14 +623,30 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     end_reconnect_ui_mute(rt).await;
 }
 
+fn abort_stale_restore(rt: &SessionRuntime, gen: u64, where_: &str) {
+    rt.cwd_freeze.store(false, Ordering::SeqCst);
+    // Do not force ui_mute off if a newer reconnect already owns mute.
+    if rt.restore_gen_matches(gen) {
+        rt.set_ui_mute(false);
+    }
+    crate::ops_log::log(
+        "CWD",
+        &format!(
+            "restore playbook aborted (stale or disconnected) at={where_} gen={gen} live_gen={}",
+            rt.restore_gen.load(Ordering::SeqCst)
+        ),
+    );
+}
+
 /// Lift reconnect UI mute and request a fresh prompt (banner/MOTD stayed hidden).
 async fn end_reconnect_ui_mute(rt: &SessionRuntime) {
     // Allow any trailing muted banner/cd echo to settle before we re-enable the stream.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    rt.set_ui_mute(false);
     if !session_still_connected(rt) {
+        rt.set_ui_mute(false);
         return;
     }
+    rt.set_ui_mute(false);
     // Empty Enter → shell redraws prompt with restored cwd; no command runs.
     let _ = send_pty_bytes(rt, b"\r".to_vec()).await;
 }

@@ -120,6 +120,11 @@ pub struct SessionRuntime {
     /// Decrypted temp key reused by side-channel `ssh` (Tab complete / pwd).
     /// Avoids re-running icacls on every Tab (which flashed black consoles).
     pub side_channel_key: Mutex<Option<SecureKeyMaterial>>,
+    /// Bumped when the session drops so an in-flight restore playbook aborts
+    /// without painting a false "Connected" over a dead transport.
+    pub restore_gen: AtomicU64,
+    /// Rate-limit ECHO ops-log lines (huge `grep`/`tail` floods freezes UI).
+    pub echo_log_budget: AtomicU32,
 }
 
 /// Pending filter for silent control injects (currently `stty` resize).
@@ -150,6 +155,8 @@ impl SessionRuntime {
             remote_stty: Mutex::new(None),
             echo_suppress: Mutex::new(None),
             side_channel_key: Mutex::new(None),
+            restore_gen: AtomicU64::new(0),
+            echo_log_budget: AtomicU32::new(40),
         }
     }
 
@@ -160,6 +167,37 @@ impl SessionRuntime {
                 crate::ops_log::log("SSH", "side-channel key cache cleared");
             }
         }
+    }
+
+    /// Invalidate any restore playbook still sleeping / side-channel waiting.
+    pub fn bump_restore_gen(&self) -> u64 {
+        self.restore_gen.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// True if this restore generation is still current.
+    pub fn restore_gen_matches(&self, gen: u64) -> bool {
+        self.restore_gen.load(Ordering::SeqCst) == gen
+    }
+
+    /// Allow a few ECHO log lines then silence bulk output until refilled.
+    pub fn take_echo_log_slot(&self) -> bool {
+        loop {
+            let cur = self.echo_log_budget.load(Ordering::Relaxed);
+            if cur == 0 {
+                return false;
+            }
+            if self
+                .echo_log_budget
+                .compare_exchange_weak(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    pub fn refill_echo_log_budget(&self) {
+        self.echo_log_budget.store(40, Ordering::Relaxed);
     }
 
     pub fn set_ui_mute(&self, mute: bool) {
