@@ -34,6 +34,18 @@
             <div class="menu-dropdown" role="menu">
               <button type="button" data-action="toggle-mode" role="menuitem">切换输入模式 <span class="accel">Ctrl+Shift+M</span></button>
               <button type="button" data-action="clear-screen" role="menuitem">清屏（仅本地）</button>
+              <hr />
+              <button
+                type="button"
+                data-action="toggle-cmd-separator"
+                id="menu-cmd-separator"
+                role="menuitemcheckbox"
+                aria-checked="false"
+                title="启用后，Shell 草稿每条命令输出结束后追加一行绿色分割线（设置会记住）"
+              >
+                <span class="menu-check" aria-hidden="true"></span>
+                <span class="menu-label">命令后显示分割线</span>
+              </button>
               <button type="button" disabled title="后续版本" role="menuitem">字体大小</button>
             </div>
           </div>
@@ -68,6 +80,7 @@
           <span class="status-host" id="status-host" title="当前会话"></span>
           <span class="dot idle" id="status-dot"></span>
           <span id="status-text">未连接</span>
+          <span class="mode-badge" id="mode-badge" title="输入模式">Shell</span>
           <span class="cwd" id="cwd-text" title="远端工作目录"></span>
         </div>
       </header>

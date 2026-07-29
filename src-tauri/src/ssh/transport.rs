@@ -4,6 +4,7 @@
 //! can accept `data_bytes` successfully while the remote shell still never
 //! receives stdin (see production logs: write ok, no echo / no prompt change).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -88,10 +89,13 @@ pub async fn write_stdin(
 ///
 /// `session_id` is captured by stdout pumps / `finish_session` so multi-session
 /// can route events (client UUID, required).
+///
+/// `control_path`: ControlMaster socket path so Tab complete can multiplex.
 pub async fn connect_session(
     app: AppHandle,
     params: ConnectParams,
     session_id: String,
+    control_path: Option<PathBuf>,
 ) -> Result<ActiveTransport, AppError> {
     info!(
         host = %params.host,
@@ -101,7 +105,7 @@ pub async fn connect_session(
         "connect via OpenSSH"
     );
 
-    let os = openssh::connect_openssh(app, params, session_id).await?;
+    let os = openssh::connect_openssh(app, params, session_id, control_path).await?;
 
     Ok(ActiveTransport {
         cmd_tx: os.cmd_tx,

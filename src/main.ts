@@ -26,6 +26,8 @@ type SessionStateName =
   | "disconnected"
   | "failed";
 type InputMode = "shell" | "raw";
+/** vim-like editor sub-mode while alternate screen is active. */
+type EditorSubMode = "normal" | "insert" | "replace";
 type PropsMode =
   | "create"
   | "edit-profile"
@@ -135,6 +137,19 @@ function opsLog(
   invoke("ops_log", { category, message, detail: d }).catch(() => {});
 }
 
+/**
+ * Defer ops_log IPC so it never runs re-entrantly inside a Tauri event
+ * handler (e.g. `session://data` → invoke while emit is still on the stack).
+ * That pattern can deadlock the runtime during high-rate tail/grep floods.
+ */
+function opsLogDeferred(
+  category: string,
+  message: string,
+  detail?: Record<string, unknown> | string | null,
+) {
+  window.setTimeout(() => opsLog(category, message, detail), 0);
+}
+
 /** Per-session budget for large ui_receive ops-log lines (reset every 2s). */
 const uiEchoLogBudget = new Map<string, { n: number; resetAt: number }>();
 
@@ -158,6 +173,107 @@ function previewText(s: string, max = 160): string {
   return one.length > max ? one.slice(0, max) + "…" : one;
 }
 
+/** DEC private modes that switch the terminal to the alternate screen buffer. */
+const ALT_SCREEN_MODES = new Set([47, 1047, 1049]);
+
+/**
+ * CSI private-mode set/reset: ESC [ ? <nums> h/l
+ * (e.g. vim: ESC[?1049h enter, ESC[?1049l leave).
+ */
+const ALT_SCREEN_CSI_RE = /\x1b\[\?([0-9;]+)([hl])/g;
+
+/**
+ * Keep a short tail that might be an incomplete CSI private-mode sequence
+ * spanning chunks (ESC, ESC[, ESC[?, ESC[?1049, …).
+ */
+function altScreenResidualTail(buf: string): string {
+  const max = 48;
+  const start = Math.max(0, buf.length - max);
+  const slice = buf.slice(start);
+  const esc = slice.lastIndexOf("\x1b");
+  if (esc < 0) return "";
+  const frag = slice.slice(esc);
+  // Complete private-mode sequence → no residual needed for that match.
+  if (/^\x1b\[\?[0-9;]+[hl]/.test(frag)) {
+    const m = frag.match(/^\x1b\[\?[0-9;]+[hl]/);
+    return m ? altScreenResidualTail(frag.slice(m[0].length)) : "";
+  }
+  // Incomplete private-mode CSI we still care about.
+  if (/^\x1b(\[\??|\[[?][0-9;]*)?$/.test(frag)) return frag;
+  return "";
+}
+
+/**
+ * Scan a stream chunk for alt-screen private modes. Walks all complete CSIs so
+ * enter+exit in one chunk nets correctly; incomplete CSI is kept in residual.
+ */
+function scanAltScreenChunk(
+  residual: string,
+  chunk: string,
+  currentlyActive: boolean,
+): {
+  residual: string;
+  nextActive: boolean;
+  lastSeq: string | null;
+  lastModes: number[];
+} {
+  const data = residual + chunk;
+  ALT_SCREEN_CSI_RE.lastIndex = 0;
+  let nextActive = currentlyActive;
+  let lastSeq: string | null = null;
+  let lastModes: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = ALT_SCREEN_CSI_RE.exec(data)) !== null) {
+    const modes = m[1]
+      .split(";")
+      .map((x) => Number(x))
+      .filter((n) => Number.isFinite(n));
+    if (!modes.some((n) => ALT_SCREEN_MODES.has(n))) continue;
+    const set = m[2] === "h";
+    nextActive = set;
+    lastSeq = m[0];
+    lastModes = modes.filter((n) => ALT_SCREEN_MODES.has(n));
+  }
+  return {
+    residual: altScreenResidualTail(data),
+    nextActive,
+    lastSeq,
+    lastModes,
+  };
+}
+
+/**
+ * Detect vim/neovim status-line editor mode from remote stream.
+ * Order matters: REPLACE before INSERT.
+ * Returns null if this chunk does not indicate a mode change.
+ */
+function scanEditorSubMode(text: string): EditorSubMode | null {
+  // Replace / 替换 (Ins while already inserting, or R)
+  if (
+    /--\s*REPLACE\s*--/i.test(text) ||
+    /REPLACE\s*--/.test(text) ||
+    /--\s*替换\s*-*/.test(text) ||
+    /\[1mREPLACE/i.test(text)
+  ) {
+    return "replace";
+  }
+  // Insert / 插入 (Ins, i, a, o, …)
+  if (
+    /--\s*INSERT\s*--/i.test(text) ||
+    /INSERT\s*--/.test(text) ||
+    /--\s*插入\s*-*/.test(text) ||
+    /\[1m--\s*INSERT/i.test(text) ||
+    /\[1mINSERT/i.test(text)
+  ) {
+    return "insert";
+  }
+  // Visual is not "editing text", treat as normal for our tip purposes.
+  if (/--\s*VISUAL/i.test(text) || /--\s*可视/.test(text)) {
+    return "normal";
+  }
+  return null;
+}
+
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
   const chunk = 0x8000;
@@ -165,6 +281,62 @@ function bytesToBase64(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
   }
   return btoa(binary);
+}
+
+// ---------------------------------------------------------------------------
+// App UI settings (localStorage — survives restart)
+// ---------------------------------------------------------------------------
+
+const SETTINGS_STORE_KEY = "anchorterm.settings.v1";
+
+interface AppUiSettings {
+  /** After each Shell draft command finishes, print a green separator line. */
+  cmdSeparator: boolean;
+}
+
+const DEFAULT_SETTINGS: AppUiSettings = {
+  cmdSeparator: false,
+};
+
+function loadAppSettings(): AppUiSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORE_KEY);
+    if (!raw) return { ...DEFAULT_SETTINGS };
+    const parsed = JSON.parse(raw) as Partial<AppUiSettings>;
+    return {
+      cmdSeparator: Boolean(parsed?.cmdSeparator),
+    };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+function saveAppSettings(s: AppUiSettings) {
+  try {
+    localStorage.setItem(SETTINGS_STORE_KEY, JSON.stringify(s));
+  } catch (e) {
+    opsLog("ERR", "settings_persist_failed", { error: String(e) });
+  }
+}
+
+let appSettings: AppUiSettings = loadAppSettings();
+
+function isCmdSeparatorEnabled(): boolean {
+  return appSettings.cmdSeparator;
+}
+
+function setCmdSeparatorEnabled(on: boolean) {
+  appSettings = { ...appSettings, cmdSeparator: on };
+  saveAppSettings(appSettings);
+  syncCmdSeparatorMenu();
+  opsLog("UI", "cmd_separator_toggle", { enabled: on });
+}
+
+function syncCmdSeparatorMenu() {
+  const btn = document.getElementById("menu-cmd-separator");
+  if (!btn) return;
+  const on = isCmdSeparatorEnabled();
+  btn.setAttribute("aria-checked", on ? "true" : "false");
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +449,13 @@ function isControlKeyPayload(data: string): boolean {
   return false;
 }
 
-function showToast(msg: string, ms = 2800) {
+let toastHideTimer: number | null = null;
+
+function showToast(
+  msg: string,
+  ms = 2800,
+  opts?: { tone?: "info" | "warn" | "ok"; position?: "top" | "bottom" },
+) {
   let el = document.getElementById("app-toast");
   if (!el) {
     el = document.createElement("div");
@@ -285,9 +463,16 @@ function showToast(msg: string, ms = 2800) {
     el.className = "toast hidden";
     document.body.appendChild(el);
   }
+  const tone = opts?.tone ?? "info";
+  const position = opts?.position ?? (tone === "warn" ? "top" : "bottom");
+  el.className = `toast toast-${tone} toast-${position}`;
   el.textContent = msg;
   el.classList.remove("hidden");
-  window.setTimeout(() => el?.classList.add("hidden"), ms);
+  if (toastHideTimer != null) window.clearTimeout(toastHideTimer);
+  toastHideTimer = window.setTimeout(() => {
+    el?.classList.add("hidden");
+    toastHideTimer = null;
+  }, ms);
 }
 
 /**
@@ -611,6 +796,22 @@ class SessionView {
   completeUi: CompleteUiState | null = null;
 
   /**
+   * True while the remote TUI holds the alternate screen (vim/htop/less…).
+   * Detected from DEC private modes 47 / 1047 / 1049 in the PTY stream.
+   * When set, Shell-mode draft send is blocked so commands don't inject into TUI.
+   */
+  altScreenActive = false;
+  /** Incomplete CSI tail across `session://data` chunks. */
+  private altScreenResidual = "";
+  /** Sequence that last toggled alt-screen (for logs / status title). */
+  altScreenLastSeq: string | null = null;
+  /**
+   * vim 等编辑器子模式（仅备用屏有效）。
+   * 由远端状态行（-- INSERT -- / REPLACE）或本地 Esc / Ins 推断。
+   */
+  editorSubMode: EditorSubMode = "normal";
+
+  /**
    * Shell draft history for this tab's current host+user.
    * Backed by localStorage so close-tab / re-open same endpoint keeps history.
    * Oldest → newest. Browsing with ↑/↓ when complete popup is closed.
@@ -621,8 +822,23 @@ class SessionView {
   /** Snapshot of the in-progress draft when the user first presses ↑. */
   private histLiveDraft = "";
 
+  /**
+   * UI-side diagnostics after a post-separator submit (correlates with backend SEP).
+   * Reset on each separator-enabled submit; logs cumulative ui_receive stats.
+   */
+  private sepUi: {
+    active: boolean;
+    startedAt: number;
+    chunks: number;
+    bytes: number;
+    lastAt: number;
+    lastLogAt: number;
+  } | null = null;
+
   rootEl: HTMLElement;
   termHost: HTMLElement;
+  draftWrap: HTMLElement;
+  tuiBanner: HTMLElement;
   draftInput: HTMLInputElement;
   btnSend: HTMLButtonElement;
   btnMode: HTMLButtonElement;
@@ -632,6 +848,8 @@ class SessionView {
   errorEl: HTMLElement;
 
   private disposed = false;
+  /** Dispose handle for xterm buffer-change listener. */
+  private bufferChangeDisposable: { dispose(): void } | null = null;
 
   constructor(opts: {
     sessionId: string;
@@ -658,8 +876,13 @@ class SessionView {
     this.errorEl.className = "error session-error";
     this.errorEl.hidden = true;
 
-    const draftWrap = document.createElement("div");
-    draftWrap.className = "draft-wrap";
+    this.draftWrap = document.createElement("div");
+    this.draftWrap.className = "draft-wrap";
+
+    this.tuiBanner = document.createElement("div");
+    this.tuiBanner.className = "tui-banner hidden";
+    this.tuiBanner.setAttribute("role", "status");
+    this.tuiBanner.setAttribute("aria-live", "polite");
 
     this.completePopup = document.createElement("ul");
     this.completePopup.className = "complete-popup hidden";
@@ -717,6 +940,11 @@ class SessionView {
       "<li>不使用草稿的补全与本地历史（由远端程序自己处理）</li>",
       "<li>交互式全屏程序请用此模式</li>",
       "</ul>",
+      "<p><b>全屏程序锁定</b></p>",
+      "<ul>",
+      "<li>检测到备用屏（vim 等）时，Shell 草稿发送会自动锁定</li>",
+      "<li>请切换到 TUI 直通操作；vim 用 <code>Esc</code> 后 <code>:q!</code> 退出</li>",
+      "</ul>",
       "<p class=\"mode-help-tip-foot\">点击「Shell 模式 / TUI 直通」按钮可切换。</p>",
     ].join("");
     modeControls.append(this.btnMode, modeHelp, modeTip);
@@ -731,7 +959,7 @@ class SessionView {
     });
 
     draftBar.append(label, this.draftInput, this.btnSend, modeControls);
-    draftWrap.append(this.completePopup, draftBar);
+    this.draftWrap.append(this.tuiBanner, this.completePopup, draftBar);
 
     this.overlay = document.createElement("div");
     this.overlay.className = "overlay hidden";
@@ -744,13 +972,21 @@ class SessionView {
     card.append(spin, this.overlayText);
     this.overlay.append(card);
 
-    this.rootEl.append(this.termHost, this.errorEl, draftWrap, this.overlay);
+    this.rootEl.append(
+      this.termHost,
+      this.errorEl,
+      this.draftWrap,
+      this.overlay,
+    );
 
     this.term = new Terminal({
       cursorBlink: true,
       fontSize: 14,
       fontFamily: 'Consolas, "Cascadia Mono", "Courier New", monospace',
       convertEol: true,
+      // Cap scrollback so multi-MB tail/grep dumps do not balloon WebView memory
+      // and freeze the UI thread while painting.
+      scrollback: 5000,
       theme: {
         background: "#0a0e14",
         foreground: "#e7ecf3",
@@ -763,6 +999,17 @@ class SessionView {
     this.term.loadAddon(this.fitAddon);
     this.term.open(this.termHost);
     this.term.options.disableStdin = true;
+
+    // Secondary detection: trust xterm's own alternate/normal buffer switch.
+    this.bufferChangeDisposable = this.term.buffer.onBufferChange((buf) => {
+      const onAlt = buf.type === "alternate";
+      if (onAlt !== this.altScreenActive) {
+        this.setAltScreenActive(onAlt, "xterm_buffer_change", {
+          seq: onAlt ? "buffer:alternate" : "buffer:normal",
+          modes: onAlt ? [1049] : [],
+        });
+      }
+    });
 
     this.wireTerminal();
     this.wireDraft();
@@ -822,28 +1069,299 @@ class SessionView {
 
   applyInputMode() {
     if (this.inputMode === "shell") {
-      this.btnMode.textContent = "Shell 模式";
+      this.btnMode.textContent = this.altScreenActive
+        ? "Shell · 已锁定"
+        : "Shell 模式";
       this.btnMode.classList.remove("raw");
-      this.btnMode.title = "当前：Shell 模式 · 点击切换为 TUI 直通";
+      this.btnMode.title = this.altScreenActive
+        ? "当前：Shell 模式 · 全屏程序运行中，发送已锁定 · 点击切换 TUI 直通"
+        : "当前：Shell 模式 · 点击切换为 TUI 直通";
       this.termHost.classList.add("shell-mode");
       this.term.options.disableStdin = true;
     } else {
-      this.btnMode.textContent = "TUI 直通";
+      this.btnMode.textContent = this.altScreenActive
+        ? "TUI · 全屏中"
+        : "TUI 直通";
       this.btnMode.classList.add("raw");
-      this.btnMode.title = "当前：TUI 直通 · 点击切换为 Shell 模式";
+      this.btnMode.title = this.altScreenActive
+        ? "当前：TUI 直通 · 全屏程序运行中，按键直达远端 · 点击可切回 Shell（发送仍锁定）"
+        : "当前：TUI 直通 · 点击切换为 Shell 模式";
       this.termHost.classList.remove("shell-mode");
       this.term.options.disableStdin = false;
       if (this.isLive()) this.term.focus();
     }
+    this.updateShellLockUi();
   }
 
   toggleInputMode() {
+    const prev = this.inputMode;
     this.inputMode = this.inputMode === "shell" ? "raw" : "shell";
     opsLog("UI", `input_mode_toggle mode=${this.inputMode}`, {
       sid: this.sessionId.slice(0, 8),
+      from: prev,
+      alt_screen: this.altScreenActive,
+      alt_seq: this.altScreenLastSeq,
     });
     this.applyInputMode();
-    if (this.inputMode === "shell") this.draftInput.focus();
+    if (this.inputMode === "shell") {
+      this.draftInput.focus();
+      showToast(
+        this.altScreenActive
+          ? "已切回 Shell 模式 · 全屏程序仍在运行，草稿发送保持锁定"
+          : "已切换到 Shell 模式 · 在底部草稿框输入命令",
+        2800,
+        { tone: this.altScreenActive ? "warn" : "info" },
+      );
+    } else {
+      if (this.isLive()) this.term.focus();
+      showToast(
+        this.altScreenActive
+          ? "已切换到 TUI 直通 · 全屏程序中，按键直达远端（vim: Esc 后 :q! 退出）"
+          : "已切换到 TUI 直通 · 按键直接发给远端（适合 vim / htop）",
+        3200,
+        { tone: this.altScreenActive ? "warn" : "ok", position: "bottom" },
+      );
+    }
+  }
+
+  /**
+   * Sync draft bar / banner / send button when live, alt-screen, or editor mode changes.
+   */
+  updateShellLockUi() {
+    const locked = this.altScreenActive;
+    const live = this.isLive();
+    const edit = this.editorSubMode;
+    this.btnSend.disabled = !live || locked;
+    this.btnSend.title = locked
+      ? "全屏程序运行中，Shell 发送已锁定。请切换到 TUI 直通操作。"
+      : live
+        ? "发送草稿命令到远端 shell"
+        : "未连接，无法发送";
+    this.btnSend.textContent = locked ? "已锁定" : "发送";
+
+    this.draftWrap.classList.toggle("alt-screen-lock", locked);
+    this.draftWrap.classList.toggle(
+      "editor-insert",
+      locked && (edit === "insert" || edit === "replace"),
+    );
+    this.btnMode.classList.toggle(
+      "need-raw",
+      locked && this.inputMode === "shell",
+    );
+
+    if (locked) {
+      this.draftInput.placeholder =
+        edit === "insert" || edit === "replace"
+          ? "编辑中 · Shell 发送已锁定 · Esc 回普通模式 · :q! 退出"
+          : "全屏程序运行中 · Shell 发送已锁定 · 请切换「TUI 直通」操作";
+      this.tuiBanner.classList.remove("hidden");
+      if (edit === "insert") {
+        this.tuiBanner.innerHTML =
+          "<b>编辑模式 INSERT</b> · 可直接输入文字 · " +
+          "按 <code>Esc</code> 回普通模式 · 再 <code>:wq</code> / <code>:q!</code> 退出（勿用 Ctrl+C）";
+      } else if (edit === "replace") {
+        this.tuiBanner.innerHTML =
+          "<b>替换模式 REPLACE</b> · 输入将覆盖原字符 · " +
+          "再按 <code>Ins</code> 可回插入 · <code>Esc</code> 回普通模式";
+      } else if (this.inputMode === "raw") {
+        this.tuiBanner.innerHTML =
+          "全屏程序运行中 · 当前 <b>TUI 直通</b>（普通模式）· " +
+          "按 <code>Ins</code> / <code>i</code> 进入编辑 · " +
+          "<code>Esc</code> 后 <code>:q!</code> / <code>:wq</code> 退出";
+      } else {
+        this.tuiBanner.innerHTML =
+          "全屏程序运行中 · <b>Shell 发送已锁定</b> · " +
+          "请切换到 <b>TUI 直通</b> 后按 <code>Ins</code>/<code>i</code> 编辑";
+      }
+    } else {
+      this.draftInput.placeholder =
+        "命令在此输入 · ↑↓ 历史 · Tab 补全 · Enter 发送（断线保留）";
+      this.tuiBanner.classList.add("hidden");
+      this.tuiBanner.textContent = "";
+    }
+
+    if (activeSessionId === this.sessionId) {
+      syncGlobalStatusBar();
+    }
+  }
+
+  /**
+   * Update vim insert/replace/normal tip (bottom banner + status badge).
+   */
+  setEditorSubMode(mode: EditorSubMode, reason: string) {
+    if (!this.altScreenActive && mode !== "normal") {
+      // Ignore insert markers that arrive after alt-screen already closed.
+      return;
+    }
+    if (this.editorSubMode === mode) return;
+    const prev = this.editorSubMode;
+    this.editorSubMode = mode;
+    opsLog("STATE", "editor_submode", {
+      sid: this.sessionId.slice(0, 8),
+      from: prev,
+      to: mode,
+      reason,
+      input_mode: this.inputMode,
+      alt_screen: this.altScreenActive,
+    });
+    this.updateShellLockUi();
+    // Light toast only when entering edit modes (bottom); no top strip.
+    if (mode === "insert") {
+      showToast("已进入编辑模式 INSERT · 按 Esc 回到普通模式", 2800, {
+        tone: "ok",
+        position: "bottom",
+      });
+    } else if (mode === "replace") {
+      showToast("已进入替换模式 REPLACE · 再按 Ins 或 Esc 可退出", 2800, {
+        tone: "warn",
+        position: "bottom",
+      });
+    }
+  }
+
+  /** Observe local keys that affect vim editor mode (Ins / Esc). */
+  private noteLocalEditorKey(data: string) {
+    if (!this.altScreenActive) return;
+    // Insert key (xterm: CSI 2 ~)
+    if (data === "\x1b[2~") {
+      opsLog("UI", "editor_key_ins", {
+        sid: this.sessionId.slice(0, 8),
+        current: this.editorSubMode,
+      });
+      // Optimistic: Ins from normal → insert; from insert → replace; from replace → insert.
+      // Stream status line will correct if wrong.
+      if (this.editorSubMode === "normal") {
+        this.setEditorSubMode("insert", "local_ins");
+      } else if (this.editorSubMode === "insert") {
+        this.setEditorSubMode("replace", "local_ins_toggle");
+      } else {
+        this.setEditorSubMode("insert", "local_ins_toggle");
+      }
+      return;
+    }
+    // Bare Esc → normal mode (common leave-insert path)
+    if (data === "\x1b") {
+      if (this.editorSubMode !== "normal") {
+        this.setEditorSubMode("normal", "local_esc");
+      }
+    }
+  }
+
+  /** Parse remote status line for -- INSERT -- / REPLACE. */
+  private feedEditorModeProbe(text: string) {
+    if (!this.altScreenActive) return;
+    const mode = scanEditorSubMode(text);
+    if (mode) {
+      this.setEditorSubMode(mode, "stream_status");
+    }
+  }
+
+  /**
+   * Enter/leave alternate screen from DEC private modes in the remote stream.
+   * @param active target state
+   * @param reason log-friendly cause
+   * @param detail optional CSI / mode numbers
+   */
+  setAltScreenActive(
+    active: boolean,
+    reason: string,
+    detail?: { seq?: string | null; modes?: number[] },
+  ) {
+    if (this.altScreenActive === active) return;
+    this.altScreenActive = active;
+    if (detail?.seq) this.altScreenLastSeq = detail.seq;
+    if (!active) {
+      this.editorSubMode = "normal";
+      if (reason === "session_state_reset") {
+        this.altScreenLastSeq = null;
+      }
+    }
+
+    opsLog("STATE", active ? "alt_screen_enter" : "alt_screen_exit", {
+      sid: this.sessionId.slice(0, 8),
+      reason,
+      seq: detail?.seq ?? this.altScreenLastSeq,
+      modes: detail?.modes ?? null,
+      input_mode: this.inputMode,
+      live: this.isLive(),
+      draft_len: this.draft.text.length,
+      pending_draft: this.pendingDraft != null,
+      editor_submode: this.editorSubMode,
+    });
+
+    // Refresh mode titles + lock banner / send button / status badge.
+    this.applyInputMode();
+
+    if (active) {
+      if (this.inputMode === "shell") {
+        showToast(
+          "检测到全屏程序：Shell 发送已锁定，请切换到「TUI 直通」",
+          4000,
+          { tone: "warn", position: "bottom" },
+        );
+      } else {
+        showToast(
+          "全屏程序运行中 · 按 Ins 或 i 进入编辑 · Esc 后 :q! 退出",
+          3600,
+          { tone: "warn", position: "bottom" },
+        );
+      }
+      opsLog("UI", "alt_screen_ui_shown", {
+        sid: this.sessionId.slice(0, 8),
+        input_mode: this.inputMode,
+        reason,
+        seq: this.altScreenLastSeq,
+      });
+    } else if (reason !== "session_state_reset") {
+      showToast("全屏程序已退出，Shell 草稿发送已恢复", 2400, {
+        tone: "ok",
+        position: "bottom",
+      });
+      opsLog("UI", "alt_screen_ui_cleared", {
+        sid: this.sessionId.slice(0, 8),
+        reason,
+      });
+      // If a reconnect-held draft was blocked while still on alt-screen, send now.
+      if (this.isLive() && this.pendingDraft !== null) {
+        const line = this.pendingDraft;
+        this.pendingDraft = null;
+        opsLog("CMD", "pending_draft_flush_after_alt_exit", {
+          line: previewText(line),
+          sid: this.sessionId.slice(0, 8),
+        });
+        void this.flushPendingLine(line);
+      }
+    }
+  }
+
+  /** Clear alt-screen lock on disconnect/reconnect (exit CSI may be muted). */
+  resetAltScreenTracking(reason: string) {
+    this.altScreenResidual = "";
+    this.editorSubMode = "normal";
+    if (this.altScreenActive) {
+      this.setAltScreenActive(false, reason);
+    } else {
+      this.altScreenLastSeq = null;
+    }
+  }
+
+  /** Parse remote stream for alt-screen private modes (chunk-safe). */
+  private feedAltScreenProbe(text: string) {
+    const scanned = scanAltScreenChunk(
+      this.altScreenResidual,
+      text,
+      this.altScreenActive,
+    );
+    this.altScreenResidual = scanned.residual;
+    if (scanned.nextActive !== this.altScreenActive) {
+      this.setAltScreenActive(scanned.nextActive, "csi_private_mode", {
+        seq: scanned.lastSeq,
+        modes: scanned.lastModes,
+      });
+    } else if (scanned.lastSeq && scanned.nextActive) {
+      // Still on alt-screen but saw another related CSI (refresh last seq for logs).
+      this.altScreenLastSeq = scanned.lastSeq;
+    }
   }
 
   clearScreenLocal() {
@@ -904,12 +1422,31 @@ class SessionView {
       this.overlay.classList.remove("reconnecting");
     }
 
-    this.btnSend.disabled = !this.isLive();
+    // Disconnect / reconnect starts a new shell; exit CSI is often muted, so
+    // clear alt-screen lock proactively.
+    if (
+      state === "connecting" ||
+      state === "reconnecting" ||
+      state === "disconnected" ||
+      state === "failed" ||
+      state === "idle"
+    ) {
+      this.resetAltScreenTracking("session_state_reset");
+    }
+
+    this.updateShellLockUi();
 
     if (this.isLive() && this.pendingDraft !== null) {
-      const line = this.pendingDraft;
-      this.pendingDraft = null;
-      void this.flushPendingLine(line);
+      if (this.altScreenActive) {
+        opsLog("CMD", "pending_draft_held_alt_screen", {
+          line: previewText(this.pendingDraft),
+          sid: this.sessionId.slice(0, 8),
+        });
+      } else {
+        const line = this.pendingDraft;
+        this.pendingDraft = null;
+        void this.flushPendingLine(line);
+      }
     }
 
     if (state === "connected") {
@@ -923,11 +1460,64 @@ class SessionView {
     }
   }
 
+  /** Pending terminal text coalesced across rAF (avoids main-thread storms). */
+  private termWriteBuf = "";
+  private termWriteScheduled = false;
+
   writeToTerm(data: string | Uint8Array) {
-    if (typeof data === "string") {
-      this.term.write(data);
+    const text =
+      typeof data === "string"
+        ? data
+        : new TextDecoder("utf-8", { fatal: false }).decode(data);
+    this.feedAltScreenProbe(text);
+    this.feedEditorModeProbe(text);
+    // Coalesce into one xterm write per animation frame so a tail flood
+    // cannot re-enter hundreds of term.write calls on the same turn.
+    this.termWriteBuf += text;
+    if (this.termWriteBuf.length > 256 * 1024) {
+      // Hard flush if backlog is huge (avoid multi-MB string hold).
+      this.flushTermWriteBuf();
+      return;
+    }
+    if (!this.termWriteScheduled) {
+      this.termWriteScheduled = true;
+      requestAnimationFrame(() => {
+        this.termWriteScheduled = false;
+        this.flushTermWriteBuf();
+      });
+    }
+  }
+
+  private flushTermWriteBuf() {
+    if (!this.termWriteBuf) return;
+    // Chunk large dumps across frames so a single 100KB+ write cannot freeze
+    // the UI thread for hundreds of ms.
+    const CHUNK = 24 * 1024;
+    let text: string;
+    if (this.termWriteBuf.length <= CHUNK) {
+      text = this.termWriteBuf;
+      this.termWriteBuf = "";
     } else {
-      this.term.write(new TextDecoder("utf-8", { fatal: false }).decode(data));
+      text = this.termWriteBuf.slice(0, CHUNK);
+      this.termWriteBuf = this.termWriteBuf.slice(CHUNK);
+    }
+    const t0 = performance.now();
+    this.term.write(text);
+    const writeMs = performance.now() - t0;
+    if (writeMs >= 40) {
+      opsLogDeferred("SSH", "ui_term_write_slow", {
+        sid: this.sessionId.slice(0, 8),
+        len: text.length,
+        write_ms: Math.round(writeMs),
+        remain: this.termWriteBuf.length,
+      });
+    }
+    if (this.termWriteBuf.length > 0) {
+      this.termWriteScheduled = true;
+      requestAnimationFrame(() => {
+        this.termWriteScheduled = false;
+        this.flushTermWriteBuf();
+      });
     }
   }
 
@@ -938,6 +1528,8 @@ class SessionView {
         return;
       }
       if (!this.isLive()) return;
+      // Track Ins / Esc for editor-mode tip while full-screen TUI is open.
+      this.noteLocalEditorKey(data);
       const bytes = new TextEncoder().encode(data);
       invoke("write_bytes", {
         sessionId: this.sessionId,
@@ -1280,10 +1872,28 @@ class SessionView {
       line: previewText(line),
       live: this.isLive(),
       mode: this.inputMode,
+      alt_screen: this.altScreenActive,
+      alt_seq: this.altScreenLastSeq,
       sid: this.sessionId.slice(0, 8),
     });
     if (!line.trim()) {
       this.setError("草稿为空，请输入命令后再发送");
+      return;
+    }
+    if (this.altScreenActive) {
+      opsLog("CMD", "draft_send_blocked_alt_screen", {
+        line: previewText(line),
+        mode: this.inputMode,
+        seq: this.altScreenLastSeq,
+        sid: this.sessionId.slice(0, 8),
+      });
+      this.setError(
+        "全屏程序运行中，Shell 发送已锁定。请切换到「TUI 直通」操作；退出程序（如 vim 的 Esc → :q!）后自动解锁。",
+      );
+      showToast("已拦截发送：当前处于全屏 TUI，请切换到 TUI 直通", 3200);
+      if (this.inputMode === "shell") {
+        this.btnMode.classList.add("need-raw");
+      }
       return;
     }
     if (!this.isLive()) {
@@ -1299,27 +1909,74 @@ class SessionView {
   private async flushPendingLine(line: string) {
     const logical = line.replace(/[\r\n]+$/g, "");
     if (!logical.trim()) return;
+    if (this.altScreenActive) {
+      opsLog("CMD", "flush_blocked_alt_screen", {
+        line: previewText(logical),
+        mode: this.inputMode,
+        seq: this.altScreenLastSeq,
+        sid: this.sessionId.slice(0, 8),
+      });
+      this.setError(
+        "全屏程序运行中，已阻止草稿发送，避免写入 vim 等程序。请切换 TUI 直通。",
+      );
+      return;
+    }
+    const postSeparator = isCmdSeparatorEnabled();
     opsLog("CMD", "ui_submit_line", {
       line: previewText(logical),
       sid: this.sessionId.slice(0, 8),
+      alt_screen: false,
+      post_separator: postSeparator,
     });
+    if (postSeparator) {
+      const now = Date.now();
+      this.sepUi = {
+        active: true,
+        startedAt: now,
+        chunks: 0,
+        bytes: 0,
+        lastAt: now,
+        lastLogAt: now,
+      };
+      opsLog("SEP", "ui_sep_begin", {
+        sid: this.sessionId.slice(0, 8),
+        line: previewText(logical, 120),
+      });
+    } else {
+      this.sepUi = null;
+    }
     // Record history before clear so ↑ works even if IPC fails later.
+    // History stores the original command only (no separator suffix).
     this.pushHistory(logical);
     this.draft.text = "";
     this.draft.cursor = 0;
     this.restoreDraftToInput();
     this.setError(null);
     try {
+      const t0 = performance.now();
       await invoke("submit_line", {
         sessionId: this.sessionId,
         line: logical,
+        postSeparator,
       });
-      opsLog("CMD", "ui_submit_line_ok", { line: previewText(logical) });
+      const invokeMs = Math.round(performance.now() - t0);
+      opsLog("CMD", "ui_submit_line_ok", {
+        line: previewText(logical),
+        post_separator: postSeparator,
+        invoke_ms: invokeMs,
+      });
+      if (postSeparator) {
+        opsLog("SEP", "ui_submit_invoke_ok", {
+          sid: this.sessionId.slice(0, 8),
+          invoke_ms: invokeMs,
+        });
+      }
       this.draftInput.focus();
     } catch (e) {
       this.draft.text = logical;
       this.draft.cursor = logical.length;
       this.restoreDraftToInput();
+      this.sepUi = null;
       opsLog("ERR", "ui_submit_line_failed", {
         line: previewText(logical),
         error: String(e),
@@ -1328,9 +1985,39 @@ class SessionView {
     }
   }
 
+  /** Track UI-side receive stats after a post-separator submit. */
+  noteSepUiData(len: number) {
+    const s = this.sepUi;
+    if (!s?.active) return;
+    const now = Date.now();
+    s.chunks += 1;
+    s.bytes += len;
+    s.lastAt = now;
+    // First 5 chunks, then every 500ms, always log slow gaps.
+    const gap = now - s.lastLogAt;
+    if (s.chunks <= 5 || gap >= 500) {
+      s.lastLogAt = now;
+      // Deferred: called from session://data handler (must not re-enter IPC).
+      opsLogDeferred("SEP", "ui_receive_progress", {
+        sid: this.sessionId.slice(0, 8),
+        chunk_len: len,
+        chunks: s.chunks,
+        bytes: s.bytes,
+        elapsed_ms: now - s.startedAt,
+        since_last_log_ms: gap,
+      });
+    }
+  }
+
   async dispose() {
     if (this.disposed) return;
     this.disposed = true;
+    try {
+      this.bufferChangeDisposable?.dispose();
+    } catch {
+      /* ignore */
+    }
+    this.bufferChangeDisposable = null;
     try {
       await invoke("close_session", { sessionId: this.sessionId });
     } catch (e) {
@@ -1415,11 +2102,18 @@ function syncGlobalStatusBar() {
   const text = $("status-text");
   const cwdEl = $("cwd-text");
   const hostEl = $("status-host");
+  const modeBadge = $("mode-badge");
   if (!view) {
     dot.className = "dot idle";
     text.textContent = "未连接";
+    text.className = "";
     cwdEl.textContent = "";
     hostEl.textContent = "";
+    if (modeBadge) {
+      modeBadge.textContent = "—";
+      modeBadge.className = "mode-badge";
+      modeBadge.title = "无会话";
+    }
     return;
   }
   const labels: Record<SessionStateName, string> = {
@@ -1430,8 +2124,67 @@ function syncGlobalStatusBar() {
     disconnected: "已断开",
     failed: "失败",
   };
-  dot.className = `dot ${view.state}`;
-  text.textContent = view.message || labels[view.state] || view.state;
+
+  // Connection status text + editor/fullscreen tips.
+  let status = view.message || labels[view.state] || view.state;
+  text.className = "";
+  if (view.altScreenActive && view.state === "connected") {
+    if (view.editorSubMode === "insert") {
+      status = "编辑模式 INSERT · Esc 回普通模式";
+      text.className = "status-text-warn";
+    } else if (view.editorSubMode === "replace") {
+      status = "替换模式 REPLACE · Esc / Ins 可退出";
+      text.className = "status-text-warn";
+    } else {
+      status =
+        view.inputMode === "raw"
+          ? "全屏 TUI · 普通模式 · Ins/i 进入编辑"
+          : "全屏 TUI · Shell 发送已锁定";
+      text.className = "status-text-warn";
+    }
+    dot.className = "dot alt-screen";
+  } else if (view.state === "connected" && view.inputMode === "raw") {
+    status = view.message
+      ? `${view.message} · TUI 直通`
+      : "已连接 · TUI 直通";
+    dot.className = `dot ${view.state}`;
+  } else {
+    dot.className = `dot ${view.state}`;
+  }
+  text.textContent = status;
+  text.title = view.altScreenActive
+    ? `备用屏 · 编辑子模式=${view.editorSubMode}${view.altScreenLastSeq ? ` · ${previewText(view.altScreenLastSeq, 40)}` : ""}`
+    : view.message || labels[view.state] || "";
+
+  // Mode badge: Shell / TUI / 全屏 / 插入 / 替换
+  if (modeBadge) {
+    if (view.altScreenActive && view.editorSubMode === "insert") {
+      modeBadge.textContent = "INSERT";
+      modeBadge.className = "mode-badge mode-badge-insert";
+      modeBadge.title = "vim 编辑模式（INSERT）· 按 Esc 回普通模式";
+    } else if (view.altScreenActive && view.editorSubMode === "replace") {
+      modeBadge.textContent = "REPLACE";
+      modeBadge.className = "mode-badge mode-badge-replace";
+      modeBadge.title = "vim 替换模式（REPLACE）";
+    } else if (view.altScreenActive) {
+      modeBadge.textContent =
+        view.inputMode === "raw" ? "TUI·全屏" : "Shell·锁定";
+      modeBadge.className = "mode-badge mode-badge-alt";
+      modeBadge.title =
+        view.inputMode === "raw"
+          ? "TUI 直通 · 全屏程序 · 普通模式（可按 Ins/i 编辑）"
+          : "Shell · 全屏程序中，草稿发送已锁定";
+    } else if (view.inputMode === "raw") {
+      modeBadge.textContent = "TUI 直通";
+      modeBadge.className = "mode-badge mode-badge-raw";
+      modeBadge.title = "输入模式：TUI 直通 · 按键直达远端";
+    } else {
+      modeBadge.textContent = "Shell";
+      modeBadge.className = "mode-badge mode-badge-shell";
+      modeBadge.title = "输入模式：Shell · 底部草稿发送命令";
+    }
+  }
+
   hostEl.textContent = `${view.title} · ${view.username}@${view.host}`;
   if (view.cwd) {
     cwdEl.textContent = view.cwd;
@@ -2073,6 +2826,14 @@ async function handleMenuAction(action: string) {
       // Local only — never send remote clear
       active?.clearScreenLocal();
       break;
+    case "toggle-cmd-separator":
+      setCmdSeparatorEnabled(!isCmdSeparatorEnabled());
+      showToast(
+        isCmdSeparatorEnabled()
+          ? "已启用：命令后显示绿色分割线"
+          : "已关闭：命令后分割线",
+      );
+      break;
     case "disconnect":
       await disconnectActive();
       break;
@@ -2285,13 +3046,16 @@ async function setupEvents() {
       const b64 = p.data_b64 || p.dataB64 || "";
       if (!b64) return;
       const bytes = base64ToBytes(b64);
-      // Throttle ECHO IPC logging: multi-MB grep freezes UI if every 8KB chunk
-      // round-trips to the backend ops log.
-      if (bytes.length <= 512 || shouldLogUiEcho(sid)) {
+      // Post-separator UI diagnostics (independent of ECHO throttle).
+      view.noteSepUiData(bytes.length);
+      // Never invoke ops_log synchronously from this handler — re-entrant IPC
+      // during emit can deadlock the runtime under tail/grep floods.
+      // Small chunks only, deferred + budgeted.
+      if (bytes.length <= 256 && shouldLogUiEcho(sid)) {
         const text = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
-        opsLog("ECHO", "ui_receive", {
+        opsLogDeferred("ECHO", "ui_receive", {
           len: bytes.length,
-          text: previewText(text, 200),
+          text: previewText(text, 120),
           sid: sid.slice(0, 8),
         });
       }
@@ -2367,6 +3131,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   renderTabBar();
   syncGlobalStatusBar();
   setupMenubar();
+  syncCmdSeparatorMenu();
   setupShortcuts();
   await setupEvents();
 

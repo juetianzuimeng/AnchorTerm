@@ -4,6 +4,7 @@
 //! Backend has **no** UI focus / current_session concept.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -125,15 +126,36 @@ pub struct SessionRuntime {
     pub restore_gen: AtomicU64,
     /// Rate-limit ECHO ops-log lines (huge `grep`/`tail` floods freezes UI).
     pub echo_log_budget: AtomicU32,
+    /// OpenSSH ControlPath for ControlMaster multiplexing (interactive + Tab complete).
+    pub control_path: Mutex<Option<PathBuf>>,
+    // --- post-command separator diagnostics (SEP category) ---
+    /// True while we expect an OSC end-marker for the last post-sep submit.
+    pub sep_pending: AtomicBool,
+    /// Monotonic id of the last post-sep submit (for correlating SEP logs).
+    pub sep_gen: AtomicU64,
+    /// Chunks received on ssh stdout since last post-sep submit.
+    pub sep_chunks: AtomicU64,
+    /// Bytes received on ssh stdout since last post-sep submit (raw, pre-filter).
+    pub sep_bytes_in: AtomicU64,
+    /// Bytes emitted to UI since last post-sep submit (post-filter).
+    pub sep_bytes_out: AtomicU64,
+    /// Chunks dropped because filter produced empty output (while sep pending).
+    pub sep_empty_drops: AtomicU64,
+    /// Last time on_data processed a chunk (ms since UNIX_EPOCH); 0 = never.
+    pub sep_last_on_data_ms: AtomicU64,
 }
 
-/// Pending filter for silent control injects (currently `stty` resize).
+/// Pending filter for silent control injects (`stty` resize, post-cmd marker echo).
 pub struct EchoSuppress {
     /// Exact command text without trailing CR/LF (as typed to the shell).
     pub pattern: Vec<u8>,
     /// Carry buffer for matches that span read chunks.
     pub carry: Vec<u8>,
     pub until: Instant,
+    /// When true, clear suppress immediately after the first successful strip
+    /// (post-cmd separator marker). When false, keep armed until `until`
+    /// (stty may echo twice in one burst).
+    pub once: bool,
 }
 
 impl SessionRuntime {
@@ -156,8 +178,105 @@ impl SessionRuntime {
             echo_suppress: Mutex::new(None),
             side_channel_key: Mutex::new(None),
             restore_gen: AtomicU64::new(0),
-            echo_log_budget: AtomicU32::new(40),
+            // Few bulk ECHO samples per connection (refilled rarely).
+            echo_log_budget: AtomicU32::new(8),
+            control_path: Mutex::new(None),
+            sep_pending: AtomicBool::new(false),
+            sep_gen: AtomicU64::new(0),
+            sep_chunks: AtomicU64::new(0),
+            sep_bytes_in: AtomicU64::new(0),
+            sep_bytes_out: AtomicU64::new(0),
+            sep_empty_drops: AtomicU64::new(0),
+            sep_last_on_data_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Begin tracking a post-command-separator submit (resets counters).
+    pub fn sep_begin(&self, logical: &str, payload_len: usize) {
+        let gen = self.sep_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        self.sep_pending.store(true, Ordering::SeqCst);
+        self.sep_chunks.store(0, Ordering::SeqCst);
+        self.sep_bytes_in.store(0, Ordering::SeqCst);
+        self.sep_bytes_out.store(0, Ordering::SeqCst);
+        self.sep_empty_drops.store(0, Ordering::SeqCst);
+        crate::ops_log::log(
+            "SEP",
+            &format!(
+                "begin gen={} sid={} line=\"{}\" payload_len={} suppress_armed=1",
+                gen,
+                &self.id[..self.id.len().min(8)],
+                crate::ops_log::text_preview(logical.as_bytes(), 120),
+                payload_len
+            ),
+        );
+    }
+
+    /// Snapshot counters for a SEP progress / end line.
+    /// `suppress_known`: `Some(true/false)` when caller already knows arm state
+    /// (avoids re-locking `echo_suppress` while holding it).
+    pub fn sep_stats_line(&self, stage: &str, suppress_known: Option<bool>) -> String {
+        let suppress = suppress_known.unwrap_or_else(|| {
+            self.echo_suppress
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(false)
+        });
+        format!(
+            "{} gen={} sid={} pending={} chunks={} bytes_in={} bytes_out={} empty_drops={} last_on_data_ms={} suppress={}",
+            stage,
+            self.sep_gen.load(Ordering::Relaxed),
+            &self.id[..self.id.len().min(8)],
+            self.sep_pending.load(Ordering::Relaxed) as u8,
+            self.sep_chunks.load(Ordering::Relaxed),
+            self.sep_bytes_in.load(Ordering::Relaxed),
+            self.sep_bytes_out.load(Ordering::Relaxed),
+            self.sep_empty_drops.load(Ordering::Relaxed),
+            self.sep_last_on_data_ms.load(Ordering::Relaxed),
+            suppress as u8
+        )
+    }
+
+    pub fn sep_note_marker_injected(&self) {
+        self.sep_pending.store(false, Ordering::SeqCst);
+        crate::ops_log::log(
+            "SEP",
+            &self.sep_stats_line("marker_injected_done", Some(false)),
+        );
+    }
+
+    /// Stable ControlPath for this tab (created once). Used by ControlMaster.
+    pub fn ensure_control_path(&self) -> PathBuf {
+        let mut g = self
+            .control_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ref p) = *g {
+            return p.clone();
+        }
+        let safe: String = self
+            .id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .take(36)
+            .collect();
+        let p = std::env::temp_dir().join(format!("anchorterm-cm-{safe}"));
+        *g = Some(p.clone());
+        crate::ops_log::log(
+            "SSH",
+            &format!(
+                "control_path set sid={} path={}",
+                &self.id[..self.id.len().min(8)],
+                p.display()
+            ),
+        );
+        p
+    }
+
+    pub fn control_path_opt(&self) -> Option<PathBuf> {
+        self.control_path
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     /// Drop cached side-channel key (new connect / auth change / close).
@@ -180,6 +299,7 @@ impl SessionRuntime {
     }
 
     /// Allow a few ECHO log lines then silence bulk output until refilled.
+    #[allow(dead_code)]
     pub fn take_echo_log_slot(&self) -> bool {
         loop {
             let cur = self.echo_log_budget.load(Ordering::Relaxed);
@@ -197,7 +317,7 @@ impl SessionRuntime {
     }
 
     pub fn refill_echo_log_budget(&self) {
-        self.echo_log_budget.store(40, Ordering::Relaxed);
+        self.echo_log_budget.store(8, Ordering::Relaxed);
     }
 
     pub fn set_ui_mute(&self, mute: bool) {
@@ -216,16 +336,40 @@ impl SessionRuntime {
         self.ui_mute.load(Ordering::SeqCst)
     }
 
-    /// Arm UI-stream filter before writing a silent `stty` inject.
-    pub fn arm_stty_echo_suppress(&self, cols: u32, rows: u32) {
-        let pattern = format!("stty cols {cols} rows {rows} 2>/dev/null").into_bytes();
+    /// Arm UI-stream filter for an exact injected/typed pattern (line echo).
+    pub fn arm_echo_suppress_pattern(&self, pattern: Vec<u8>, ttl: Duration, once: bool) {
+        if pattern.is_empty() {
+            return;
+        }
+        // Only log SEP for post-cmd (once) arms; stty arms are routine noise.
+        if once {
+            crate::ops_log::log(
+                "SEP",
+                &format!(
+                    "suppress_arm sid={} once=1 ttl_ms={} pat_len={} pat=\"{}\"",
+                    &self.id[..self.id.len().min(8)],
+                    ttl.as_millis(),
+                    pattern.len(),
+                    crate::ops_log::text_preview(&pattern, 80)
+                ),
+            );
+        }
         if let Ok(mut g) = self.echo_suppress.lock() {
             *g = Some(EchoSuppress {
                 pattern,
                 carry: Vec::new(),
-                until: Instant::now() + Duration::from_secs(3),
+                until: Instant::now() + ttl,
+                once,
             });
         }
+    }
+
+    /// Arm UI-stream filter before writing a silent `stty` inject.
+    pub fn arm_stty_echo_suppress(&self, cols: u32, rows: u32) {
+        let pattern = format!("stty cols {cols} rows {rows} 2>/dev/null").into_bytes();
+        // Keep armed for the full window: a second identical stty may echo in-burst.
+        // once=false; do not use SEP category spam for stty — still logs via suppress_arm.
+        self.arm_echo_suppress_pattern(pattern, Duration::from_secs(3), false);
     }
 
     /// Remove injected control-command echo from bytes headed to the terminal UI.
@@ -238,13 +382,71 @@ impl SessionRuntime {
             return data.to_vec();
         };
         if Instant::now() > state.until {
+            // Flush any held residual so we never drop bytes on TTL expiry.
+            let carry_len = state.carry.len();
+            let once = state.once;
+            let mut leftover = std::mem::take(&mut state.carry);
             *g = None;
-            return data.to_vec();
+            drop(g); // release before logging (sep_stats may lock)
+            leftover.extend_from_slice(data);
+            crate::ops_log::log(
+                "SEP",
+                &format!(
+                    "suppress_ttl_flush sid={} once={} carry_was={} in={} out={} {}",
+                    &self.id[..self.id.len().min(8)],
+                    once as u8,
+                    carry_len,
+                    data.len(),
+                    leftover.len(),
+                    self.sep_stats_line("after_ttl", Some(false))
+                ),
+            );
+            return leftover;
         }
+        let once = state.once;
+        let carry_before = state.carry.len();
         state.carry.extend_from_slice(data);
-        let out = strip_echo_pattern(&mut state.carry, &state.pattern);
-        // Keep suppress armed for the full window so a second identical stty
-        // echo in the same burst is also dropped.
+        let matched = find_slice(&state.carry, &state.pattern).is_some();
+        let mut out = strip_echo_pattern(&mut state.carry, &state.pattern);
+        let carry_after = state.carry.len();
+        // Post-cmd marker: disarm immediately after the line-echo is stripped so
+        // large command output (tail -1000 …) is never scanned by this filter.
+        if once && matched {
+            out.extend_from_slice(&state.carry);
+            state.carry.clear();
+            *g = None;
+            drop(g);
+            crate::ops_log::log(
+                "SEP",
+                &format!(
+                    "suppress_match_disarm sid={} in={} out={} carry_before={} carry_after_strip={} {}",
+                    &self.id[..self.id.len().min(8)],
+                    data.len(),
+                    out.len(),
+                    carry_before,
+                    carry_after,
+                    self.sep_stats_line("after_disarm", Some(false))
+                ),
+            );
+            return out;
+        }
+        // Active suppress without match: sample log when holding residual or shrinking output.
+        if once && (out.len() != data.len() || carry_after > 0) {
+            let stats = self.sep_stats_line("pass", Some(true));
+            // still holding g — do not call anything that re-locks echo_suppress
+            crate::ops_log::log(
+                "SEP",
+                &format!(
+                    "suppress_pass sid={} matched=0 in={} out={} carry_before={} carry_after={} {}",
+                    &self.id[..self.id.len().min(8)],
+                    data.len(),
+                    out.len(),
+                    carry_before,
+                    carry_after,
+                    stats
+                ),
+            );
+        }
         out
     }
 
@@ -292,6 +494,12 @@ impl SessionRuntime {
 
 /// Strip all occurrences of `pattern` plus following CR/LF from `carry`.
 /// Incomplete suffix of `pattern` is retained in `carry` across chunks.
+///
+/// - **Whole-line** match (pattern at start of buffer or after CR/LF): drop the
+///   line including its trailing EOL (silent `stty` inject).
+/// - **Mid-line suffix** match (e.g. post-command separator chained after the
+///   user command): drop only the pattern and re-insert `\r\n` so the remaining
+///   command text still ends a line and does not glue to following output.
 pub fn strip_echo_pattern(carry: &mut Vec<u8>, pattern: &[u8]) -> Vec<u8> {
     if pattern.is_empty() {
         return std::mem::take(carry);
@@ -301,12 +509,19 @@ pub fn strip_echo_pattern(carry: &mut Vec<u8>, pattern: &[u8]) -> Vec<u8> {
         if let Some(pos) = find_slice(carry, pattern) {
             out.extend_from_slice(&carry[..pos]);
             let mut end = pos + pattern.len();
+            let had_eol =
+                end < carry.len() && (carry[end] == b'\r' || carry[end] == b'\n');
             while end < carry.len() && (carry[end] == b'\r' || carry[end] == b'\n') {
                 end += 1;
             }
+            let at_line_start =
+                pos == 0 || carry[pos - 1] == b'\n' || carry[pos - 1] == b'\r';
+            if !at_line_start && had_eol {
+                out.extend_from_slice(b"\r\n");
+            }
             let rest = carry[end..].to_vec();
             *carry = rest;
-            crate::ops_log::log("SSH", "stty echo suppressed from UI stream");
+            crate::ops_log::log("SSH", "echo pattern suppressed from UI stream");
         } else {
             // Keep only a *suffix* that is a prefix of `pattern` (possible incomplete match).
             let max_keep = pattern.len().saturating_sub(1).min(carry.len());
@@ -480,5 +695,62 @@ mod tests {
         rt.arm_stty_echo_suppress(120, 40);
         let filtered = rt.filter_outgoing_echo(b"stty cols 120 rows 40 2>/dev/null\r\nprompt$ ");
         assert_eq!(String::from_utf8_lossy(&filtered), "prompt$ ");
+    }
+
+    #[test]
+    fn strip_midline_suffix_keeps_eol() {
+        // Post-command separator is chained after the user command; stripping it
+        // must leave the user command on its own line.
+        let suffix = b";printf 'x'";
+        let mut carry = b"tail -200 test.log;printf 'x'\r\nlogline\n".to_vec();
+        let out = strip_echo_pattern(&mut carry, suffix);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "tail -200 test.log\r\nlogline\n"
+        );
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn once_suppress_disarms_after_match_so_large_output_passes() {
+        let rt = SessionRuntime::new("s");
+        let suffix = b";printf '\\033]733;ATsep\\007'";
+        rt.arm_echo_suppress_pattern(suffix.to_vec(), Duration::from_secs(5), true);
+
+        // First chunk: typed line echo with suffix — stripped, suppress disarmed.
+        let echo = b"tail -1000 big.log;printf '\\033]733;ATsep\\007'\r\n";
+        let out1 = rt.filter_outgoing_echo(echo);
+        assert_eq!(String::from_utf8_lossy(&out1), "tail -1000 big.log\r\n");
+        assert!(rt.echo_suppress.lock().unwrap().is_none());
+
+        // Subsequent large chunk must pass through untouched (no filter).
+        let big = vec![b'x'; 8192];
+        let out2 = rt.filter_outgoing_echo(&big);
+        assert_eq!(out2, big);
+    }
+
+    #[test]
+    fn suppress_ttl_flush_does_not_drop_carry() {
+        let rt = SessionRuntime::new("s");
+        // Pattern that will not appear; residual prefix held in carry.
+        rt.arm_echo_suppress_pattern(b"ZZZNOMATCH".to_vec(), Duration::from_millis(1), true);
+        let partial = rt.filter_outgoing_echo(b"helloZZ");
+        // "ZZ" may be held as prefix of ZZZNOMATCH — either emitted or in carry.
+        std::thread::sleep(Duration::from_millis(5));
+        let rest = rt.filter_outgoing_echo(b"world");
+        let combined = [partial.as_slice(), rest.as_slice()].concat();
+        assert!(
+            combined.windows(5).any(|w| w == b"hello") || combined.windows(5).any(|w| w == b"world"),
+            "got {:?}",
+            String::from_utf8_lossy(&combined)
+        );
+        // All user bytes should eventually appear.
+        let text = String::from_utf8_lossy(&combined);
+        assert!(text.contains('h') || text.contains('w'));
+        // After TTL, suppress is gone and no residual permanently lost: helloworld or hello + world
+        assert!(
+            text.contains("hello") && text.contains("world"),
+            "lost residual on TTL: {text:?}"
+        );
     }
 }

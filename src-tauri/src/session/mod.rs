@@ -257,7 +257,19 @@ async fn connect_inner(
         rt.cwd_freeze.store(true, Ordering::SeqCst);
     }
 
-    match connect_session(app.clone(), params, rt.id.clone()).await {
+    // Windows OpenSSH often breaks with ControlMaster ("getsockname failed:
+    // Not a socket"). Only enable mux when supported / forced via env.
+    let control_path = if crate::ssh::openssh::control_master_enabled() {
+        crate::ops_log::log("SSH", "ControlMaster enabled for this connect");
+        Some(rt.ensure_control_path())
+    } else {
+        crate::ops_log::log(
+            "SSH",
+            "ControlMaster disabled (Windows default; set ANCHORTERM_SSH_MUX=1 to force)",
+        );
+        None
+    };
+    match connect_session(app.clone(), params, rt.id.clone(), control_path).await {
         Ok(transport) => {
             if let AuthMethod::Password {
                 password: Some(pw),
@@ -671,10 +683,12 @@ fn connect_params_from_cache(rt: &SessionRuntime) -> Result<ConnectParams, Strin
 
 async fn query_remote_pwd(rt: &SessionRuntime) -> Result<String, String> {
     let params = connect_params_from_cache(rt)?;
+    let cp = mux_control_path(rt);
     let out = crate::ssh::openssh::openssh_exec_with_key_cache(
         &params,
         "pwd -P",
         &rt.side_channel_key,
+        cp.as_deref(),
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -690,10 +704,12 @@ async fn query_dir_exists(rt: &SessionRuntime, path: &str) -> Result<bool, Strin
     let params = connect_params_from_cache(rt)?;
     let quoted = crate::cwd::shell_single_quote(path);
     let cmd = format!("test -d {quoted} && echo AT_DIR_OK || echo AT_DIR_MISSING");
+    let cp = mux_control_path(rt);
     let out = crate::ssh::openssh::openssh_exec_with_key_cache(
         &params,
         &cmd,
         &rt.side_channel_key,
+        cp.as_deref(),
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1027,12 +1043,13 @@ fn close_session_inner(
     );
     // Persist last absolute cwd before tearing down (tab close → later reconnect).
     freeze_restore_target_from_cwd(&rt, "close tab");
-    // 1–4: cancel reconnect + clear freeze/mute + side-channel key
+    // 1–4: cancel reconnect + clear freeze/mute + side-channel key + mux
     rt.auto_reconnect.store(false, Ordering::SeqCst);
     rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
     rt.cwd_freeze.store(false, Ordering::SeqCst);
     rt.set_ui_mute(false);
     rt.clear_side_channel_key();
+    shutdown_session_mux(&rt);
     // 5: take transport → Drop SecureKeyMaterial
     let transport = rt.transport.lock().expect("transport lock").take();
     if let Some(t) = transport {
@@ -1079,6 +1096,7 @@ fn disconnect_inner(rt: &SessionRuntime, app: &AppHandle) -> Result<(), AppError
 
     // Freeze absolute cwd so the next user-initiated connect can restore it.
     freeze_restore_target_from_cwd(rt, "manual disconnect");
+    shutdown_session_mux(rt);
 
     let transport = rt.transport.lock().expect("transport lock").take();
     if let Some(t) = transport {
@@ -1119,6 +1137,35 @@ fn freeze_restore_target_from_cwd(rt: &SessionRuntime, reason: &str) {
             &format!("freeze restore_target skipped (no absolute cwd) reason={reason}"),
         );
     }
+}
+
+/// ControlPath only when mux is enabled (otherwise side-channel is full SSH).
+fn mux_control_path(rt: &SessionRuntime) -> Option<std::path::PathBuf> {
+    if crate::ssh::openssh::control_master_enabled() {
+        rt.control_path_opt()
+    } else {
+        None
+    }
+}
+
+/// Shut down OpenSSH ControlMaster for this session (best-effort).
+fn shutdown_session_mux(rt: &SessionRuntime) {
+    if !crate::ssh::openssh::control_master_enabled() {
+        return;
+    }
+    let Some(cp) = rt.control_path_opt() else {
+        return;
+    };
+    if let Ok(params) = connect_params_from_cache(rt) {
+        crate::ssh::openssh::control_master_exit(&params, &cp);
+    } else {
+        let _ = std::fs::remove_file(&cp);
+    }
+}
+
+/// Public wrapper for `finish_session` (openssh module) to avoid circular private access.
+pub fn shutdown_session_mux_public(rt: &SessionRuntime) {
+    shutdown_session_mux(rt);
 }
 
 /// Write absolute cwd to disk keyed by host+user (survives tab close).
@@ -1195,16 +1242,29 @@ async fn write_inner(rt: &SessionRuntime, data_b64: String) -> Result<(), AppErr
     Ok(())
 }
 
+/// Suffix chained after the user command when "post-command separator" is on.
+///
+/// Emits a private OSC that is **not** shown by xterm; `on_data` rewrites it
+/// into a green separator line. Kept short/ASCII so:
+/// - line-echo suppress matches once at the start and disarms immediately
+/// - large command output (e.g. `tail -1000`) is never scanned by the filter
+/// - command line stays well under typical terminal width (no wrap-split)
+const POST_CMD_SEP_SUFFIX: &str = ";printf '\\033]733;ATsep\\007'";
+
 /// Submit a full draft line (appends CR). Used by draft input box.
+///
+/// When `post_separator` is true, chains a tiny OSC marker after the user
+/// command; the UI stream rewrites that marker into a green separator line.
 #[tauri::command]
 pub async fn submit_line(
     state: State<'_, AppState>,
     app: AppHandle,
     session_id: String,
     line: String,
+    post_separator: Option<bool>,
 ) -> Result<(), String> {
     let rt = state.get_runtime(&session_id).map_err(|e| -> String { e.into() })?;
-    submit_line_inner(&rt, &app, line)
+    submit_line_inner(&rt, &app, line, post_separator.unwrap_or(false))
         .await
         .map_err(Into::into)
 }
@@ -1213,6 +1273,7 @@ async fn submit_line_inner(
     rt: &SessionRuntime,
     app: &AppHandle,
     line: String,
+    post_separator: bool,
 ) -> Result<(), AppError> {
     // Draft is one logical shell line.
     let logical = line.trim_end_matches(['\n', '\r']);
@@ -1228,25 +1289,80 @@ async fn submit_line_inner(
             .clone_writer()
     };
 
+    // Optionally chain an end-of-command marker (rewritten to a green line in on_data).
+    // Cwd tracking still uses the original logical line (no suffix).
+    let to_send: String = if post_separator {
+        // Suppress only the injected suffix from remote line-echo; `once=true`
+        // so the filter disarms right after the typed line is echoed — before
+        // large stdout (tail/grep) arrives.
+        rt.arm_echo_suppress_pattern(
+            POST_CMD_SEP_SUFFIX.as_bytes().to_vec(),
+            Duration::from_secs(3),
+            true,
+        );
+        format!("{logical}{POST_CMD_SEP_SUFFIX}")
+    } else {
+        // Clear any stale pending marker tracking from a previous toggle.
+        rt.sep_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        logical.to_string()
+    };
+
     // OpenSSH -tt PTY: type the line then CR (Enter). Send as one packet first;
     // character-by-character was not needed for stty, but we flush hard so the
     // Windows pipe → ssh bridge does not hold the line incomplete.
-    let mut payload = logical.as_bytes().to_vec();
+    let mut payload = to_send.as_bytes().to_vec();
     payload.push(b'\r');
 
-    info!(len = payload.len(), line = %logical, "submit_line → openssh stdin");
+    if post_separator {
+        rt.sep_begin(logical, payload.len());
+        crate::ops_log::log(
+            "SEP",
+            &format!(
+                "submit_payload sid={} suffix=\"{}\" full_preview=\"{}\"",
+                &rt.id[..rt.id.len().min(8)],
+                POST_CMD_SEP_SUFFIX,
+                crate::ops_log::text_preview(&payload, 160)
+            ),
+        );
+    }
+
+    info!(
+        len = payload.len(),
+        line = %logical,
+        post_separator,
+        "submit_line → openssh stdin"
+    );
     crate::ops_log::log(
         "CMD",
         &format!(
-            "submit_line line=\"{}\" payload_len={} hex={}",
+            "submit_line line=\"{}\" post_sep={} payload_len={} hex={}",
             logical,
+            post_separator,
             payload.len(),
             crate::ops_log::hex_preview(&payload, 64)
         ),
     );
+    let t0 = std::time::Instant::now();
     write_stdin(&stdin, &alive, &payload).await?;
+    let write_ms = t0.elapsed().as_millis();
     info!("submit_line write ok");
-    crate::ops_log::log("CMD", &format!("submit_line ok line=\"{logical}\""));
+    crate::ops_log::log(
+        "CMD",
+        &format!(
+            "submit_line ok line=\"{logical}\" post_sep={post_separator} write_ms={write_ms}"
+        ),
+    );
+    if post_separator {
+        crate::ops_log::log(
+            "SEP",
+            &format!(
+                "stdin_write_ok sid={} write_ms={} {}",
+                &rt.id[..rt.id.len().min(8)],
+                write_ms,
+                rt.sep_stats_line("after_write", Some(true))
+            ),
+        );
+    }
 
     // Track cwd from the submitted line (optimistic; OSC 7 / failure echo may correct).
     // IMPORTANT: release `cwd` before emit_state/snapshot — snapshot() also locks cwd
@@ -1330,10 +1446,12 @@ async fn complete_draft_inner(
                         crate::ops_log::text_preview(command.as_bytes(), 100)
                     ),
                 );
+                let cp = mux_control_path(&rt_exec);
                 crate::ssh::openssh::openssh_exec_with_key_cache(
                     &params,
                     &command,
                     &rt_exec.side_channel_key,
+                    cp.as_deref(),
                 )
                 .await
                 .map_err(|e| e.to_string())

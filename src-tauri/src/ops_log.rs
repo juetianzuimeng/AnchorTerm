@@ -249,7 +249,9 @@ fn clear_previous_logs(dir: &Path) {
 fn append_raw(path: &Path, text: &str) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
         let _ = f.write_all(text.as_bytes());
-        let _ = f.flush();
+        // Intentionally no flush(): triple-file fsync on every ECHO chunk can
+        // stall the SSH stdout pump during large `tail`/`grep` floods.
+        // Page cache is enough for diagnostics; process exit still persists.
     }
 }
 

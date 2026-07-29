@@ -166,8 +166,13 @@ impl CwdTracker {
         let text = String::from_utf8_lossy(data);
         self.line_buf.push_str(&text);
         // Cap buffer to avoid unbounded growth on binary noise.
+        // Must snap to a char boundary — Chinese log lines (UTF-8) previously
+        // panicked with `is_char_boundary` mid-tail and dropped a full chunk.
         if self.line_buf.len() > 8192 {
-            let keep = self.line_buf.len() - 4096;
+            let mut keep = self.line_buf.len() - 4096;
+            while keep > 0 && !self.line_buf.is_char_boundary(keep) {
+                keep -= 1;
+            }
             self.line_buf.drain(..keep);
         }
 

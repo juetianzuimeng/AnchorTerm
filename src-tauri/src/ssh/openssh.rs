@@ -7,11 +7,12 @@
 //!
 //! Fixes: secure temp key copy + ACL lock-down; wait for auth; auth fail → Failed (no reconnect).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -348,16 +349,52 @@ struct BuiltArgs {
     secure_key: Option<SecureKeyMaterial>,
 }
 
-fn build_ssh_args(params: &ConnectParams) -> Result<BuiltArgs, AppError> {
-    build_ssh_args_inner(params, None)
+/// Multiplex mode for OpenSSH ControlMaster (speeds up Tab complete side-channel).
+#[derive(Debug, Clone, Copy)]
+enum MuxRole {
+    /// Interactive PTY: create / own the shared connection.
+    Master,
+    /// Non-interactive exec: attach to master when available.
+    Slave,
+}
+
+/// Whether to enable OpenSSH ControlMaster.
+///
+/// On Windows, stock OpenSSH frequently fails with:
+/// `getsockname failed: Not a socket` when ControlMaster/ControlPath is set.
+/// Default **off** on Windows; set env `ANCHORTERM_SSH_MUX=1` to force-enable
+/// (for builds that support AF_UNIX mux). Non-Windows defaults to **on**.
+pub fn control_master_enabled() -> bool {
+    if let Ok(v) = std::env::var("ANCHORTERM_SSH_MUX") {
+        let t = v.trim();
+        if t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off") {
+            return false;
+        }
+        if t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("on") {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 /// Build ssh argv. When `side_key_cache` is set (side-channel exec), reuse a
 /// single decrypted temp key for the whole session so Tab complete does not
 /// re-run `icacls` three times per keystroke.
+///
+/// When `control_path` is set, enable ControlMaster multiplexing so side-channel
+/// exec reuses the interactive TCP/auth session (major Tab complete speedup).
 fn build_ssh_args_inner(
     params: &ConnectParams,
     side_key_cache: Option<&std::sync::Mutex<Option<SecureKeyMaterial>>>,
+    control_path: Option<&Path>,
+    mux_role: MuxRole,
 ) -> Result<BuiltArgs, AppError> {
     // Dead-link detection (e.g. unplugged NIC): plain TCP can stay ESTABLISHED for a
     // long time with no local I/O. OpenSSH client keepalives force a probe so the
@@ -378,6 +415,23 @@ fn build_ssh_args_inner(
         "-p".into(),
         params.port.to_string(),
     ];
+
+    if let Some(cp) = control_path {
+        // Master: interactive owns the mux. Slave/auto: Tab complete attaches.
+        // ControlPersist keeps the master briefly after the first client exits so
+        // a side-channel can still fire during reconnect races; we always
+        // `ssh -O exit` on session teardown.
+        let master_opt = match mux_role {
+            MuxRole::Master => "yes",
+            MuxRole::Slave => "auto",
+        };
+        args.push("-o".into());
+        args.push(format!("ControlMaster={master_opt}"));
+        args.push("-o".into());
+        args.push(format!("ControlPath={}", cp.display()));
+        args.push("-o".into());
+        args.push("ControlPersist=60".into());
+    }
 
     let (askpass, secure_key) = match &params.auth {
         AuthMethod::Password { password, .. } => {
@@ -467,13 +521,22 @@ fn build_ssh_args_inner(
 ///
 /// `session_id` is bound into stdout/stderr pumps and the child-wait task so
 /// `on_data` / `finish_session` never touch a global singleton session.
+///
+/// `control_path`: when set, this session is ControlMaster so Tab complete can
+/// multiplex over the same connection.
 pub async fn connect_openssh(
     app: AppHandle,
     params: ConnectParams,
     session_id: String,
+    control_path: Option<PathBuf>,
 ) -> Result<OpensshTransport, AppError> {
     let ssh = find_ssh()?;
-    let built = build_ssh_args(&params)?;
+    let built = build_ssh_args_inner(
+        &params,
+        None,
+        control_path.as_deref(),
+        MuxRole::Master,
+    )?;
 
     info!(
         ssh = %ssh.display(),
@@ -485,7 +548,7 @@ pub async fn connect_openssh(
     crate::ops_log::log(
         "SSH",
         &format!(
-            "openssh connect begin sid={} host={} port={} user={} auth={}",
+            "openssh connect begin sid={} host={} port={} user={} auth={} mux={}",
             &session_id[..session_id.len().min(8)],
             params.host,
             params.port,
@@ -493,7 +556,11 @@ pub async fn connect_openssh(
             match &params.auth {
                 AuthMethod::Password { .. } => "password",
                 AuthMethod::PublicKey { .. } => "public_key",
-            }
+            },
+            control_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "off".into())
         ),
     );
 
@@ -562,21 +629,19 @@ pub async fn connect_openssh(
         drop(askpass);
     });
 
-    // stdout → UI + buffer
+    // stdout / stderr → dedicated OS threads (own Tokio current-thread runtimes).
+    // Running pumps on the shared app runtime was observed to stall mid-tail:
+    // progress stopped ~180KB in, no further pump_waiting_read for that stream,
+    // while the other stream kept idling — classic "task no longer polled".
     let app_out = app.clone();
     let sid_out = session_id.clone();
     let out_b = Arc::clone(&out_buf);
-    tokio::spawn(async move {
-        pump_stream(app_out, sid_out, stdout, Some(out_b)).await;
-    });
+    spawn_stream_pump(app_out, sid_out, "stdout", stdout, Some(out_b));
 
-    // stderr → UI + buffer
     let app_err = app.clone();
     let sid_err = session_id.clone();
     let err_b = Arc::clone(&err_buf);
-    tokio::spawn(async move {
-        pump_stream(app_err, sid_err, stderr, Some(err_b)).await;
-    });
+    spawn_stream_pump(app_err, sid_err, "stderr", stderr, Some(err_b));
 
     // ---- Wait for auth success (or fail fast) before reporting Connected ----
     // Previously we returned immediately after spawn → UI showed "已连接" then
@@ -760,42 +825,178 @@ async fn control_loop(
     }
 }
 
+/// Run one SSH stream pump on a **dedicated OS thread** with a private
+/// current-thread Tokio runtime so the shared app runtime cannot starve it.
+fn spawn_stream_pump<R>(
+    app: AppHandle,
+    session_id: String,
+    label: &'static str,
+    stream: R,
+    mirror: Option<Arc<Mutex<String>>>,
+) where
+    R: AsyncReadExt + Unpin + Send + 'static,
+{
+    let name = format!("ssh-pump-{label}-{}", &session_id[..session_id.len().min(8)]);
+    let spawn_result = std::thread::Builder::new().name(name.clone()).spawn(move || {
+        crate::ops_log::log(
+            "SSH",
+            &format!(
+                "pump_thread_start label={label} sid={} thread={}",
+                &session_id[..session_id.len().min(8)],
+                std::thread::current().name().unwrap_or("?")
+            ),
+        );
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                crate::ops_log::log(
+                    "ERR",
+                    &format!("pump_thread runtime build failed label={label}: {e}"),
+                );
+                return;
+            }
+        };
+        rt.block_on(pump_stream(app, session_id, label, stream, mirror));
+        crate::ops_log::log("SSH", &format!("pump_thread_exit label={label}"));
+    });
+    if let Err(e) = spawn_result {
+        crate::ops_log::log(
+            "ERR",
+            &format!("pump_thread spawn failed label={label}: {e}"),
+        );
+    }
+}
+
 async fn pump_stream<R: AsyncReadExt + Unpin>(
     app: AppHandle,
     session_id: String,
+    label: &'static str,
     mut stream: R,
     mirror: Option<Arc<Mutex<String>>>,
 ) {
-    let mut buf = vec![0u8; 8192];
+    let mut buf = vec![0u8; 16_384];
     let mut total: u64 = 0;
+    let mut last_heartbeat = Instant::now();
+    let mut chunks_since_hb: u64 = 0;
+    let mut idle_wait_logs: u64 = 0;
+    let sid8 = &session_id[..session_id.len().min(8)];
     loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => {
+        // Timeout so we can log "still alive, waiting for remote".
+        let read_result =
+            tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+        match read_result {
+            Err(_elapsed) => {
+                idle_wait_logs += 1;
+                if idle_wait_logs <= 3 || idle_wait_logs % 5 == 0 {
+                    crate::ops_log::log(
+                        "SSH",
+                        &format!(
+                            "pump_waiting_read label={label} sid={sid8} total={total} idle_waits={idle_wait_logs} ui_queued={} ui_flushed={}",
+                            UI_EMIT_QUEUED.load(Ordering::Relaxed),
+                            UI_EMIT_FLUSHED.load(Ordering::Relaxed),
+                        ),
+                    );
+                }
+                continue;
+            }
+            Ok(Ok(0)) => {
                 crate::ops_log::log(
                     "SSH",
                     &format!(
-                        "ssh stream EOF (pump end) sid={} bytes_read={total}",
-                        &session_id[..session_id.len().min(8)]
+                        "ssh stream EOF label={label} sid={sid8} bytes_read={total}"
                     ),
                 );
-                break;
-            }
-            Ok(n) => {
-                total += n as u64;
-                if let Some(ref m) = mirror {
-                    let mut g = m.lock().await;
-                    // Cap diagnostic buffer.
-                    if g.len() < 32_000 {
-                        g.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if label == "stdout" {
+                    if let Some(state) = app.try_state::<AppState>() {
+                        if let Ok(rt) = state.get_runtime(&session_id) {
+                            if rt.sep_pending.load(Ordering::Relaxed) {
+                                crate::ops_log::log(
+                                    "SEP",
+                                    &format!(
+                                        "pump_eof_while_pending {}",
+                                        rt.sep_stats_line("eof", None)
+                                    ),
+                                );
+                            }
+                        }
                     }
                 }
-                on_data(&app, &session_id, &buf[..n]);
+                break;
             }
-            Err(e) => {
-                warn!(error = %e, "ssh stream read error");
+            Ok(Ok(n)) => {
+                idle_wait_logs = 0;
+                total += n as u64;
+                chunks_since_hb += 1;
+                // Never block the pump on the auth mirror buffer.
+                if let Some(ref m) = mirror {
+                    if let Ok(mut g) = m.try_lock() {
+                        if g.len() < 32_000 {
+                            g.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        }
+                    }
+                }
+                let t0 = Instant::now();
+                // Catch panics so one bad chunk cannot kill the pump thread.
+                let on_data_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        on_data(&app, &session_id, &buf[..n]);
+                    }));
+                if let Err(payload) = on_data_result {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    crate::ops_log::log(
+                        "ERR",
+                        &format!(
+                            "on_data_panic label={label} sid={sid8} n={n} total={total} err={msg}"
+                        ),
+                    );
+                }
+                let on_data_ms = t0.elapsed().as_millis();
+                let need_hb = last_heartbeat.elapsed().as_millis() >= 500
+                    || on_data_ms >= 30
+                    || chunks_since_hb >= 20;
+                if need_hb {
+                    crate::ops_log::log(
+                        "SSH",
+                        &format!(
+                            "pump_progress label={label} sid={sid8} n={n} total={total} on_data_ms={on_data_ms} chunks_since_hb={chunks_since_hb} ui_queued={} ui_flushed={}",
+                            UI_EMIT_QUEUED.load(Ordering::Relaxed),
+                            UI_EMIT_FLUSHED.load(Ordering::Relaxed),
+                        ),
+                    );
+                    if label == "stdout" {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            if let Ok(rt) = state.get_runtime(&session_id) {
+                                if rt.sep_pending.load(Ordering::Relaxed) {
+                                    crate::ops_log::log(
+                                        "SEP",
+                                        &format!(
+                                            "pump_chunk sid={sid8} {}",
+                                            rt.sep_stats_line("pump", None)
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    last_heartbeat = Instant::now();
+                    chunks_since_hb = 0;
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, label, "ssh stream read error");
                 crate::ops_log::log(
                     "ERR",
-                    &format!("ssh stream read error: {e} (bytes_read={total})"),
+                    &format!(
+                        "ssh stream read error label={label} sid={sid8}: {e} (bytes_read={total})"
+                    ),
                 );
                 break;
             }
@@ -820,9 +1021,60 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
         return;
     };
 
+    let sep_pending = rt.sep_pending.load(Ordering::Relaxed);
+    if sep_pending {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        rt.sep_last_on_data_ms.store(now_ms, Ordering::Relaxed);
+        rt.sep_chunks.fetch_add(1, Ordering::Relaxed);
+        rt.sep_bytes_in
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+    }
+
     // Drop remote echo of our silent `stty` injects so the user never sees them.
+    let t_filter = std::time::Instant::now();
     let filtered = rt.filter_outgoing_echo(data);
+    let filter_ms = t_filter.elapsed().as_millis();
     if filtered.is_empty() {
+        if sep_pending {
+            rt.sep_empty_drops.fetch_add(1, Ordering::Relaxed);
+            crate::ops_log::log(
+                "SEP",
+                &format!(
+                    "on_data_empty_after_filter sid={} in={} filter_ms={} {}",
+                    &session_id[..session_id.len().min(8)],
+                    data.len(),
+                    filter_ms,
+                    rt.sep_stats_line("empty_filter", None)
+                ),
+            );
+        }
+        return;
+    }
+
+    // Rewrite post-command OSC marker into a green separator line (local only).
+    let had_marker_bytes = filtered.windows(SEP_OSC_BEL.len()).any(|w| w == SEP_OSC_BEL)
+        || filtered.windows(SEP_OSC_ST.len()).any(|w| w == SEP_OSC_ST);
+    let (cols, _) = rt.term_size();
+    let filtered = rewrite_cmd_separator_marker(&filtered, cols);
+    if had_marker_bytes {
+        rt.sep_note_marker_injected();
+    }
+    if filtered.is_empty() {
+        if sep_pending {
+            rt.sep_empty_drops.fetch_add(1, Ordering::Relaxed);
+            crate::ops_log::log(
+                "SEP",
+                &format!(
+                    "on_data_empty_after_rewrite sid={} in={} {}",
+                    &session_id[..session_id.len().min(8)],
+                    data.len(),
+                    rt.sep_stats_line("empty_rewrite", None)
+                ),
+            );
+        }
         return;
     }
 
@@ -830,7 +1082,24 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
     // Status bar already covers disconnect/reconnect; keep scrollback clean.
     let filtered = strip_openssh_client_noise(&filtered);
     if filtered.is_empty() {
+        if sep_pending {
+            rt.sep_empty_drops.fetch_add(1, Ordering::Relaxed);
+            crate::ops_log::log(
+                "SEP",
+                &format!(
+                    "on_data_empty_after_noise sid={} in={} {}",
+                    &session_id[..session_id.len().min(8)],
+                    data.len(),
+                    rt.sep_stats_line("empty_noise", None)
+                ),
+            );
+        }
         return;
+    }
+
+    if sep_pending || rt.sep_pending.load(Ordering::Relaxed) {
+        rt.sep_bytes_out
+            .fetch_add(filtered.len() as u64, Ordering::Relaxed);
     }
 
     // Reconnect / cwd-restore: mute MOTD, Last login, timeout spam, silent cd echo.
@@ -838,7 +1107,9 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
     let muted = rt.is_ui_muted();
     // Huge remote dumps (grep/tail of multi-MB logs) used to log every 8KB chunk
     // thrice to disk + UI IPC — freezing the app during reconnect. Rate-limit.
-    let log_echo = filtered.len() <= 512 || rt.take_echo_log_slot();
+    // Never log bulk payload bodies on the pump path (disk+mutex contention
+    // under tail floods). Small interactive chunks only.
+    let log_echo = filtered.len() <= 256;
     if !muted {
         if log_echo {
             crate::ops_log::log(
@@ -847,12 +1118,25 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
                     "remote sid={} len={} hex={} text=\"{}\"",
                     &session_id[..session_id.len().min(8)],
                     filtered.len(),
-                    crate::ops_log::hex_preview(&filtered, 96),
-                    crate::ops_log::text_preview(&filtered, 200)
+                    crate::ops_log::hex_preview(&filtered, 48),
+                    crate::ops_log::text_preview(&filtered, 120)
                 ),
             );
         }
+        // Non-blocking queue — pump must not wait on WebView.
         emit_data_raw(app, session_id, &filtered);
+        if sep_pending && rt.sep_chunks.load(Ordering::Relaxed) <= 3 {
+            crate::ops_log::log(
+                "SEP",
+                &format!(
+                    "emit_queued sid={} out={} filter_ms={} {}",
+                    &session_id[..session_id.len().min(8)],
+                    filtered.len(),
+                    filter_ms,
+                    rt.sep_stats_line("emit", None)
+                ),
+            );
+        }
     } else if log_echo {
         crate::ops_log::log(
             "ECHO",
@@ -863,6 +1147,17 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
                 crate::ops_log::text_preview(&filtered, 120)
             ),
         );
+        if sep_pending {
+            crate::ops_log::log(
+                "SEP",
+                &format!(
+                    "emit_skipped_muted sid={} out={} {}",
+                    &session_id[..session_id.len().min(8)],
+                    filtered.len(),
+                    rt.sep_stats_line("muted", None)
+                ),
+            );
+        }
     }
 
     if rt.cwd_freeze.load(Ordering::SeqCst) {
@@ -882,14 +1177,79 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
     }
 }
 
+/// Private OSC emitted after user commands when post-separator is enabled.
+/// BEL-terminated (common) and ST-terminated (ESC \) forms.
+const SEP_OSC_BEL: &[u8] = b"\x1b]733;ATsep\x07";
+const SEP_OSC_ST: &[u8] = b"\x1b]733;ATsep\x1b\\";
+
+/// Build a green separator spanning most of the terminal width.
+/// Uses U+2500 BOX DRAWINGS LIGHT HORIZONTAL; width is clamped for sanity.
+fn sep_line_for_cols(cols: u32) -> String {
+    // Leave a small margin so the line does not wrap on the last cell.
+    let width = (cols as usize).clamp(60, 240).saturating_sub(2).max(48);
+    let mut s = String::with_capacity(width * 3 + 16);
+    s.push_str("\r\n\x1b[32m");
+    for _ in 0..width {
+        s.push('─');
+    }
+    s.push_str("\x1b[0m\r\n");
+    s
+}
+
+/// Replace post-command OSC marker(s) with a green separator line.
+fn rewrite_cmd_separator_marker(data: &[u8], cols: u32) -> Vec<u8> {
+    if find_bytes(data, SEP_OSC_BEL).is_none() && find_bytes(data, SEP_OSC_ST).is_none() {
+        return data.to_vec();
+    }
+    let sep = sep_line_for_cols(cols);
+    let mut out = replace_bytes(data, SEP_OSC_BEL, sep.as_bytes());
+    out = replace_bytes(&out, SEP_OSC_ST, sep.as_bytes());
+    crate::ops_log::log(
+        "SEP",
+        &format!(
+            "rewrite_marker cols={cols} sep_cells={} in={} out={} delta={}",
+            (cols as usize).clamp(60, 240).saturating_sub(2).max(48),
+            data.len(),
+            out.len(),
+            out.len() as i64 - data.len() as i64
+        ),
+    );
+    out
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn replace_bytes(hay: &[u8], needle: &[u8], rep: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return hay.to_vec();
+    }
+    let mut out = Vec::with_capacity(hay.len().saturating_add(64));
+    let mut i = 0;
+    while i < hay.len() {
+        if i + needle.len() <= hay.len() && &hay[i..i + needle.len()] == needle {
+            out.extend_from_slice(rep);
+            i += needle.len();
+        } else {
+            out.push(hay[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Drop OpenSSH client diagnostic lines that are not remote shell output.
 /// e.g. `Timeout, server 1.2.3.4 not responding.`
 fn strip_openssh_client_noise(data: &[u8]) -> Vec<u8> {
-    let text = String::from_utf8_lossy(data);
-    // Fast path: nothing matching.
-    if !text.contains("Timeout, server") {
+    // Fast path: avoid UTF-8 allocation when the needle is absent (bulk path).
+    if !data.windows(15).any(|w| w == b"Timeout, server") {
         return data.to_vec();
     }
+    let text = String::from_utf8_lossy(data);
     let mut out = String::with_capacity(text.len());
     // Normalize to \n for line decisions, then rewrite with original endings preserved
     // by scanning the original string with a simple line walker.
@@ -951,7 +1311,157 @@ mod noise_filter_tests {
     }
 }
 
+/// UI terminal bytes: pump → std mpsc → **dedicated OS thread** → WebView.
+///
+/// Important: `app.emit` must NOT run on a Tokio worker. A slow WebView can block
+/// emit for a long time; if that worker also services the SSH stdout pump, the
+/// PTY stops being read → remote `tail` blocks → session appears frozen
+/// (stdin write still succeeds, but no further echo).
+type UiEmitItem = (String, Vec<u8>);
+static UI_EMIT_TX: OnceLock<std::sync::mpsc::Sender<UiEmitItem>> = OnceLock::new();
+static UI_EMIT_QUEUED: AtomicU64 = AtomicU64::new(0);
+static UI_EMIT_FLUSHED: AtomicU64 = AtomicU64::new(0);
+
+fn ensure_ui_emit_worker(app: &AppHandle) -> std::sync::mpsc::Sender<UiEmitItem> {
+    UI_EMIT_TX
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<UiEmitItem>();
+            let app = app.clone();
+            std::thread::Builder::new()
+                .name("anchor-ui-emit".into())
+                .spawn(move || {
+                    ui_emit_worker_loop(app, rx);
+                })
+                .expect("spawn anchor-ui-emit thread");
+            crate::ops_log::log(
+                "SSH",
+                "ui_emit_worker started (dedicated OS thread, coalesce ~12ms)",
+            );
+            tx
+        })
+        .clone()
+}
+
+fn ui_emit_worker_loop(app: AppHandle, rx: std::sync::mpsc::Receiver<UiEmitItem>) {
+    let mut pending: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut last_flood_log = Instant::now();
+    let mut flood_bytes: u64 = 0;
+    let mut flood_flushes: u64 = 0;
+    let mut emit_block_warns: u64 = 0;
+
+    loop {
+        // Block for the first item when idle; timed wait when we have a batch
+        // so interactive output still flushes promptly.
+        let first = if pending.is_empty() {
+            match rx.recv() {
+                Ok(x) => Some(x),
+                Err(_) => break,
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_millis(12)) {
+                Ok(x) => Some(x),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        };
+
+        if let Some((sid, data)) = first {
+            let n = data.len() as u64;
+            UI_EMIT_QUEUED.fetch_add(n, Ordering::Relaxed);
+            flood_bytes += n;
+            pending.entry(sid).or_default().extend(data);
+        }
+
+        // Drain whatever is already queued (coalesce a burst into one emit).
+        loop {
+            match rx.try_recv() {
+                Ok((sid, data)) => {
+                    let n = data.len() as u64;
+                    UI_EMIT_QUEUED.fetch_add(n, Ordering::Relaxed);
+                    flood_bytes += n;
+                    pending.entry(sid).or_default().extend(data);
+                    // Cap RAM if WebView is extremely slow.
+                    let total: usize = pending.values().map(|v| v.len()).sum();
+                    if total >= 2 * 1024 * 1024 {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        if pending.is_empty() {
+            if last_flood_log.elapsed() >= Duration::from_secs(2) && flood_bytes > 0 {
+                crate::ops_log::log(
+                    "SSH",
+                    &format!(
+                        "ui_emit_idle_stats bytes_window={flood_bytes} flushes={flood_flushes} block_warns={emit_block_warns} queued_total={} flushed_total={}",
+                        UI_EMIT_QUEUED.load(Ordering::Relaxed),
+                        UI_EMIT_FLUSHED.load(Ordering::Relaxed),
+                    ),
+                );
+                flood_bytes = 0;
+                flood_flushes = 0;
+                last_flood_log = Instant::now();
+            }
+            continue;
+        }
+
+        for (sid, buf) in pending.drain() {
+            if buf.is_empty() {
+                continue;
+            }
+            flood_flushes += 1;
+            let t0 = Instant::now();
+            emit_data_raw_now(&app, &sid, &buf);
+            let ms = t0.elapsed().as_millis();
+            UI_EMIT_FLUSHED.fetch_add(buf.len() as u64, Ordering::Relaxed);
+            if ms >= 100 {
+                emit_block_warns += 1;
+                crate::ops_log::log(
+                    "SSH",
+                    &format!(
+                        "ui_emit_slow sid={} bytes={} emit_ms={} (OS thread; pump unaffected)",
+                        &sid[..sid.len().min(8)],
+                        buf.len(),
+                        ms
+                    ),
+                );
+            }
+        }
+
+        if last_flood_log.elapsed() >= Duration::from_secs(1) && flood_bytes > 64 * 1024 {
+            crate::ops_log::log(
+                "SSH",
+                &format!(
+                    "ui_emit_flood_stats bytes_window={flood_bytes} flushes={flood_flushes} block_warns={emit_block_warns} queued_total={} flushed_total={}",
+                    UI_EMIT_QUEUED.load(Ordering::Relaxed),
+                    UI_EMIT_FLUSHED.load(Ordering::Relaxed),
+                ),
+            );
+            flood_bytes = 0;
+            flood_flushes = 0;
+            last_flood_log = Instant::now();
+        }
+    }
+
+    crate::ops_log::log("SSH", "ui_emit_worker exit");
+}
+
+/// Queue terminal bytes for the UI. Non-blocking for the SSH stdout pump.
 fn emit_data_raw(app: &AppHandle, session_id: &str, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let tx = ensure_ui_emit_worker(app);
+    if let Err(e) = tx.send((session_id.to_string(), data.to_vec())) {
+        error!("ui emit queue closed: {e}");
+        crate::ops_log::log("ERR", &format!("ui emit queue closed: {e}"));
+    }
+}
+
+fn emit_data_raw_now(app: &AppHandle, session_id: &str, data: &[u8]) {
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
     if let Err(e) = app.emit(
         "session://data",
@@ -1157,6 +1667,9 @@ async fn finish_session(app: AppHandle, session_id: String, manual: bool) {
     };
     let do_reconnect = !is_manual && auto;
     drop(meta);
+    // Tear down ControlMaster before spawn_reconnect so the next connect can
+    // create a fresh mux (stale socket causes side-channel hangs).
+    crate::session::shutdown_session_mux_public(&rt);
     let _ = app.emit("session://state", snap);
     if do_reconnect {
         crate::session::spawn_reconnect_loop(app, session_id);
@@ -1164,30 +1677,77 @@ async fn finish_session(app: AppHandle, session_id: String, manual: bool) {
 }
 
 /// One-shot remote command via OpenSSH (non-interactive).
+#[allow(dead_code)]
 pub async fn openssh_exec(
     params: &ConnectParams,
     remote_command: &str,
 ) -> Result<String, AppError> {
-    openssh_exec_inner(params, remote_command, None).await
+    openssh_exec_inner(params, remote_command, None, None).await
 }
 
 /// Side-channel exec that reuses a per-session decrypted key (Tab complete, pwd).
+/// Pass `control_path` from the interactive session to multiplex (ControlMaster).
 pub async fn openssh_exec_with_key_cache(
     params: &ConnectParams,
     remote_command: &str,
     key_cache: &std::sync::Mutex<Option<SecureKeyMaterial>>,
+    control_path: Option<&Path>,
 ) -> Result<String, AppError> {
-    openssh_exec_inner(params, remote_command, Some(key_cache)).await
+    openssh_exec_inner(params, remote_command, Some(key_cache), control_path).await
+}
+
+/// Tear down a ControlMaster mux (`ssh -O exit`) and remove the control path file.
+pub fn control_master_exit(params: &ConnectParams, control_path: &Path) {
+    let Ok(ssh) = find_ssh() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(&ssh);
+    cmd.arg("-O")
+        .arg("exit")
+        .arg("-o")
+        .arg(format!("ControlPath={}", control_path.display()))
+        .arg("-p")
+        .arg(params.port.to_string())
+        .arg(format!("{}@{}", params.username, params.host));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.output() {
+        Ok(o) => {
+            crate::ops_log::log(
+                "SSH",
+                &format!(
+                    "control_master_exit path={} status={:?} err={}",
+                    control_path.display(),
+                    o.status,
+                    crate::ops_log::text_preview(&o.stderr, 80)
+                ),
+            );
+        }
+        Err(e) => {
+            crate::ops_log::log("ERR", &format!("control_master_exit spawn failed: {e}"));
+        }
+    }
+    let _ = std::fs::remove_file(control_path);
 }
 
 async fn openssh_exec_inner(
     params: &ConnectParams,
     remote_command: &str,
     side_key_cache: Option<&std::sync::Mutex<Option<SecureKeyMaterial>>>,
+    control_path: Option<&Path>,
 ) -> Result<String, AppError> {
     let ssh = find_ssh()?;
     let t0 = std::time::Instant::now();
-    let built = build_ssh_args_inner(params, side_key_cache)?;
+    let built = build_ssh_args_inner(
+        params,
+        side_key_cache,
+        control_path,
+        MuxRole::Slave,
+    )?;
     let mut args = built.args;
     // Non-interactive exec: no -tt
     args.retain(|a| a != "-tt");
@@ -1219,9 +1779,12 @@ async fn openssh_exec_inner(
     crate::ops_log::log(
         "SSH",
         &format!(
-            "side-channel ssh spawn cmd_len={} key_cached={}",
+            "side-channel ssh spawn cmd_len={} key_cached={} mux={}",
             remote_command.len(),
-            side_key_cache.is_some()
+            side_key_cache.is_some(),
+            control_path
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "off".into())
         ),
     );
 
@@ -1234,11 +1797,18 @@ async fn openssh_exec_inner(
     drop(built.secure_key);
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let ms = t0.elapsed().as_millis();
+    let mux_hint = if control_path.is_some() && ms < 400 {
+        "likely_mux"
+    } else if control_path.is_some() {
+        "mux_or_full"
+    } else {
+        "no_mux"
+    };
     crate::ops_log::log(
         "SSH",
         &format!(
-            "side-channel ssh done ms={} status={:?} stdout_len={}",
-            t0.elapsed().as_millis(),
+            "side-channel ssh done ms={ms} status={:?} stdout_len={} hint={mux_hint}",
             output.status,
             stdout.len()
         ),
