@@ -3,6 +3,7 @@ mod auth;
 mod config;
 mod cwd;
 mod error;
+mod external_sftp;
 mod ops_log;
 mod session;
 mod ssh;
@@ -56,6 +57,8 @@ pub fn run() {
             ops_log::ops_log_info,
             ops_log::open_ops_log_dir,
             ssh::openssh::check_ssh,
+            external_sftp::detect_xftp,
+            external_sftp::launch_xftp,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AnchorTerm");

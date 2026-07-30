@@ -168,6 +168,20 @@ fn prepare_secure_key(
     src: &Path,
     passphrase: Option<&str>,
 ) -> Result<SecureKeyMaterial, AppError> {
+    let dest = export_clear_openssh_key(src, passphrase, "anchorterm-key")?;
+    Ok(SecureKeyMaterial { path: dest })
+}
+
+/// Export an **unencrypted** OpenSSH private key to a temp PEM (ACL locked).
+///
+/// Used by interactive SSH and by external tools (e.g. Xftp) so the user is not
+/// asked for the key passphrase again. Caller owns deletion of the returned path
+/// (or wrap in [`SecureKeyMaterial`]).
+pub(crate) fn export_clear_openssh_key(
+    src: &Path,
+    passphrase: Option<&str>,
+    file_prefix: &str,
+) -> Result<PathBuf, AppError> {
     if !src.is_file() {
         return Err(AppError::Auth(format!(
             "找不到私钥文件: {}",
@@ -180,7 +194,13 @@ fn prepare_secure_key(
         .to_openssh(russh::keys::ssh_key::LineEnding::LF)
         .map_err(|e| AppError::Auth(format!("导出私钥为 OpenSSH 格式失败: {e}")))?;
 
-    let dest = std::env::temp_dir().join(format!("anchorterm-key-{}.pem", Uuid::new_v4()));
+    // Prefer app-local tmp for external tools so cleanup sweeps are consistent.
+    let dest = external_key_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join(format!("{file_prefix}-{}.pem", Uuid::new_v4()));
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     std::fs::write(&dest, openssh_pem.as_bytes()).map_err(|e| {
         AppError::Ssh(format!(
             "无法写入解密后的私钥临时文件: {e} (dest: {})",
@@ -202,11 +222,19 @@ fn prepare_secure_key(
         ),
     );
 
-    Ok(SecureKeyMaterial { path: dest })
+    Ok(dest)
+}
+
+fn external_key_dir() -> Result<PathBuf, AppError> {
+    let base = dirs::data_local_dir()
+        .ok_or_else(|| AppError::Io("无法解析 %LOCALAPPDATA%".into()))?;
+    let dir = base.join("AnchorTerm").join("tmp").join("keys");
+    std::fs::create_dir_all(&dir).map_err(|e| AppError::Io(format!("创建密钥临时目录失败: {e}")))?;
+    Ok(dir)
 }
 
 /// Restrict ACL so OpenSSH on Windows accepts the key file.
-fn lockdown_private_key_acl(path: &Path) {
+pub(crate) fn lockdown_private_key_acl(path: &Path) {
     let dest_s = path.display().to_string();
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "User".into());
 

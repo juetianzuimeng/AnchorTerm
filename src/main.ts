@@ -292,10 +292,13 @@ const SETTINGS_STORE_KEY = "anchorterm.settings.v1";
 interface AppUiSettings {
   /** After each Shell draft command finishes, print a green separator line. */
   cmdSeparator: boolean;
+  /** On first Connected of a tab, auto-launch Xftp (once per tab lifetime). */
+  xftpAutoLaunch: boolean;
 }
 
 const DEFAULT_SETTINGS: AppUiSettings = {
   cmdSeparator: false,
+  xftpAutoLaunch: false,
 };
 
 function loadAppSettings(): AppUiSettings {
@@ -305,6 +308,7 @@ function loadAppSettings(): AppUiSettings {
     const parsed = JSON.parse(raw) as Partial<AppUiSettings>;
     return {
       cmdSeparator: Boolean(parsed?.cmdSeparator),
+      xftpAutoLaunch: Boolean(parsed?.xftpAutoLaunch),
     };
   } catch {
     return { ...DEFAULT_SETTINGS };
@@ -337,6 +341,26 @@ function syncCmdSeparatorMenu() {
   if (!btn) return;
   const on = isCmdSeparatorEnabled();
   btn.setAttribute("aria-checked", on ? "true" : "false");
+}
+
+function isXftpAutoLaunchEnabled(): boolean {
+  return appSettings.xftpAutoLaunch;
+}
+
+function setXftpAutoLaunchEnabled(on: boolean) {
+  appSettings = { ...appSettings, xftpAutoLaunch: on };
+  saveAppSettings(appSettings);
+  syncXftpAutoMenu();
+  opsLog("UI", "xftp_auto_toggle", { enabled: on });
+}
+
+function syncXftpAutoMenu() {
+  const on = isXftpAutoLaunchEnabled();
+  document
+    .querySelectorAll("#menu-xftp-auto, .menu-xftp-auto-mirror")
+    .forEach((btn) => {
+      btn.setAttribute("aria-checked", on ? "true" : "false");
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -787,6 +811,8 @@ class SessionView {
   cwd: string | null = null;
   message: string | null = null;
   lastForm: ConnectFormSnapshot | null = null;
+  /** True after auto-launch Xftp was attempted for this tab (once per lifetime). */
+  xftpAutoLaunched = false;
 
   term: Terminal;
   fitAddon: FitAddon;
@@ -2419,6 +2445,97 @@ async function connectWithForm(opts: {
   }
 }
 
+type LaunchXftpResult = {
+  executable: string;
+  xfp_path: string;
+  host: string;
+  port: number;
+  username: string;
+  remote: string | null;
+  auth_mode: string;
+  user_key_name?: string | null;
+  user_hint: string;
+};
+
+/** Open external Xftp for a session (host/user/port/cwd; pubkey uses clear temp key). */
+async function openXftpForSession(
+  sessionId: string,
+  opts?: { silent?: boolean; reason?: string },
+): Promise<boolean> {
+  const view = sessions.get(sessionId);
+  if (!view) {
+    if (!opts?.silent) showToast("会话不存在");
+    return false;
+  }
+  if (!view.isLive()) {
+    if (!opts?.silent) showToast("请先连接会话后再打开 Xftp");
+    return false;
+  }
+  opsLog("UI", "open_xftp", {
+    sid: view.sessionId.slice(0, 8),
+    host: view.host || undefined,
+    reason: opts?.reason || "manual",
+  });
+  try {
+    const r = await invoke<LaunchXftpResult>("launch_xftp", {
+      sessionId: view.sessionId,
+    });
+    const remoteHint = r.remote ? ` · ${r.remote}` : "";
+    const hint = r.user_hint ? ` — ${r.user_hint}` : "";
+    showToast(`已打开 Xftp：${r.username}@${r.host}${remoteHint}${hint}`);
+    opsLog("UI", "open_xftp ok", {
+      host: r.host,
+      port: r.port,
+      user: r.username,
+      remote: r.remote,
+      auth_mode: r.auth_mode,
+      user_key_name: r.user_key_name ?? null,
+      exe: r.executable,
+      reason: opts?.reason || "manual",
+    });
+    return true;
+  } catch (e) {
+    const msg = String(e);
+    opsLog("ERR", "open_xftp failed", {
+      error: msg,
+      reason: opts?.reason || "manual",
+    });
+    if (!opts?.silent) {
+      showToast(msg.replace(/^[^:]+:\s*/, "") || msg);
+    } else {
+      showToast(`自动打开 Xftp 失败：${msg.replace(/^[^:]+:\s*/, "") || msg}`);
+    }
+    return false;
+  }
+}
+
+async function openXftpForActive() {
+  const view = getActive();
+  if (!view) {
+    showToast("请先打开并连接一个会话");
+    return;
+  }
+  await openXftpForSession(view.sessionId, { reason: "manual" });
+}
+
+/**
+ * After first Connected of a tab: optional auto-launch (once).
+ * Slight delay so cwd seed / restore can fill Remote= path.
+ */
+function maybeAutoLaunchXftp(view: SessionView) {
+  if (!isXftpAutoLaunchEnabled()) return;
+  if (view.xftpAutoLaunched) return;
+  if (!view.isLive()) return;
+  view.xftpAutoLaunched = true;
+  window.setTimeout(() => {
+    if (!sessions.has(view.sessionId) || !view.isLive()) return;
+    void openXftpForSession(view.sessionId, {
+      reason: "auto_on_connect",
+      silent: true,
+    });
+  }, 700);
+}
+
 async function disconnectActive() {
   const view = getActive();
   if (!view) {
@@ -2837,6 +2954,17 @@ async function handleMenuAction(action: string) {
     case "disconnect":
       await disconnectActive();
       break;
+    case "open-xftp":
+      await openXftpForActive();
+      break;
+    case "toggle-xftp-auto":
+      setXftpAutoLaunchEnabled(!isXftpAutoLaunchEnabled());
+      showToast(
+        isXftpAutoLaunchEnabled()
+          ? "已启用：连接成功后自动打开 Xftp（每标签一次）"
+          : "已关闭：连接后自动打开 Xftp",
+      );
+      break;
     case "reconnect": {
       if (!active || !active.canReconnectSameTab()) {
         showToast("当前标签无法重新连接（需先断开或处于失败状态）");
@@ -3106,6 +3234,7 @@ async function setupEvents() {
         requestAnimationFrame(() => {
           if (activeSessionId === sid) view.fitAndResize();
         });
+        maybeAutoLaunchXftp(view);
       }
     },
   );
@@ -3132,6 +3261,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   syncGlobalStatusBar();
   setupMenubar();
   syncCmdSeparatorMenu();
+  syncXftpAutoMenu();
   setupShortcuts();
   await setupEvents();
 

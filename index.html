@@ -59,11 +59,51 @@
               <button type="button" data-action="reconnect" role="menuitem">重新连接</button>
               <button type="button" data-action="close-tab" role="menuitem">关闭标签 <span class="accel">Ctrl+W</span></button>
               <button type="button" data-action="session-props" role="menuitem">会话属性…</button>
+              <hr />
+              <button
+                type="button"
+                data-action="open-xftp"
+                id="menu-open-xftp"
+                role="menuitem"
+                title="用当前连接信息打开 Xftp（需已连接；公钥会话会尽量免输密钥口令）"
+              >
+                打开 Xftp…
+              </button>
+              <button
+                type="button"
+                data-action="toggle-xftp-auto"
+                id="menu-xftp-auto"
+                role="menuitemcheckbox"
+                aria-checked="false"
+                title="连接成功后自动打开 Xftp（每个标签只自动一次；重连不再弹）"
+              >
+                <span class="menu-check" aria-hidden="true"></span>
+                <span class="menu-label">连接后自动打开 Xftp</span>
+              </button>
             </div>
           </div>
           <div class="menu-item" data-menu="tools">
             <button type="button" class="menu-btn" role="menuitem">工具(T)</button>
             <div class="menu-dropdown" role="menu">
+              <button
+                type="button"
+                data-action="open-xftp"
+                role="menuitem"
+                title="用当前连接信息打开 Xftp（需已连接）"
+              >
+                打开 Xftp…
+              </button>
+              <button
+                type="button"
+                data-action="toggle-xftp-auto"
+                role="menuitemcheckbox"
+                aria-checked="false"
+                class="menu-xftp-auto-mirror"
+                title="连接成功后自动打开 Xftp（每个标签只自动一次）"
+              >
+                <span class="menu-check" aria-hidden="true"></span>
+                <span class="menu-label">连接后自动打开 Xftp</span>
+              </button>
               <button type="button" data-action="open-logs" role="menuitem">打开操作日志目录</button>
               <button type="button" disabled title="后续版本" role="menuitem">密钥管理</button>
             </div>
