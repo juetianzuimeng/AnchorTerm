@@ -12,7 +12,8 @@ use serde::Serialize;
 use tracing::debug;
 
 const COMPLETE_TIMEOUT: Duration = Duration::from_secs(6);
-const MAX_CANDIDATES: usize = 200;
+/// Cap for UI candidates and token-scoped `compgen` output (not dir/cmd inventory).
+pub const MAX_CANDIDATES: usize = 200;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CompleteResult {
@@ -95,7 +96,8 @@ where
     apply_candidates(line, cursor, token_start, token_end, &token, &raw)
 }
 
-fn apply_candidates(
+/// Parse remote `compgen` stdout and apply common-prefix / single match.
+pub fn apply_candidates(
     line: String,
     cursor: usize,
     token_start: usize,
@@ -103,8 +105,30 @@ fn apply_candidates(
     token: &str,
     raw: &str,
 ) -> Result<CompleteResult, String> {
+    let candidates = parse_candidates(raw);
+    Ok(apply_candidate_list(
+        line,
+        cursor,
+        token_start,
+        token_end,
+        token,
+        candidates,
+    ))
+}
+
+/// **Only** construction path for hybrid local hits and remote candidate lists.
+///
+/// Sorts/dedups/truncates, applies common-prefix / single match, and updates
+/// `token_end` for frontend multi-candidate cycling.
+pub fn apply_candidate_list(
+    line: String,
+    cursor: usize,
+    token_start: usize,
+    token_end: usize,
+    token: &str,
+    mut candidates: Vec<String>,
+) -> CompleteResult {
     let chars: Vec<char> = line.chars().collect();
-    let mut candidates = parse_candidates(raw);
     candidates.sort();
     candidates.dedup();
     if candidates.len() > MAX_CANDIDATES {
@@ -120,13 +144,13 @@ fn apply_candidates(
                 crate::ops_log::text_preview(line.as_bytes(), 120)
             ),
         );
-        return Ok(CompleteResult {
+        return CompleteResult {
             line,
             cursor,
             candidates,
             token_start,
             token_end,
-        });
+        };
     }
 
     let common = common_prefix(&candidates);
@@ -166,13 +190,13 @@ fn apply_candidates(
         ),
     );
 
-    Ok(CompleteResult {
+    CompleteResult {
         line: new_line,
         cursor: new_cursor,
         candidates,
         token_start,
         token_end: new_token_end,
-    })
+    }
 }
 
 /// Locate the token under/before the cursor (whitespace-separated; no quote parse v1).
@@ -180,7 +204,7 @@ fn apply_candidates(
 /// - **Match prefix** = text from word start → cursor (what the user typed).
 /// - **Replace range** = whole word start → first whitespace after cursor, so
 ///   characters after the caret in the same word are not left as a ghost suffix.
-fn analyze_token(chars: &[char], cursor: usize) -> (usize, usize, String, String, bool, bool) {
+pub fn analyze_token(chars: &[char], cursor: usize) -> (usize, usize, String, String, bool, bool) {
     let mut start = cursor;
     while start > 0 && !chars[start - 1].is_whitespace() {
         start -= 1;
@@ -202,7 +226,7 @@ fn analyze_token(chars: &[char], cursor: usize) -> (usize, usize, String, String
 
 /// Build: `echo SCRIPT_B64 | base64 -d | bash --noprofile --norc`
 /// so we never nest shell quotes around user-controlled paths.
-fn build_exec_command(cwd: &str, token: &str, is_first_word: bool, prefer_dirs: bool) -> String {
+pub fn build_exec_command(cwd: &str, token: &str, is_first_word: bool, prefer_dirs: bool) -> String {
     let mode = if is_first_word {
         "cmd"
     } else if prefer_dirs {
@@ -271,15 +295,100 @@ exit 0
         max = MAX_CANDIDATES,
     );
 
+    wrap_remote_bash_script(&script)
+}
+
+pub(crate) fn b64(data: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// Wrap a bash script body the same way as token-scoped complete (base64 | bash).
+pub fn wrap_remote_bash_script(script: &str) -> String {
     let script_b64 = b64(script.as_bytes());
-    // Prefer base64 -d; some systems use -D or openssl.
     format!(
         "echo {script_b64} | (base64 -d 2>/dev/null || base64 --decode 2>/dev/null || openssl base64 -d -A 2>/dev/null) | bash --noprofile --norc"
     )
 }
 
-fn b64(data: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(data)
+/// Remote directory inventory for the hybrid cache (not for Tab-critical path).
+///
+/// Output protocol:
+/// - `ERR_CD` | `ERR_LIST` | `OK`
+/// - if OK: `FULL` | `TRUNCATED`
+/// - then lines: `d\tbasename` or `f\tbasename`
+pub fn build_list_dir_command(abs_dir: &str, max: usize) -> String {
+    let script = format!(
+        r#"set +e
+b64d() {{
+  if command -v base64 >/dev/null 2>&1; then
+    printf '%s' "$1" | base64 -d 2>/dev/null || printf '%s' "$1" | base64 --decode 2>/dev/null
+  elif command -v openssl >/dev/null 2>&1; then
+    printf '%s' "$1" | openssl base64 -d -A 2>/dev/null
+  else
+    printf ''
+  fi
+}}
+DIR=$(b64d '{dir_b64}')
+MAX={max}
+if ! cd -- "$DIR" 2>/dev/null; then
+  printf '%s\n' 'ERR_CD'
+  exit 0
+fi
+# Prefer find; BusyBox/no-find → ls -1A. Include hidden; skip . and ..
+if command -v find >/dev/null 2>&1; then
+  list=$(find . -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null || find . -mindepth 1 -maxdepth 1 2>/dev/null | sed 's|^\./||')
+else
+  list=$(ls -1A 2>/dev/null)
+fi
+total=$(printf '%s\n' "$list" | awk 'NF' | wc -l | tr -d ' ')
+printf '%s\n' 'OK'
+if [ "${{total:-0}}" -gt "$MAX" ] 2>/dev/null; then
+  printf 'TRUNCATED\n'
+else
+  printf 'FULL\n'
+fi
+printf '%s\n' "$list" | awk 'NF' | sort -u | head -n "$MAX" | while IFS= read -r name; do
+  case "$name" in
+    *$'\t'*|*$'\n'*) continue ;;
+  esac
+  if [ -d "$name" ]; then
+    printf 'd\t%s\n' "$name"
+  else
+    printf 'f\t%s\n' "$name"
+  fi
+done
+exit 0
+"#,
+        dir_b64 = b64(abs_dir.as_bytes()),
+        max = max,
+    );
+    wrap_remote_bash_script(&script)
+}
+
+/// Dedicated command inventory for CommandCache fill (`max` = MAX_CMD_ENTRIES, not 200).
+pub fn build_cmd_list_command(max: usize) -> String {
+    let script = format!(
+        r#"set +e
+MAX={max}
+out=''
+if command -v compgen >/dev/null 2>&1; then
+  out=$( {{ compgen -c; compgen -a; compgen -A function; }} 2>/dev/null)
+else
+  out=$(printf '%s\n' ls cd pwd cat cp mv rm mkdir touch grep find echo head tail less more vim nano vi ssh scp tar gzip unzip wget curl docker git python python3 node npm cargo go make)
+fi
+total=$(printf '%s\n' "$out" | awk 'NF' | sort -u | wc -l | tr -d ' ')
+printf '%s\n' 'OK'
+if [ "${{total:-0}}" -gt "$MAX" ] 2>/dev/null; then
+  printf 'TRUNCATED\n'
+else
+  printf 'FULL\n'
+fi
+printf '%s\n' "$out" | awk 'NF' | sort -u | head -n "$MAX"
+exit 0
+"#,
+        max = max,
+    );
+    wrap_remote_bash_script(&script)
 }
 
 fn parse_candidates(raw: &str) -> Vec<String> {
@@ -290,7 +399,7 @@ fn parse_candidates(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn common_prefix(items: &[String]) -> String {
+pub fn common_prefix(items: &[String]) -> String {
     if items.is_empty() {
         return String::new();
     }

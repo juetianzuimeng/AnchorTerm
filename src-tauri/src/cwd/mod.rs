@@ -643,6 +643,14 @@ fn normalize_abs(path: &str) -> String {
     normalize_abs_path(Path::new(path))
 }
 
+/// Normalize a remote POSIX absolute path (collapse `.`/`..`, force `/` separators).
+///
+/// Shared by CWD tracking and Tab-complete directory cache keys. Must not emit
+/// Windows backslash keys.
+pub fn normalize_remote_abs(path: &str) -> String {
+    normalize_abs(path)
+}
+
 /// Best-effort `$HOME` from a known absolute path like `/home/user/...` or `/root/...`.
 fn guess_home_from_path(path: &str) -> Option<String> {
     let path = path.trim();

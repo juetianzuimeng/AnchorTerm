@@ -128,6 +128,8 @@ async fn connect_inner(
         rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
         // New credentials / endpoint → do not reuse old decrypted temp key.
         rt.clear_side_channel_key();
+        // Drop previous host's directory/command completion cache.
+        crate::ssh::complete_cache::clear_session_cache(&rt);
 
         // Restore path priority:
         // 1) In-memory restore_target / last_known when this runtime already
@@ -328,12 +330,11 @@ async fn connect_inner(
                 run_restore_playbook(app, &rt).await;
                 // If the PTY died mid-restore, do **not** report Ok — the reconnect
                 // loop must keep retrying (log: false "重连成功" while transport=None).
-                if !session_still_connected(&rt)
-                    || rt.transport.lock().map(|t| t.is_none()).unwrap_or(true)
-                {
+                // Prefer pty_is_live (transport + alive) — not only meta.state.
+                if !rt.pty_is_live() {
                     crate::ops_log::log(
                         "SSH",
-                        "connect_inner: transport gone after restore; treating as connect failure",
+                        "connect_inner: PTY gone after restore; treating as connect failure",
                     );
                     return Err(AppError::Connect(
                         "连接在恢复工作目录过程中断开".into(),
@@ -392,9 +393,17 @@ fn paths_equal(a: &str, b: &str) -> bool {
     trim_slash(a) == trim_slash(b)
 }
 
+/// True when UI/meta claims Connected **and** the interactive PTY is still live.
+///
+/// Checking only `meta.state` caused a false "重连成功" window: child died or
+/// transport was cleared while state stayed Connected → submit_line returned
+/// `NOT_CONNECTED` even though the status bar said connected.
 fn session_still_connected(rt: &SessionRuntime) -> bool {
-    let meta = rt.meta.lock().expect("meta lock");
-    matches!(meta.state, SessionState::Connected)
+    let meta_ok = {
+        let meta = rt.meta.lock().expect("meta lock");
+        matches!(meta.state, SessionState::Connected)
+    };
+    meta_ok && rt.pty_is_live()
 }
 
 async fn send_pty_bytes(rt: &SessionRuntime, data: Vec<u8>) -> bool {
@@ -517,6 +526,10 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
             config::clear_last_cwd(&host, &user);
         }
         emit_cwd(app, rt, "");
+        if !restore_still_valid(rt, gen) || !rt.pty_is_live() {
+            abort_stale_restore(rt, gen, "dir missing and PTY dead");
+            return;
+        }
         set_state(
             app,
             rt,
@@ -544,10 +557,11 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
 
     if !send_pty_bytes(rt, cmd.clone().into_bytes()).await {
         rt.cwd_freeze.store(false, Ordering::SeqCst);
-        if !restore_still_valid(rt, gen) {
+        if !restore_still_valid(rt, gen) || !rt.pty_is_live() {
             abort_stale_restore(rt, gen, "send cd failed / disconnected");
             return;
         }
+        // PTY still live but write failed transiently — keep Connected only if live.
         set_state(
             app,
             rt,
@@ -594,7 +608,7 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
         rt.cwd_freeze.store(true, Ordering::SeqCst);
         if !send_pty_bytes(rt, cmd.into_bytes()).await {
             rt.cwd_freeze.store(false, Ordering::SeqCst);
-            if !restore_still_valid(rt, gen) {
+            if !restore_still_valid(rt, gen) || !rt.pty_is_live() {
                 abort_stale_restore(rt, gen, "retry cd failed / disconnected");
                 return;
             }
@@ -616,6 +630,12 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     }
 
     // Bookkeeping: prefer target path for next disconnect restore.
+    // Never repaint Connected if the PTY already died (finish_session may have
+    // taken transport while we were waiting on timers).
+    if !restore_still_valid(rt, gen) || !rt.pty_is_live() {
+        abort_stale_restore(rt, gen, "before final Connected paint");
+        return;
+    }
     if let Ok(mut tracker) = rt.cwd.lock() {
         tracker.set(path.clone());
     }
@@ -631,6 +651,14 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
         Some(format!("已恢复工作目录: {path}")),
     );
     info!(path = %path, retry = need_retry, "restore playbook done");
+    if path.starts_with('/') {
+        // Prefer Arc from AppState if available; otherwise skip prefetch (non-fatal).
+        if let Some(state) = app.try_state::<AppState>() {
+            if let Ok(rt_arc) = state.get_runtime(&rt.id) {
+                crate::ssh::complete_cache::schedule_prefetch_cwd(rt_arc, &path);
+            }
+        }
+    }
     rt.cwd_freeze.store(false, Ordering::SeqCst);
     end_reconnect_ui_mute(rt).await;
 }
@@ -796,6 +824,7 @@ fn schedule_seed_login_pwd(app: &AppHandle, rt: Arc<SessionRuntime>, delay_ms: u
                 }
                 emit_cwd(&app, &rt, &path);
                 emit_state(&app, &rt);
+                crate::ssh::complete_cache::schedule_prefetch_cwd(Arc::clone(&rt), &path);
                 debug!("seeded login pwd");
             }
             Err(e) => debug!(error = %e, "seed login pwd failed"),
@@ -1049,6 +1078,7 @@ fn close_session_inner(
     rt.cwd_freeze.store(false, Ordering::SeqCst);
     rt.set_ui_mute(false);
     rt.clear_side_channel_key();
+    crate::ssh::complete_cache::clear_session_cache(&rt);
     shutdown_session_mux(&rt);
     // 5: take transport → Drop SecureKeyMaterial
     let transport = rt.transport.lock().expect("transport lock").take();
@@ -1096,6 +1126,7 @@ fn disconnect_inner(rt: &SessionRuntime, app: &AppHandle) -> Result<(), AppError
 
     // Freeze absolute cwd so the next user-initiated connect can restore it.
     freeze_restore_target_from_cwd(rt, "manual disconnect");
+    crate::ssh::complete_cache::clear_session_cache(rt);
     shutdown_session_mux(rt);
 
     let transport = rt.transport.lock().expect("transport lock").take();
@@ -1283,10 +1314,23 @@ async fn submit_line_inner(
 
     let (stdin, alive) = {
         let transport = rt.transport.lock().expect("transport lock");
-        transport
-            .as_ref()
-            .ok_or(AppError::NotConnected)?
-            .clone_writer()
+        match transport.as_ref() {
+            Some(t) if t.is_alive() => t.clone_writer(),
+            Some(_) => {
+                crate::ops_log::log(
+                    "ERR",
+                    "submit_line: transport present but ssh child not alive (stale Connected UI?)",
+                );
+                return Err(AppError::NotConnected);
+            }
+            None => {
+                crate::ops_log::log(
+                    "ERR",
+                    "submit_line: no transport (UI may still show Connected)",
+                );
+                return Err(AppError::NotConnected);
+            }
+        }
     };
 
     // Optionally chain an end-of-command marker (rewritten to a green line in on_data).
@@ -1364,6 +1408,10 @@ async fn submit_line_inner(
         );
     }
 
+    // PR4: drop dir/cmd complete-cache entries when the submitted line may mutate
+    // the remote tree or PATH (before optimistic cwd update uses the same cwd lock).
+    crate::ssh::complete_cache::note_mutating_submit(rt, logical);
+
     // Track cwd from the submitted line (optimistic; OSC 7 / failure echo may correct).
     // IMPORTANT: release `cwd` before emit_state/snapshot — snapshot() also locks cwd
     // and std::sync::Mutex is not reentrant (deadlock froze the stdout pump after `cd`).
@@ -1412,14 +1460,14 @@ async fn complete_draft_inner(
         }
     }
 
-    let cwd = rt
-        .cwd
-        .lock()
-        .ok()
-        .and_then(|c| c.last_known().map(|s| s.to_string()));
-
-    let params = connect_params_from_cache(&rt)?;
-    let rt_exec = Arc::clone(&rt);
+    // Clone cwd + home_hint then drop lock before any await / cache work.
+    let (cwd, home_hint) = {
+        let c = rt.cwd.lock().expect("cwd lock");
+        (
+            c.last_known().map(|s| s.to_string()),
+            c.home_hint().map(|s| s.to_string()),
+        )
+    };
 
     crate::ops_log::log(
         "CMD",
@@ -1430,33 +1478,12 @@ async fn complete_draft_inner(
         ),
     );
 
-    let result = crate::ssh::complete::remote_complete_with_exec(
+    let result = crate::ssh::complete_cache::complete_with_cache(
+        Arc::clone(&rt),
         cwd,
+        home_hint,
         line,
         cursor,
-        move |command| {
-            let params = params.clone();
-            let rt_exec = Arc::clone(&rt_exec);
-            async move {
-                crate::ops_log::log(
-                    "SSH",
-                    &format!(
-                        "complete side-channel exec cmd_len={} preview=\"{}\"",
-                        command.len(),
-                        crate::ops_log::text_preview(command.as_bytes(), 100)
-                    ),
-                );
-                let cp = mux_control_path(&rt_exec);
-                crate::ssh::openssh::openssh_exec_with_key_cache(
-                    &params,
-                    &command,
-                    &rt_exec.side_channel_key,
-                    cp.as_deref(),
-                )
-                .await
-                .map_err(|e| e.to_string())
-            }
-        },
     )
     .await;
 

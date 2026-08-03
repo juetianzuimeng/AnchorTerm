@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::AuthMethod;
 use crate::cwd::CwdTracker;
 use crate::error::AppError;
+use crate::ssh::complete_cache::SessionCompleteCache;
 use crate::ssh::openssh::SecureKeyMaterial;
 use crate::ssh::transport::ActiveTransport;
 
@@ -128,6 +129,8 @@ pub struct SessionRuntime {
     pub echo_log_budget: AtomicU32,
     /// OpenSSH ControlPath for ControlMaster multiplexing (interactive + Tab complete).
     pub control_path: Mutex<Option<PathBuf>>,
+    /// Hybrid Tab completion directory/command cache (per session).
+    pub complete_cache: Mutex<SessionCompleteCache>,
     // --- post-command separator diagnostics (SEP category) ---
     /// True while we expect an OSC end-marker for the last post-sep submit.
     pub sep_pending: AtomicBool,
@@ -181,6 +184,7 @@ impl SessionRuntime {
             // Few bulk ECHO samples per connection (refilled rarely).
             echo_log_budget: AtomicU32::new(8),
             control_path: Mutex::new(None),
+            complete_cache: Mutex::new(SessionCompleteCache::default()),
             sep_pending: AtomicBool::new(false),
             sep_gen: AtomicU64::new(0),
             sep_chunks: AtomicU64::new(0),
@@ -489,6 +493,18 @@ impl SessionRuntime {
             self.cols.load(Ordering::Relaxed).max(20),
             self.rows.load(Ordering::Relaxed).max(5),
         )
+    }
+
+    /// Interactive PTY is usable: transport present **and** OpenSSH child still alive.
+    ///
+    /// UI `SessionState::Connected` can briefly lag a dead child (or restore can
+    /// repaint Connected after transport was cleared). Prefer this for writes.
+    pub fn pty_is_live(&self) -> bool {
+        self.transport
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|t| t.is_alive()))
+            .unwrap_or(false)
     }
 }
 

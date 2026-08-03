@@ -47,6 +47,11 @@ impl ActiveTransport {
     pub fn clone_writer(&self) -> (Arc<Mutex<ChildStdin>>, Arc<AtomicBool>) {
         (Arc::clone(&self.stdin), Arc::clone(&self.alive))
     }
+
+    /// True while the OpenSSH child is still considered live (stdin may be written).
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
 }
 
 /// Write to a cloned OpenSSH stdin handle.

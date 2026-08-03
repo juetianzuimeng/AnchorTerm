@@ -1560,6 +1560,16 @@ fn apply_cwd_change(
                     cwd: path.clone(),
                 },
             );
+            // Hybrid complete cache: prefetch on confirmed cwd (not CdParse).
+            if let Some(state) = app.try_state::<crate::app_state::AppState>() {
+                if let Ok(rt_arc) = state.get_runtime(&rt.id) {
+                    crate::ssh::complete_cache::on_cwd_confirmed_for_cache(
+                        rt_arc,
+                        path,
+                        ch.reason,
+                    );
+                }
+            }
         }
         Some(path) => {
             // Non-absolute (e.g. ~/x) — emit for UI but do not freeze as restore target.
