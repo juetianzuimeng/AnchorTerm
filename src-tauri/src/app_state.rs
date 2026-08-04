@@ -730,13 +730,14 @@ mod tests {
     #[test]
     fn once_suppress_disarms_after_match_so_large_output_passes() {
         let rt = SessionRuntime::new("s");
-        let suffix = b";printf '\\033]733;ATsep\\007'";
+        // Same-line short bash $'...' suffix (matches session::POST_CMD_SEP_SUFFIX).
+        let suffix = b";printf $'\\e]733;ATsep\\a'";
         rt.arm_echo_suppress_pattern(suffix.to_vec(), Duration::from_secs(5), true);
 
-        // First chunk: typed line echo with suffix — stripped, suppress disarmed.
-        let echo = b"tail -1000 big.log;printf '\\033]733;ATsep\\007'\r\n";
+        // Typed line echo with suffix — stripped, suppress disarmed.
+        let echo = b"ls;printf $'\\e]733;ATsep\\a'\r\n";
         let out1 = rt.filter_outgoing_echo(echo);
-        assert_eq!(String::from_utf8_lossy(&out1), "tail -1000 big.log\r\n");
+        assert_eq!(String::from_utf8_lossy(&out1), "ls\r\n");
         assert!(rt.echo_suppress.lock().unwrap().is_none());
 
         // Subsequent large chunk must pass through untouched (no filter).

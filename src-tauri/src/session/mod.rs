@@ -1273,19 +1273,22 @@ async fn write_inner(rt: &SessionRuntime, data_b64: String) -> Result<(), AppErr
     Ok(())
 }
 
-/// Suffix chained after the user command when "post-command separator" is on.
+/// Same-line suffix when "post-command separator" is on.
 ///
-/// Emits a private OSC that is **not** shown by xterm; `on_data` rewrites it
-/// into a green separator line. Kept short/ASCII so:
-/// - line-echo suppress matches once at the start and disarms immediately
-/// - large command output (e.g. `tail -1000`) is never scanned by the filter
-/// - command line stays well under typical terminal width (no wrap-split)
-const POST_CMD_SEP_SUFFIX: &str = ";printf '\\033]733;ATsep\\007'";
+/// Must stay on the **same** shell line as the user command (`cmd;printf…`).
+/// A second typed line caused an extra prompt after `ls`:
+///   prompt$ ls / … / prompt$ / green line / prompt$
+///
+/// Uses bash `$'...'` escapes so the suffix is short (less terminal wrap risk
+/// than `\\033` / `\\007`). If user+suffix would wrap past terminal width, we
+/// skip the remote inject rather than send a second line.
+const POST_CMD_SEP_SUFFIX: &str = ";printf $'\\e]733;ATsep\\a'";
 
 /// Submit a full draft line (appends CR). Used by draft input box.
 ///
-/// When `post_separator` is true, chains a tiny OSC marker after the user
-/// command; the UI stream rewrites that marker into a green separator line.
+/// When `post_separator` is true and the line fits the terminal width, chains a
+/// tiny OSC marker after the user command; the UI stream rewrites that marker
+/// into a green separator line.
 #[tauri::command]
 pub async fn submit_line(
     state: State<'_, AppState>,
@@ -1333,36 +1336,47 @@ async fn submit_line_inner(
         }
     };
 
-    // Optionally chain an end-of-command marker (rewritten to a green line in on_data).
-    // Cwd tracking still uses the original logical line (no suffix).
-    let to_send: String = if post_separator {
-        // Suppress only the injected suffix from remote line-echo; `once=true`
-        // so the filter disarms right after the typed line is echoed — before
-        // large stdout (tail/grep) arrives.
+    // Same-line inject only when it fits without wrap (cols leave a small margin).
+    let cols = rt.term_size().0 as usize;
+    let max_cols = cols.saturating_sub(2).max(20);
+    let would_wrap = logical.chars().count() + POST_CMD_SEP_SUFFIX.chars().count() >= max_cols;
+    let inject_sep = post_separator && !would_wrap;
+
+    let to_send: String = if inject_sep {
+        // Suppress the chained suffix from line-echo; once=true disarms before
+        // large stdout (tail/grep) so the filter does not scan bulk output.
         rt.arm_echo_suppress_pattern(
             POST_CMD_SEP_SUFFIX.as_bytes().to_vec(),
-            Duration::from_secs(3),
+            Duration::from_secs(5),
             true,
         );
         format!("{logical}{POST_CMD_SEP_SUFFIX}")
     } else {
-        // Clear any stale pending marker tracking from a previous toggle.
+        if post_separator && would_wrap {
+            crate::ops_log::log(
+                "SEP",
+                &format!(
+                    "sep_skip_wrap sid={} cols={} line_chars={}",
+                    &rt.id[..rt.id.len().min(8)],
+                    cols,
+                    logical.chars().count()
+                ),
+            );
+        }
         rt.sep_pending.store(false, std::sync::atomic::Ordering::SeqCst);
         logical.to_string()
     };
 
-    // OpenSSH -tt PTY: type the line then CR (Enter). Send as one packet first;
-    // character-by-character was not needed for stty, but we flush hard so the
-    // Windows pipe → ssh bridge does not hold the line incomplete.
+    // OpenSSH -tt PTY: type the line then CR (Enter).
     let mut payload = to_send.as_bytes().to_vec();
     payload.push(b'\r');
 
-    if post_separator {
+    if inject_sep {
         rt.sep_begin(logical, payload.len());
         crate::ops_log::log(
             "SEP",
             &format!(
-                "submit_payload sid={} suffix=\"{}\" full_preview=\"{}\"",
+                "submit_payload sid={} mode=same_line suffix=\"{}\" full_preview=\"{}\"",
                 &rt.id[..rt.id.len().min(8)],
                 POST_CMD_SEP_SUFFIX,
                 crate::ops_log::text_preview(&payload, 160)
@@ -1374,14 +1388,16 @@ async fn submit_line_inner(
         len = payload.len(),
         line = %logical,
         post_separator,
+        inject_sep,
         "submit_line → openssh stdin"
     );
     crate::ops_log::log(
         "CMD",
         &format!(
-            "submit_line line=\"{}\" post_sep={} payload_len={} hex={}",
+            "submit_line line=\"{}\" post_sep={} inject_sep={} payload_len={} hex={}",
             logical,
             post_separator,
+            inject_sep,
             payload.len(),
             crate::ops_log::hex_preview(&payload, 64)
         ),
@@ -1393,10 +1409,10 @@ async fn submit_line_inner(
     crate::ops_log::log(
         "CMD",
         &format!(
-            "submit_line ok line=\"{logical}\" post_sep={post_separator} write_ms={write_ms}"
+            "submit_line ok line=\"{logical}\" post_sep={post_separator} inject_sep={inject_sep} write_ms={write_ms}"
         ),
     );
-    if post_separator {
+    if inject_sep {
         crate::ops_log::log(
             "SEP",
             &format!(
@@ -1412,6 +1428,15 @@ async fn submit_line_inner(
     // the remote tree or PATH (before optimistic cwd update uses the same cwd lock).
     crate::ssh::complete_cache::note_mutating_submit(rt, logical);
 
+    // Snapshot cwd/home before optimistic cd so `ls` warms the pre-cd directory.
+    let (cwd_before, home_hint) = {
+        let cwd = rt.cwd.lock().expect("cwd lock");
+        (
+            cwd.last_known().map(|s| s.to_string()),
+            cwd.home_hint().map(|s| s.to_string()),
+        )
+    };
+
     // Track cwd from the submitted line (optimistic; OSC 7 / failure echo may correct).
     // IMPORTANT: release `cwd` before emit_state/snapshot — snapshot() also locks cwd
     // and std::sync::Mutex is not reentrant (deadlock froze the stdout pump after `cd`).
@@ -1419,6 +1444,11 @@ async fn submit_line_inner(
         let mut cwd = rt.cwd.lock().expect("cwd lock");
         cwd.feed_submitted_line(logical)
     };
+    let cd_optimistic_abs = change
+        .as_ref()
+        .and_then(|ch| ch.path.as_ref())
+        .filter(|p| p.starts_with('/'))
+        .cloned();
     if let Some(ch) = change {
         if let Some(ref path) = ch.path {
             crate::ops_log::log("CWD", &format!("from_cd_parse path={path}"));
@@ -1431,6 +1461,21 @@ async fn submit_line_inner(
             emit_cwd(app, rt, path);
         }
         emit_state(app, rt);
+    }
+
+    // Warm dir listing for cd / ls / ll (background; does not block PTY).
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(rt_arc) = state.get_runtime(&rt.id) {
+            crate::ssh::complete_cache::note_listing_warmup_submit(
+                rt_arc,
+                logical,
+                crate::ssh::complete_cache::ListingWarmupCtx {
+                    cwd_before: cwd_before.as_deref(),
+                    home_hint: home_hint.as_deref(),
+                    cd_optimistic_abs: cd_optimistic_abs.as_deref(),
+                },
+            );
+        }
     }
 
     Ok(())

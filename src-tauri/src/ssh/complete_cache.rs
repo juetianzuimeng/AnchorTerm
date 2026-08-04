@@ -1423,6 +1423,170 @@ pub fn schedule_prefetch_cwd(rt: Arc<SessionRuntime>, path: &str) {
     schedule_ensure_dir_listing(rt, path.to_string());
 }
 
+/// Context for submit-time directory listing warmup (`cd` / `ls` / `ll`).
+pub struct ListingWarmupCtx<'a> {
+    /// Absolute cwd (or best-known) **before** optimistic `cd` is applied.
+    pub cwd_before: Option<&'a str>,
+    pub home_hint: Option<&'a str>,
+    /// Optimistic absolute path from `feed_submitted_line` for `cd`/`pushd`.
+    pub cd_optimistic_abs: Option<&'a str>,
+}
+
+/// After a draft line is submitted: background-warm dir listings for `cd` / `ls` / `ll`.
+///
+/// - `cd` / `pushd`: list the **destination** (optimistic absolute path when known).
+/// - `ls` / `ll`: list the first path argument, or **cwd** when none.
+///
+/// Does not block the PTY. Failed `cd` may briefly warm a wrong path (TTL / next
+/// OSC path will supersede; list of a missing dir does not poison hit cache).
+pub fn note_listing_warmup_submit(rt: Arc<SessionRuntime>, line: &str, ctx: ListingWarmupCtx<'_>) {
+    if !complete_cache_enabled() {
+        return;
+    }
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return;
+    }
+
+    let first = first_shell_word(line);
+    if first.is_empty() {
+        return;
+    }
+
+    let targets = match first {
+        "cd" | "pushd" => warmup_targets_for_cd(ctx.cd_optimistic_abs, ctx.cwd_before, ctx.home_hint, line),
+        "ls" | "ll" => warmup_targets_for_ls(ctx.cwd_before, ctx.home_hint, line),
+        _ => return,
+    };
+
+    for abs in targets {
+        crate::ops_log::log(
+            "CMD",
+            &format!(
+                "complete listing_warmup first={first} dir={}",
+                crate::ops_log::text_preview(abs.as_bytes(), 80)
+            ),
+        );
+        schedule_ensure_dir_listing(Arc::clone(&rt), abs);
+    }
+}
+
+fn warmup_targets_for_cd(
+    cd_optimistic_abs: Option<&str>,
+    cwd_before: Option<&str>,
+    home_hint: Option<&str>,
+    line: &str,
+) -> Vec<String> {
+    if let Some(p) = cd_optimistic_abs.filter(|p| p.starts_with('/')) {
+        return vec![normalize_remote_abs(p)];
+    }
+    // Fallback: first non-option arg after cd/pushd (best-effort).
+    if let Some(arg) = first_path_arg_after_command(line) {
+        if let Some(abs) = resolve_listing_target(arg, cwd_before, home_hint) {
+            return vec![abs];
+        }
+    }
+    // bare `cd` / `cd ~` with no absolute path yet — warm home if known
+    if let Some(h) = home_hint.filter(|h| h.starts_with('/')) {
+        return vec![normalize_remote_abs(h)];
+    }
+    Vec::new()
+}
+
+fn warmup_targets_for_ls(
+    cwd_before: Option<&str>,
+    home_hint: Option<&str>,
+    line: &str,
+) -> Vec<String> {
+    if let Some(arg) = first_path_arg_after_command(line) {
+        if let Some(abs) = resolve_listing_target(arg, cwd_before, home_hint) {
+            return vec![abs];
+        }
+        // Unresolvable arg — still try cwd so `ls relative_unknown` warms cwd
+    }
+    if let Some(c) = abs_cwd(cwd_before, home_hint) {
+        return vec![c];
+    }
+    Vec::new()
+}
+
+/// First non-option argument after the command word (skips `-la`, `--color=auto`, etc.).
+fn first_path_arg_after_command(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    // Skip env FOO=bar
+    loop {
+        let word = rest.split_whitespace().next()?;
+        if word.contains('=') && !word.starts_with('-') && !word.starts_with('/') {
+            rest = rest[word.len()..].trim_start();
+            continue;
+        }
+        if matches!(word, "sudo" | "command" | "time" | "nohup" | "nice") {
+            rest = rest[word.len()..].trim_start();
+            while let Some(w) = rest.split_whitespace().next() {
+                if w.starts_with('-') {
+                    rest = rest[w.len()..].trim_start();
+                    if matches!(w, "-u" | "-g" | "-C" | "--user" | "--group") {
+                        if let Some(arg) = rest.split_whitespace().next() {
+                            if !arg.starts_with('-') {
+                                rest = rest[arg.len()..].trim_start();
+                            }
+                        }
+                    }
+                    continue;
+                }
+                break;
+            }
+            continue;
+        }
+        // command word (possibly /bin/ls)
+        rest = rest[word.len()..].trim_start();
+        break;
+    }
+    // Remaining: options then path
+    while let Some(w) = rest.split_whitespace().next() {
+        if w == "--" {
+            rest = rest[w.len()..].trim_start();
+            return rest.split_whitespace().next();
+        }
+        if w.starts_with('-') {
+            rest = rest[w.len()..].trim_start();
+            continue;
+        }
+        return Some(w);
+    }
+    None
+}
+
+/// Resolve a user path token to an absolute remote dir key for listing warmup.
+fn resolve_listing_target(
+    token: &str,
+    cwd: Option<&str>,
+    home_hint: Option<&str>,
+) -> Option<String> {
+    let token = token.trim().trim_matches(|c| c == '\'' || c == '"');
+    if token.is_empty() || token == "-" {
+        return abs_cwd(cwd, home_hint);
+    }
+    // ~otheruser — cannot resolve without their home
+    if is_other_user_tilde(token) {
+        return None;
+    }
+    if token == "~" {
+        return home_hint
+            .filter(|h| h.starts_with('/'))
+            .map(|h| normalize_remote_abs(h));
+    }
+    if token.starts_with("~/") || token == "~" {
+        return expand_shell_path(token, home_hint).map(|p| normalize_remote_abs(&p));
+    }
+    if token.starts_with('/') {
+        return Some(normalize_remote_abs(token));
+    }
+    // relative incl. ./ ../
+    let base = abs_cwd(cwd, home_hint)?;
+    Some(normalize_remote_abs(&format!("{base}/{token}")))
+}
+
 // --- tests ------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1675,5 +1839,63 @@ mod tests {
         assert!(listing.truncated);
         // Design lock: only !truncated listings are insertable as hits; mark_truncated
         // invalidates; ensure_dir_listing does not insert truncated entries.
+    }
+
+    #[test]
+    fn first_path_arg_skips_ls_flags() {
+        assert_eq!(first_path_arg_after_command("ls"), None);
+        assert_eq!(first_path_arg_after_command("ls -la"), None);
+        assert_eq!(first_path_arg_after_command("ll -h"), None);
+        assert_eq!(first_path_arg_after_command("ls -la /tmp"), Some("/tmp"));
+        assert_eq!(first_path_arg_after_command("ls -- /var"), Some("/var"));
+        assert_eq!(first_path_arg_after_command("ll ./src"), Some("./src"));
+        assert_eq!(first_path_arg_after_command("sudo ls -l /etc"), Some("/etc"));
+    }
+
+    #[test]
+    fn resolve_listing_target_cases() {
+        assert_eq!(
+            resolve_listing_target(".", Some("/home/u/a"), None).as_deref(),
+            Some("/home/u/a")
+        );
+        assert_eq!(
+            resolve_listing_target("./", Some("/home/u/a"), None).as_deref(),
+            Some("/home/u/a")
+        );
+        assert_eq!(
+            resolve_listing_target("..", Some("/home/u/a"), None).as_deref(),
+            Some("/home/u")
+        );
+        assert_eq!(
+            resolve_listing_target("/tmp", Some("/home/u"), None).as_deref(),
+            Some("/tmp")
+        );
+        assert_eq!(
+            resolve_listing_target("~/proj", Some("/tmp"), Some("/home/u")).as_deref(),
+            Some("/home/u/proj")
+        );
+        assert_eq!(
+            resolve_listing_target("foo", Some("/home/u/a"), None).as_deref(),
+            Some("/home/u/a/foo")
+        );
+    }
+
+    #[test]
+    fn warmup_ls_defaults_to_cwd() {
+        let t = warmup_targets_for_ls(Some("/home/u/a"), None, "ls -la");
+        assert_eq!(t, vec!["/home/u/a".to_string()]);
+        let t = warmup_targets_for_ls(Some("/home/u/a"), None, "ll /tmp");
+        assert_eq!(t, vec!["/tmp".to_string()]);
+    }
+
+    #[test]
+    fn warmup_cd_prefers_optimistic_abs() {
+        let t = warmup_targets_for_cd(
+            Some("/home/u/proj"),
+            Some("/home/u"),
+            Some("/home/u"),
+            "cd proj",
+        );
+        assert_eq!(t, vec!["/home/u/proj".to_string()]);
     }
 }
