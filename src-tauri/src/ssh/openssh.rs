@@ -57,17 +57,36 @@ impl Drop for SecureKeyMaterial {
     }
 }
 
+/// Password/secret material for OpenSSH `SSH_ASKPASS`.
+///
+/// On Windows, OpenSSH cannot `CreateProcess` a `.cmd` helper under
+/// `CREATE_NO_WINDOW` (`ssh_askpass: posix_spawnp: No such file`). We therefore
+/// point `SSH_ASKPASS` at **this executable** (a real PE) and pass the secret
+/// via a temp file + env markers that `main` handles before starting the GUI.
 struct AskPassMaterial {
-    askpass_path: PathBuf,
+    /// Real PE used as SSH_ASKPASS (usually current `anchorterm.exe`).
+    askpass_program: PathBuf,
+    /// Temp file holding the password/secret (deleted on Drop).
     secret_path: PathBuf,
 }
 
 impl Drop for AskPassMaterial {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.secret_path);
-        let _ = std::fs::remove_file(&self.askpass_path);
+        crate::ops_log::log(
+            "SSH",
+            &format!(
+                "askpass secret temp removed path={}",
+                self.secret_path.display()
+            ),
+        );
     }
 }
+
+/// Env marker: when set to `1` and secret file is present, the process acts as askpass.
+pub const ENV_ASKPASS_MODE: &str = "ANCHORTERM_SSH_ASKPASS";
+/// Env: absolute path to the temp file containing the secret (password).
+pub const ENV_ASKPASS_FILE: &str = "ANCHORTERM_ASKPASS_FILE";
 
 /// Locate system OpenSSH client. Used by interactive connect and startup check.
 pub fn find_ssh() -> Result<PathBuf, AppError> {
@@ -138,21 +157,45 @@ pub fn check_ssh() -> SshCheckResult {
 fn make_askpass(secret: &str) -> Result<AskPassMaterial, AppError> {
     let id = Uuid::new_v4();
     let dir = std::env::temp_dir();
-    let secret_path = dir.join(format!("anchorterm-sec-{id}.txt"));
-    let askpass_path = dir.join(format!("anchorterm-ask-{id}.cmd"));
+    let secret_path = dir.join(format!("anchorterm-sec-{id}.tmp"));
 
+    // Exact bytes of the password (no trailing newline forced).
     std::fs::write(&secret_path, secret.as_bytes())
         .map_err(|e| AppError::Ssh(format!("无法创建凭据临时文件: {e}")))?;
 
-    let secret_disp = secret_path.display().to_string();
-    let script = format!("@echo off\r\ntype \"{secret_disp}\"\r\n");
-    std::fs::write(&askpass_path, script)
-        .map_err(|e| AppError::Ssh(format!("无法创建 askpass: {e}")))?;
+    // Restrict ACL when possible (same spirit as private key temp files).
+    lockdown_private_key_acl(&secret_path);
+
+    let askpass_program = std::env::current_exe().map_err(|e| {
+        AppError::Ssh(format!(
+            "无法定位自身可执行文件以作为 SSH_ASKPASS: {e}"
+        ))
+    })?;
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "askpass prepared secret_id={}",
+            &id.to_string()[..8]
+        ),
+    );
 
     Ok(AskPassMaterial {
-        askpass_path,
+        askpass_program,
         secret_path,
     })
+}
+
+/// Apply askpass env to an OpenSSH child command (interactive or side-channel).
+fn apply_askpass_env(cmd: &mut Command, ap: &AskPassMaterial) {
+    cmd.env("SSH_ASKPASS", &ap.askpass_program);
+    cmd.env("SSH_ASKPASS_REQUIRE", "force");
+    // OpenSSH only uses askpass when it believes a display exists.
+    cmd.env("DISPLAY", "localhost:0");
+    cmd.env(ENV_ASKPASS_MODE, "1");
+    cmd.env(ENV_ASKPASS_FILE, &ap.secret_path);
+    // Avoid agent interfering with password-only auth.
+    cmd.env_remove("SSH_AUTH_SOCK");
 }
 
 /// Load/decrypt the private key in-process, export an **unencrypted** OpenSSH PEM
@@ -322,16 +365,17 @@ fn classify_auth_error(stderr: &str, exit: Option<i32>) -> AppError {
     }
     if l.contains("ssh_askpass") || l.contains("createprocessw failed") {
         return AppError::Auth(
-            "认证失败：无法弹出私钥口令程序（SSH_ASKPASS）。\
-             请在连接表单填写「私钥口令 / passphrase」后重试（应用会在本地解密密钥）。"
+            "认证失败：无法通过 SSH_ASKPASS 提供密码/口令（Windows 下需使用应用内置 askpass）。\
+             若使用账号密码登录：请确认已填写登录密码后重试；\
+             若使用加密私钥：请在表单填写「私钥口令 / passphrase」（应用会在本地解密密钥）。"
                 .into(),
         );
     }
     if l.contains("permission denied") || l.contains("authentication failed") {
         return AppError::Auth(
-            "认证失败：公钥被拒绝或私钥口令错误。\
-             请确认：1) 私钥与服务器 authorized_keys 匹配；2) 加密私钥已填写正确口令；\
-             3) 用户名正确（当前场景 Xshell 可用时，优先检查口令是否填入 AnchorTerm）。"
+            "认证失败：密码错误、公钥被拒绝或私钥口令错误。\
+             请确认：1) 登录密码正确；2) 或私钥与服务器 authorized_keys 匹配且口令正确；\
+             3) 用户名正确。"
                 .into(),
         );
     }
@@ -476,6 +520,7 @@ fn build_ssh_args_inner(
         AuthMethod::PublicKey {
             private_key_path,
             passphrase,
+            ..
         } => {
             // Decrypt in-app and export clear OpenSSH key — no SSH_ASKPASS needed.
             // (Windows OpenSSH cannot spawn our askpass .cmd under CREATE_NO_WINDOW.)
@@ -606,10 +651,7 @@ pub async fn connect_openssh(
     cmd.env("COLORTERM", "truecolor");
 
     if let Some(ref ap) = built.askpass {
-        cmd.env("SSH_ASKPASS", &ap.askpass_path);
-        cmd.env("SSH_ASKPASS_REQUIRE", "force");
-        cmd.env("DISPLAY", "localhost:0");
-        cmd.env_remove("SSH_AUTH_SOCK");
+        apply_askpass_env(&mut cmd, ap);
     }
 
     #[cfg(windows)]
@@ -1139,6 +1181,8 @@ fn on_data(app: &AppHandle, session_id: &str, data: &[u8]) {
     // under tail floods). Small interactive chunks only.
     let log_echo = filtered.len() <= 256;
     if !muted {
+        // MCP ring buffer (PR-M4): same bytes the user sees in the terminal.
+        crate::output_ring::push_session_output(&rt, &filtered);
         if log_echo {
             crate::ops_log::log(
                 "ECHO",
@@ -1714,6 +1758,759 @@ async fn finish_session(app: AppHandle, session_id: String, manual: bool) {
     }
 }
 
+/// Structured side-channel exec result (MCP `session_exec`).
+#[derive(Debug, Clone)]
+pub struct SideChannelExecResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    /// Reserved; truncation is applied by the caller.
+    pub truncated: bool,
+}
+
+/// Side-channel exec with optional stdin payload and raw stdout bytes (file transfer).
+#[derive(Debug, Clone)]
+pub struct SideChannelBytesResult {
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    /// True when stdout hit `max_stdout` and was cut short.
+    pub truncated: bool,
+}
+
+/// Locate system `scp` next to `ssh` (Windows OpenSSH / Git).
+pub fn find_scp() -> Result<PathBuf, AppError> {
+    let candidates = [
+        r"C:\Windows\System32\OpenSSH\scp.exe",
+        r"C:\Program Files\Git\usr\bin\scp.exe",
+    ];
+    for c in candidates {
+        if Path::new(c).is_file() {
+            return Ok(PathBuf::from(c));
+        }
+    }
+    // Same directory as ssh.exe when found via PATH.
+    if let Ok(ssh) = find_ssh() {
+        if let Some(parent) = ssh.parent() {
+            let scp = parent.join("scp.exe");
+            if scp.is_file() {
+                return Ok(scp);
+            }
+            let scp2 = parent.join("scp");
+            if scp2.is_file() {
+                return Ok(scp2);
+            }
+        }
+    }
+    which_tool("scp").ok_or_else(|| {
+        AppError::Ssh(
+            "未找到 scp.exe。请安装 Windows「OpenSSH 客户端」可选功能后再使用文件传输。"
+                .into(),
+        )
+    })
+}
+
+/// Locate optional `rsync` (Git for Windows / MSYS / WSL path). Soft-missing is OK.
+pub fn find_rsync() -> Option<PathBuf> {
+    let candidates = [
+        r"C:\Program Files\Git\usr\bin\rsync.exe",
+        r"C:\Program Files\Git\bin\rsync.exe",
+        r"C:\msys64\usr\bin\rsync.exe",
+        r"C:\cygwin64\bin\rsync.exe",
+    ];
+    for c in candidates {
+        if Path::new(c).is_file() {
+            return Some(PathBuf::from(c));
+        }
+    }
+    which_tool("rsync")
+}
+
+fn which_tool(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let p = dir.join(format!("{name}.exe"));
+        if p.is_file() {
+            return Some(p);
+        }
+        let p2 = dir.join(name);
+        if p2.is_file() {
+            return Some(p2);
+        }
+    }
+    None
+}
+
+
+
+/// Build scp argv options (no source/dest) reusing the same auth/mux as side-channel ssh.
+///
+/// Keepalive is **looser** than interactive ssh (which uses 1s×2 for dead-link UI):
+/// bulk transfers of hundreds of MB can stall briefly without being dead.
+fn build_scp_args_inner(
+    params: &ConnectParams,
+    side_key_cache: Option<&std::sync::Mutex<Option<SecureKeyMaterial>>>,
+    control_path: Option<&Path>,
+) -> Result<BuiltArgs, AppError> {
+    // scp uses -P for port (ssh uses -p). `-q` keeps stderr small so we don't
+    // buffer progress spam for multi-hundred-MB transfers.
+    let mut args = vec![
+        "-q".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+        "-o".into(),
+        "ServerAliveInterval=30".into(),
+        "-o".into(),
+        "ServerAliveCountMax=6".into(),
+        "-o".into(),
+        "TCPKeepAlive=yes".into(),
+        "-o".into(),
+        "NumberOfPasswordPrompts=1".into(),
+        "-P".into(),
+        params.port.to_string(),
+    ];
+
+    if let Some(cp) = control_path {
+        args.push("-o".into());
+        args.push("ControlMaster=auto".into());
+        args.push("-o".into());
+        args.push(format!("ControlPath={}", cp.display()));
+        args.push("-o".into());
+        args.push("ControlPersist=60".into());
+    }
+
+    let (askpass, secure_key) = match &params.auth {
+        AuthMethod::Password { password, .. } => {
+            let pw = password
+                .as_ref()
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| AppError::Auth("未提供密码".into()))?;
+            args.push("-o".into());
+            args.push("PreferredAuthentications=password".into());
+            args.push("-o".into());
+            args.push("PubkeyAuthentication=no".into());
+            (Some(make_askpass(pw)?), None)
+        }
+        AuthMethod::PublicKey {
+            private_key_path,
+            passphrase,
+            ..
+        } => {
+            let key_path = if let Some(cache) = side_key_cache {
+                let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+                if g.is_none() {
+                    *g = Some(prepare_secure_key(
+                        Path::new(private_key_path),
+                        passphrase.as_deref(),
+                    )?);
+                }
+                g.as_ref()
+                    .map(|k| k.path().display().to_string())
+                    .ok_or_else(|| AppError::Ssh("side-channel key missing".into()))?
+            } else {
+                let secure = prepare_secure_key(
+                    Path::new(private_key_path),
+                    passphrase.as_deref(),
+                )?;
+                let p = secure.path().display().to_string();
+                args.push("-i".into());
+                args.push(p);
+                args.push("-o".into());
+                args.push("IdentitiesOnly=yes".into());
+                args.push("-o".into());
+                args.push("PreferredAuthentications=publickey".into());
+                args.push("-o".into());
+                args.push("PasswordAuthentication=no".into());
+                return Ok(BuiltArgs {
+                    args,
+                    askpass: None,
+                    secure_key: Some(secure),
+                });
+            };
+            args.push("-i".into());
+            args.push(key_path);
+            args.push("-o".into());
+            args.push("IdentitiesOnly=yes".into());
+            args.push("-o".into());
+            args.push("PreferredAuthentications=publickey".into());
+            args.push("-o".into());
+            args.push("PasswordAuthentication=no".into());
+            (None, None)
+        }
+    };
+
+    Ok(BuiltArgs {
+        args,
+        askpass,
+        secure_key,
+    })
+}
+
+/// Side-channel SSH with optional stdin bytes and raw stdout (for MCP file put/get).
+pub async fn openssh_exec_bytes(
+    params: &ConnectParams,
+    remote_command: &str,
+    stdin_data: Option<&[u8]>,
+    key_cache: &std::sync::Mutex<Option<SecureKeyMaterial>>,
+    control_path: Option<&Path>,
+    timeout: Duration,
+    max_stdout: usize,
+) -> Result<SideChannelBytesResult, AppError> {
+    let ssh = find_ssh()?;
+    let t0 = Instant::now();
+    let built = build_ssh_args_inner(
+        params,
+        Some(key_cache),
+        control_path,
+        MuxRole::Slave,
+    )?;
+    let mut args = built.args;
+    args.retain(|a| a != "-tt");
+    args.push(remote_command.to_string());
+
+    let mut cmd = Command::new(&ssh);
+    cmd.args(&args)
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd.env("TERM", "xterm-256color");
+
+    if let Some(ref ap) = built.askpass {
+        apply_askpass_env(&mut cmd, ap);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "side-channel bytes exec spawn cmd_len={} stdin_len={} timeout_ms={} max_out={}",
+            remote_command.len(),
+            stdin_data.map(|d| d.len()).unwrap_or(0),
+            timeout.as_millis(),
+            max_stdout
+        ),
+    );
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError::Ssh(format!("ssh exec 启动失败: {e}")))?;
+
+    if let Some(data) = stdin_data {
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(data).await {
+                let _ = child.kill().await;
+                drop(built.askpass);
+                drop(built.secure_key);
+                return Err(AppError::Ssh(format!("ssh stdin 写入失败: {e}")));
+            }
+            // Close stdin so remote cat sees EOF.
+            drop(stdin);
+        }
+    }
+
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            drop(built.askpass);
+            drop(built.secure_key);
+            return Err(AppError::Ssh(format!("ssh exec 失败: {e}")));
+        }
+        Err(_) => {
+            // kill_on_drop will clean up; try explicit kill.
+            drop(built.askpass);
+            drop(built.secure_key);
+            crate::ops_log::log(
+                "SSH",
+                &format!(
+                    "side-channel bytes exec timeout ms={}",
+                    t0.elapsed().as_millis()
+                ),
+            );
+            return Err(AppError::Message(format!(
+                "ssh exec 超时 ({}s)",
+                timeout.as_secs()
+            )));
+        }
+    };
+
+    drop(built.askpass);
+    drop(built.secure_key);
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code();
+    let mut stdout = output.stdout;
+    let truncated = stdout.len() > max_stdout;
+    if truncated {
+        stdout.truncate(max_stdout);
+    }
+    let ms = t0.elapsed().as_millis();
+
+    if !output.status.success() {
+        let lower = stderr.to_ascii_lowercase();
+        let auth_looking = lower.contains("permission denied")
+            || lower.contains("authentication")
+            || lower.contains("unprotected private key");
+        if auth_looking && stdout.is_empty() {
+            crate::ops_log::log(
+                "ERR",
+                &format!(
+                    "ssh bytes exec auth fail status={:?} err={}",
+                    exit_code, stderr
+                ),
+            );
+            return Err(classify_auth_error(&stderr, exit_code));
+        }
+    }
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "side-channel bytes exec done ms={ms} status={:?} stdout_len={} stderr_len={} trunc={}",
+            exit_code,
+            stdout.len(),
+            stderr.len(),
+            truncated
+        ),
+    );
+
+    Ok(SideChannelBytesResult {
+        stdout,
+        stderr,
+        exit_code,
+        truncated,
+    })
+}
+
+/// Cap for scp stdout/stderr capture (quiet mode; avoid unbounded growth).
+const SCP_CAPTURE_MAX: usize = 64 * 1024;
+
+/// scp local → remote (`user@host:remote_path`).
+///
+/// `cancel`: when set to true, kills the scp child (async transfer cancel).
+/// `recursive`: allow directories (`scp -r`).
+pub async fn openssh_scp_upload(
+    params: &ConnectParams,
+    local_path: &Path,
+    remote_path: &str,
+    key_cache: &std::sync::Mutex<Option<SecureKeyMaterial>>,
+    control_path: Option<&Path>,
+    timeout: Duration,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    recursive: bool,
+) -> Result<SideChannelExecResult, AppError> {
+    if recursive {
+        if !local_path.exists() {
+            return Err(AppError::Message(format!(
+                "本地路径不存在: {}",
+                local_path.display()
+            )));
+        }
+    } else if !local_path.is_file() {
+        return Err(AppError::Message(format!(
+            "本地文件不存在: {}",
+            local_path.display()
+        )));
+    }
+    let scp = find_scp()?;
+    let built = build_scp_args_inner(params, Some(key_cache), control_path)?;
+    let mut args = built.args.clone();
+    if recursive {
+        args.insert(0, "-r".into());
+    }
+    args.push(local_path.display().to_string());
+    args.push(format!(
+        "{}@{}:{}",
+        params.username, params.host, remote_path
+    ));
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "scp upload recursive={recursive} remote_len={} timeout_s={}",
+            remote_path.len(),
+            timeout.as_secs()
+        ),
+    );
+
+    let result = run_scp_process(&scp, &args, &built, timeout, cancel, "upload").await;
+    drop(built.askpass);
+    drop(built.secure_key);
+    result
+}
+
+/// scp remote → local (`user@host:remote_path` → local_path).
+pub async fn openssh_scp_download(
+    params: &ConnectParams,
+    remote_path: &str,
+    local_path: &Path,
+    key_cache: &std::sync::Mutex<Option<SecureKeyMaterial>>,
+    control_path: Option<&Path>,
+    timeout: Duration,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    recursive: bool,
+) -> Result<SideChannelExecResult, AppError> {
+    if let Some(parent) = local_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AppError::Io(format!(
+                    "无法创建本地下载目录 {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+    }
+    if recursive {
+        let _ = std::fs::create_dir_all(local_path);
+    }
+
+    let scp = find_scp()?;
+    let built = build_scp_args_inner(params, Some(key_cache), control_path)?;
+    let mut args = built.args.clone();
+    if recursive {
+        args.insert(0, "-r".into());
+    }
+    args.push(format!(
+        "{}@{}:{}",
+        params.username, params.host, remote_path
+    ));
+    args.push(local_path.display().to_string());
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "scp download recursive={recursive} remote_len={} timeout_s={}",
+            remote_path.len(),
+            timeout.as_secs()
+        ),
+    );
+
+    let result = run_scp_process(&scp, &args, &built, timeout, cancel, "download").await;
+    drop(built.askpass);
+    drop(built.secure_key);
+    result
+}
+
+/// rsync local → remote via `rsync -e ssh` (optional; enables `--partial` resume).
+pub async fn openssh_rsync_upload(
+    params: &ConnectParams,
+    local_path: &Path,
+    remote_path: &str,
+    key_cache: &std::sync::Mutex<Option<SecureKeyMaterial>>,
+    control_path: Option<&Path>,
+    timeout: Duration,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    recursive: bool,
+    partial: bool,
+) -> Result<SideChannelExecResult, AppError> {
+    let rsync = find_rsync().ok_or_else(|| {
+        AppError::Ssh("rsync 不可用".into())
+    })?;
+    let built = build_scp_args_inner(params, Some(key_cache), control_path)?;
+    let ssh = find_ssh()?;
+    // Build ssh command string for rsync -e (Windows: quote carefully).
+    let mut e_parts = vec![format!("\"{}\"", ssh.display())];
+    e_parts.push("-o".into());
+    e_parts.push("StrictHostKeyChecking=accept-new".into());
+    e_parts.push("-o".into());
+    e_parts.push("ServerAliveInterval=30".into());
+    e_parts.push("-o".into());
+    e_parts.push("ServerAliveCountMax=6".into());
+    e_parts.push("-p".into());
+    e_parts.push(params.port.to_string());
+    // Identity from built.args: find -i
+    let mut i = 0;
+    while i < built.args.len() {
+        if built.args[i] == "-i" && i + 1 < built.args.len() {
+            e_parts.push("-i".into());
+            e_parts.push(format!("\"{}\"", built.args[i + 1]));
+            e_parts.push("-o".into());
+            e_parts.push("IdentitiesOnly=yes".into());
+            break;
+        }
+        i += 1;
+    }
+    if let Some(cp) = control_path {
+        e_parts.push("-o".into());
+        e_parts.push("ControlMaster=auto".into());
+        e_parts.push("-o".into());
+        e_parts.push(format!("ControlPath={}", cp.display()));
+    }
+    let e_ssh = e_parts.join(" ");
+
+    let mut args: Vec<String> = vec!["-a".into(), "--human-readable".into()];
+    if recursive {
+        // -a already implies recurse
+    }
+    if partial {
+        args.push("--partial".into());
+        args.push("--partial-dir=.anchorterm-rsync-partial".into());
+    }
+    args.push("-e".into());
+    args.push(e_ssh);
+    // Trailing slash semantics: for file, no trailing slash on local.
+    let local_s = local_path.display().to_string();
+    args.push(local_s);
+    args.push(format!(
+        "{}@{}:{}",
+        params.username, params.host, remote_path
+    ));
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "rsync upload recursive={recursive} partial={partial} timeout_s={}",
+            timeout.as_secs()
+        ),
+    );
+
+    let result = run_scp_process(&rsync, &args, &built, timeout, cancel, "rsync-upload").await;
+    drop(built.askpass);
+    drop(built.secure_key);
+    result
+}
+
+/// rsync remote → local (optional partial resume).
+pub async fn openssh_rsync_download(
+    params: &ConnectParams,
+    remote_path: &str,
+    local_path: &Path,
+    key_cache: &std::sync::Mutex<Option<SecureKeyMaterial>>,
+    control_path: Option<&Path>,
+    timeout: Duration,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    recursive: bool,
+    partial: bool,
+) -> Result<SideChannelExecResult, AppError> {
+    let rsync = find_rsync().ok_or_else(|| AppError::Ssh("rsync 不可用".into()))?;
+    if let Some(parent) = local_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    let built = build_scp_args_inner(params, Some(key_cache), control_path)?;
+    let ssh = find_ssh()?;
+    let mut e_parts = vec![format!("\"{}\"", ssh.display())];
+    e_parts.push("-o".into());
+    e_parts.push("StrictHostKeyChecking=accept-new".into());
+    e_parts.push("-o".into());
+    e_parts.push("ServerAliveInterval=30".into());
+    e_parts.push("-o".into());
+    e_parts.push("ServerAliveCountMax=6".into());
+    e_parts.push("-p".into());
+    e_parts.push(params.port.to_string());
+    let mut i = 0;
+    while i < built.args.len() {
+        if built.args[i] == "-i" && i + 1 < built.args.len() {
+            e_parts.push("-i".into());
+            e_parts.push(format!("\"{}\"", built.args[i + 1]));
+            e_parts.push("-o".into());
+            e_parts.push("IdentitiesOnly=yes".into());
+            break;
+        }
+        i += 1;
+    }
+    if let Some(cp) = control_path {
+        e_parts.push("-o".into());
+        e_parts.push("ControlMaster=auto".into());
+        e_parts.push("-o".into());
+        e_parts.push(format!("ControlPath={}", cp.display()));
+    }
+    let e_ssh = e_parts.join(" ");
+
+    let mut args: Vec<String> = vec!["-a".into(), "--human-readable".into()];
+    let _ = recursive;
+    if partial {
+        args.push("--partial".into());
+        args.push("--partial-dir=.anchorterm-rsync-partial".into());
+    }
+    args.push("-e".into());
+    args.push(e_ssh);
+    args.push(format!(
+        "{}@{}:{}",
+        params.username, params.host, remote_path
+    ));
+    args.push(local_path.display().to_string());
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "rsync download partial={partial} timeout_s={}",
+            timeout.as_secs()
+        ),
+    );
+
+    let result = run_scp_process(&rsync, &args, &built, timeout, cancel, "rsync-download").await;
+    drop(built.askpass);
+    drop(built.secure_key);
+    result
+}
+
+/// Spawn scp, poll for cancel/timeout, capture bounded stdout/stderr.
+async fn run_scp_process(
+    scp: &Path,
+    args: &[String],
+    built: &BuiltArgs,
+    timeout: Duration,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    op: &str,
+) -> Result<SideChannelExecResult, AppError> {
+    use std::sync::atomic::Ordering;
+
+    let t0 = Instant::now();
+    let mut cmd = Command::new(scp);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(ref ap) = built.askpass {
+        apply_askpass_env(&mut cmd, ap);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError::Ssh(format!("scp {op} 启动失败: {e}")))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_task = tokio::spawn(async move { read_pipe_capped(stdout, SCP_CAPTURE_MAX).await });
+    let stderr_task = tokio::spawn(async move { read_pipe_capped(stderr, SCP_CAPTURE_MAX).await });
+
+    loop {
+        if cancel
+            .as_ref()
+            .map(|c| c.load(Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            crate::ops_log::log(
+                "SSH",
+                &format!(
+                    "scp {op} cancelled ms={}",
+                    t0.elapsed().as_millis()
+                ),
+            );
+            return Err(AppError::Message(format!("scp {op} 已取消")));
+        }
+        if t0.elapsed() > timeout {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            crate::ops_log::log(
+                "SSH",
+                &format!(
+                    "scp {op} timeout ms={} limit_s={}",
+                    t0.elapsed().as_millis(),
+                    timeout.as_secs()
+                ),
+            );
+            return Err(AppError::Message(format!(
+                "scp {op} 超时 ({}s)",
+                timeout.as_secs()
+            )));
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout_b = stdout_task.await.unwrap_or_default();
+                let stderr_b = stderr_task.await.unwrap_or_default();
+                let stdout = String::from_utf8_lossy(&stdout_b).to_string();
+                let stderr = String::from_utf8_lossy(&stderr_b).to_string();
+                let exit_code = status.code();
+                let ms = t0.elapsed().as_millis();
+
+                if !status.success() {
+                    let lower = stderr.to_ascii_lowercase();
+                    let auth_looking = lower.contains("permission denied")
+                        || lower.contains("authentication")
+                        || lower.contains("unprotected private key");
+                    if auth_looking {
+                        return Err(classify_auth_error(&stderr, exit_code));
+                    }
+                    crate::ops_log::log(
+                        "ERR",
+                        &format!(
+                            "scp {op} failed status={:?} err={}",
+                            exit_code, stderr
+                        ),
+                    );
+                    return Err(AppError::Ssh(format!(
+                        "scp {op} 失败 (exit={exit_code:?}): {}",
+                        stderr.trim()
+                    )));
+                }
+
+                crate::ops_log::log(
+                    "SSH",
+                    &format!("scp {op} done ms={ms} status={:?}", exit_code),
+                );
+                return Ok(SideChannelExecResult {
+                    stdout,
+                    stderr,
+                    exit_code,
+                    truncated: false,
+                });
+            }
+            Ok(None) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => {
+                let _ = child.start_kill();
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(AppError::Ssh(format!("scp {op} wait 失败: {e}")));
+            }
+        }
+    }
+}
+
+async fn read_pipe_capped(
+    pipe: Option<impl tokio::io::AsyncRead + Unpin>,
+    max: usize,
+) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut out = Vec::new();
+    let Some(mut pipe) = pipe else {
+        return out;
+    };
+    let mut tmp = [0u8; 8192];
+    loop {
+        match pipe.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if out.len() < max {
+                    let take = n.min(max - out.len());
+                    out.extend_from_slice(&tmp[..take]);
+                }
+                // Keep reading to drain the pipe even after cap.
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 /// One-shot remote command via OpenSSH (non-interactive).
 #[allow(dead_code)]
 pub async fn openssh_exec(
@@ -1732,6 +2529,120 @@ pub async fn openssh_exec_with_key_cache(
     control_path: Option<&Path>,
 ) -> Result<String, AppError> {
     openssh_exec_inner(params, remote_command, Some(key_cache), control_path).await
+}
+
+/// Side-channel exec with timeout; **non-zero exit is not an error**.
+/// Auth / spawn failures still return [`AppError`].
+pub async fn openssh_exec_raw(
+    params: &ConnectParams,
+    remote_command: &str,
+    key_cache: &std::sync::Mutex<Option<SecureKeyMaterial>>,
+    control_path: Option<&Path>,
+    timeout: Duration,
+) -> Result<SideChannelExecResult, AppError> {
+    let ssh = find_ssh()?;
+    let t0 = Instant::now();
+    let built = build_ssh_args_inner(
+        params,
+        Some(key_cache),
+        control_path,
+        MuxRole::Slave,
+    )?;
+    let mut args = built.args;
+    args.retain(|a| a != "-tt");
+    args.push(remote_command.to_string());
+
+    let mut cmd = Command::new(&ssh);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd.env("TERM", "xterm-256color");
+
+    if let Some(ref ap) = built.askpass {
+        apply_askpass_env(&mut cmd, ap);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "side-channel raw exec spawn cmd_len={} timeout_ms={}",
+            remote_command.len(),
+            timeout.as_millis()
+        ),
+    );
+
+    let output = match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            drop(built.askpass);
+            drop(built.secure_key);
+            return Err(AppError::Ssh(format!("ssh exec 失败: {e}")));
+        }
+        Err(_) => {
+            drop(built.askpass);
+            drop(built.secure_key);
+            crate::ops_log::log(
+                "SSH",
+                &format!(
+                    "side-channel raw exec timeout ms={}",
+                    t0.elapsed().as_millis()
+                ),
+            );
+            return Err(AppError::Message(format!(
+                "ssh exec 超时 ({}s)",
+                timeout.as_secs()
+            )));
+        }
+    };
+
+    drop(built.askpass);
+    drop(built.secure_key);
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code();
+    let ms = t0.elapsed().as_millis();
+
+    // Treat hard auth failures as errors (same heuristics as openssh_exec_inner).
+    if !output.status.success() {
+        let lower = stderr.to_ascii_lowercase();
+        let auth_looking = lower.contains("permission denied")
+            || lower.contains("authentication")
+            || lower.contains("unprotected private key");
+        if auth_looking && stdout.trim().is_empty() {
+            crate::ops_log::log(
+                "ERR",
+                &format!("ssh raw exec auth fail status={:?} err={}", exit_code, stderr),
+            );
+            return Err(classify_auth_error(&stderr, exit_code));
+        }
+    }
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "side-channel raw exec done ms={ms} status={:?} stdout_len={} stderr_len={}",
+            exit_code,
+            stdout.len(),
+            stderr.len()
+        ),
+    );
+
+    Ok(SideChannelExecResult {
+        stdout,
+        stderr,
+        exit_code,
+        truncated: false,
+    })
 }
 
 /// Tear down a ControlMaster mux (`ssh -O exit`) and remove the control path file.
@@ -1801,9 +2712,7 @@ async fn openssh_exec_inner(
     cmd.env("TERM", "xterm-256color");
 
     if let Some(ref ap) = built.askpass {
-        cmd.env("SSH_ASKPASS", &ap.askpass_path);
-        cmd.env("SSH_ASKPASS_REQUIRE", "force");
-        cmd.env("DISPLAY", "localhost:0");
+        apply_askpass_env(&mut cmd, ap);
     }
 
     #[cfg(windows)]

@@ -273,20 +273,7 @@ async fn connect_inner(
     };
     match connect_session(app.clone(), params, rt.id.clone(), control_path).await {
         Ok(transport) => {
-            if let AuthMethod::Password {
-                password: Some(pw),
-                save_password: true,
-            } = &req.auth
-            {
-                if let Some(pid) = &req.profile_id {
-                    if let Err(e) = credentials::save_password(pid, pw) {
-                        warn!("failed to save password to keyring: {e}");
-                    } else if let Ok(Some(mut profile)) = config::get_profile(pid) {
-                        profile.has_saved_password = true;
-                        let _ = config::upsert_profile(profile);
-                    }
-                }
-            }
+            persist_secrets_after_connect(req);
 
             *rt.transport.lock().expect("transport lock") = Some(transport);
             // Fresh PTY → allow a burst of ECHO diagnostics again.
@@ -363,22 +350,201 @@ async fn connect_inner(
     }
 }
 
+/// Fill missing secrets from OS keyring when a profile_id is present.
 fn resolve_password(req: &mut ConnectRequest) -> Result<(), AppError> {
-    if let AuthMethod::Password { password, .. } = &mut req.auth {
-        if password.as_ref().map(|p| p.is_empty()).unwrap_or(true) {
-            if let Some(pid) = &req.profile_id {
-                if let Some(stored) = credentials::load_password(pid)? {
-                    *password = Some(stored);
+    match &mut req.auth {
+        AuthMethod::Password { password, .. } => {
+            let empty = password.as_ref().map(|p| p.is_empty()).unwrap_or(true);
+            if empty {
+                if let Some(pid) = &req.profile_id {
+                    match credentials::load_password(pid) {
+                        Ok(Some(stored)) if !stored.is_empty() => {
+                            crate::ops_log::log(
+                                "AUTH",
+                                &format!(
+                                    "password loaded from keyring profile={}",
+                                    &pid[..pid.len().min(8)]
+                                ),
+                            );
+                            *password = Some(stored);
+                        }
+                        Ok(None) | Ok(Some(_)) => {
+                            // Stale has_saved_password flag — clear it.
+                            if let Ok(Some(mut profile)) = config::get_profile(pid) {
+                                if profile.has_saved_password {
+                                    profile.has_saved_password = false;
+                                    let _ = config::upsert_profile(profile);
+                                    crate::ops_log::log(
+                                        "AUTH",
+                                        &format!(
+                                            "cleared stale has_saved_password profile={}",
+                                            &pid[..pid.len().min(8)]
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            crate::ops_log::log(
+                                "ERR",
+                                &format!("keyring load_password failed: {e}"),
+                            );
+                            return Err(AppError::Credential(format!(
+                                "读取已保存密码失败: {e}"
+                            )));
+                        }
+                    }
+                } else {
+                    crate::ops_log::log(
+                        "AUTH",
+                        "password empty and no profile_id — cannot use keyring",
+                    );
+                }
+            }
+            if password.as_ref().map(|p| p.is_empty()).unwrap_or(true) {
+                return Err(AppError::Auth(
+                    "未提供密码。请在连接表单输入密码；\
+                     若需记住密码，请勾选「保存登录密码」并确保已保存会话配置（或使用「保存并连接」）。\
+                     若曾保存过但失效，请重新输入密码并再次勾选保存。"
+                        .into(),
+                ));
+            }
+        }
+        AuthMethod::PublicKey { passphrase, .. } => {
+            // Empty passphrase is valid for unencrypted keys; only load from
+            // keyring when the form left it empty/absent.
+            if passphrase.as_ref().map(|p| p.is_empty()).unwrap_or(true) {
+                if let Some(pid) = &req.profile_id {
+                    match credentials::load_passphrase(pid) {
+                        Ok(Some(stored)) if !stored.is_empty() => {
+                            crate::ops_log::log(
+                                "AUTH",
+                                &format!(
+                                    "passphrase loaded from keyring profile={}",
+                                    &pid[..pid.len().min(8)]
+                                ),
+                            );
+                            *passphrase = Some(stored);
+                        }
+                        Ok(None) | Ok(Some(_)) => {
+                            if let Ok(Some(mut profile)) = config::get_profile(pid) {
+                                if profile.has_saved_passphrase {
+                                    profile.has_saved_passphrase = false;
+                                    let _ = config::upsert_profile(profile);
+                                    crate::ops_log::log(
+                                        "AUTH",
+                                        &format!(
+                                            "cleared stale has_saved_passphrase profile={}",
+                                            &pid[..pid.len().min(8)]
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            crate::ops_log::log(
+                                "ERR",
+                                &format!("keyring load_passphrase failed: {e}"),
+                            );
+                            return Err(AppError::Credential(format!(
+                                "读取已保存私钥口令失败: {e}"
+                            )));
+                        }
+                    }
                 }
             }
         }
-        if password.as_ref().map(|p| p.is_empty()).unwrap_or(true) {
-            return Err(AppError::Auth(
-                "未提供密码（且配置中无已保存密码）".into(),
-            ));
-        }
     }
     Ok(())
+}
+
+/// After a successful connect, optionally persist secrets to the keyring.
+fn persist_secrets_after_connect(req: &ConnectRequest) {
+    let Some(pid) = req.profile_id.as_ref() else {
+        if matches!(
+            &req.auth,
+            AuthMethod::Password {
+                save_password: true,
+                ..
+            } | AuthMethod::PublicKey {
+                save_passphrase: true,
+                ..
+            }
+        ) {
+            crate::ops_log::log(
+                "AUTH",
+                "save secret requested but profile_id is None — secret not persisted",
+            );
+        }
+        return;
+    };
+    match &req.auth {
+        AuthMethod::Password {
+            password: Some(pw),
+            save_password: true,
+        } if !pw.is_empty() => {
+            match credentials::save_password(pid, pw) {
+                Ok(()) => {
+                    crate::ops_log::log(
+                        "AUTH",
+                        &format!(
+                            "password saved to keyring profile={}",
+                            &pid[..pid.len().min(8)]
+                        ),
+                    );
+                    if let Ok(Some(mut profile)) = config::get_profile(pid) {
+                        profile.has_saved_password = true;
+                        profile.has_saved_passphrase = false;
+                        let _ = credentials::delete_passphrase(pid);
+                        let _ = config::upsert_profile(profile);
+                    } else {
+                        warn!(
+                            "password in keyring but profile {} missing — flag not updated",
+                            pid
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to save password to keyring: {e}");
+                    crate::ops_log::log("ERR", &format!("save_password keyring failed: {e}"));
+                }
+            }
+        }
+        AuthMethod::PublicKey {
+            passphrase: Some(pp),
+            save_passphrase: true,
+            ..
+        } if !pp.is_empty() => {
+            match credentials::save_passphrase(pid, pp) {
+                Ok(()) => {
+                    crate::ops_log::log(
+                        "AUTH",
+                        &format!(
+                            "passphrase saved to keyring profile={}",
+                            &pid[..pid.len().min(8)]
+                        ),
+                    );
+                    if let Ok(Some(mut profile)) = config::get_profile(pid) {
+                        profile.has_saved_passphrase = true;
+                        profile.has_saved_password = false;
+                        let _ = credentials::delete_password(pid);
+                        let _ = config::upsert_profile(profile);
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to save passphrase to keyring: {e}");
+                    crate::ops_log::log("ERR", &format!("save_passphrase keyring failed: {e}"));
+                }
+            }
+        }
+        AuthMethod::PublicKey {
+            save_passphrase: false,
+            ..
+        } => {
+            // Explicitly not saving: leave existing keyring entry alone.
+        }
+        _ => {}
+    }
 }
 
 /// Normalize absolute path for equality (trailing slashes).
@@ -1038,6 +1204,7 @@ pub async fn close_session(
 #[tauri::command]
 pub async fn app_quit(state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
     crate::ops_log::log("SYS", "app_quit begin");
+    crate::mcp::shutdown(&state).await;
     let ids = state.list_session_ids();
     for id in ids {
         if let Err(e) = close_session_inner(&state, &app, &id) {
@@ -1638,6 +1805,20 @@ pub async fn list_profiles() -> Result<Vec<HostProfile>, String> {
 }
 
 #[tauri::command]
+pub async fn export_profiles(
+    req: config::ExportRequest,
+) -> Result<config::ExportResult, String> {
+    config::export_profiles(req).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn import_profiles(
+    req: config::ImportRequest,
+) -> Result<config::ImportResult, String> {
+    config::import_profiles(req).map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn save_profile(req: SaveProfileRequest) -> Result<HostProfile, String> {
     save_profile_inner(req).map_err(Into::into)
 }
@@ -1664,16 +1845,68 @@ fn save_profile_inner(req: SaveProfileRequest) -> Result<HostProfile, AppError> 
         )
     };
 
-    if req.auth_type == AuthType::Password {
-        if req.save_password {
-            if let Some(pw) = req.password.as_ref().filter(|p| !p.is_empty()) {
-                credentials::save_password(&profile.id, pw)?;
-                profile.has_saved_password = true;
+    match req.auth_type {
+        AuthType::Password => {
+            // Switching to password: drop any stored key passphrase.
+            credentials::delete_passphrase(&profile.id)?;
+            profile.has_saved_passphrase = false;
+
+            if req.save_password {
+                if let Some(pw) = req.password.as_ref().filter(|p| !p.is_empty()) {
+                    credentials::save_password(&profile.id, pw)?;
+                    profile.has_saved_password = true;
+                    crate::ops_log::log(
+                        "AUTH",
+                        &format!(
+                            "profile save: password stored profile={}",
+                            &profile.id[..profile.id.len().min(8)]
+                        ),
+                    );
+                } else {
+                    // Keep only if keyring still has a real secret.
+                    let still = credentials::load_password(&profile.id)?
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    profile.has_saved_password = still;
+                    if !still {
+                        crate::ops_log::log(
+                            "AUTH",
+                            "profile save: save_password checked but no password in form/keyring",
+                        );
+                    }
+                }
+            } else {
+                credentials::delete_password(&profile.id)?;
+                profile.has_saved_password = false;
             }
         }
-    } else {
-        credentials::delete_password(&profile.id)?;
-        profile.has_saved_password = false;
+        AuthType::PublicKey => {
+            // Switching to public key: drop login password.
+            credentials::delete_password(&profile.id)?;
+            profile.has_saved_password = false;
+
+            if req.save_passphrase {
+                if let Some(pp) = req.passphrase.as_ref().filter(|p| !p.is_empty()) {
+                    credentials::save_passphrase(&profile.id, pp)?;
+                    profile.has_saved_passphrase = true;
+                    crate::ops_log::log(
+                        "AUTH",
+                        &format!(
+                            "profile save: passphrase stored profile={}",
+                            &profile.id[..profile.id.len().min(8)]
+                        ),
+                    );
+                } else {
+                    let still = credentials::load_passphrase(&profile.id)?
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    profile.has_saved_passphrase = still;
+                }
+            } else {
+                credentials::delete_passphrase(&profile.id)?;
+                profile.has_saved_passphrase = false;
+            }
+        }
     }
 
     config::upsert_profile(profile)

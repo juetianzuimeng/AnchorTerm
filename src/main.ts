@@ -43,6 +43,7 @@ interface HostProfile {
   auth_type: AuthType;
   private_key_path?: string | null;
   has_saved_password: boolean;
+  has_saved_passphrase?: boolean;
   reconnect_enabled: boolean;
 }
 
@@ -564,36 +565,93 @@ function promptSecret(opts: {
   });
 }
 
-/** Ensure public-key auth has a passphrase (prompt if form empty). Cancel → null. */
+/**
+ * Ensure public-key auth has a passphrase when needed.
+ * - Form value wins.
+ * - Only skip prompt when profile flag says keyring has it (NOT merely the
+ *   "save" checkbox — checkbox means "write after connect", not "already stored").
+ * - Otherwise prompt (empty allowed for unencrypted keys). Cancel → undefined.
+ */
 async function ensurePassphrase(
   current: string | null | undefined,
+  keyringHasSecret?: boolean,
 ): Promise<string | null | undefined> {
   if (current && current.length > 0) return current;
+  if (keyringHasSecret) {
+    opsLog("UI", "passphrase_use_keyring");
+    return null; // backend loads from keyring via profile_id
+  }
   opsLog("UI", "prompt_passphrase_before_connect");
   const entered = await promptSecret({
     title: "私钥口令",
-    label: "私钥口令 / passphrase",
-    hint: "该私钥可能已加密。口令仅用于本次连接，不会写入配置或日志。无口令可留空后确定。",
+    label: "私钥口令 / 证书密码",
+    hint: "该私钥可能已加密。口令默认不写入配置；可勾选「保存私钥口令」写入系统凭据库。无口令可留空后确定。",
     allowEmpty: true,
   });
   if (entered === null) return undefined; // cancelled
   return entered;
 }
 
-/** Ensure password auth has a password (prompt if form empty). Cancel → null. */
+/**
+ * Ensure password auth has a password when needed.
+ * - Form value wins.
+ * - Only skip prompt when profile reports keyring has a password.
+ * - "保存密码" checkbox alone must NOT skip the prompt (that was a bug).
+ */
 async function ensurePassword(
   current: string | null | undefined,
+  keyringHasSecret?: boolean,
 ): Promise<string | null | undefined> {
   if (current && current.length > 0) return current;
+  if (keyringHasSecret) {
+    opsLog("UI", "password_use_keyring");
+    return null;
+  }
   opsLog("UI", "prompt_password_before_connect");
   const entered = await promptSecret({
     title: "登录密码",
     label: "密码",
-    hint: "未填写密码且可能无已保存凭据。密码仅用于本次连接，不会写入日志。若已保存到凭据库可留空后确定。",
-    allowEmpty: true,
+    hint: "请输入登录密码。勾选「保存登录密码」可在连接成功后写入系统凭据库；下次可自动填充。",
+    allowEmpty: false,
   });
   if (entered === null) return undefined;
+  // allowEmpty false → empty string still possible if user clears; treat as cancel
+  if (!entered || entered.length === 0) {
+    return undefined;
+  }
   return entered;
+}
+
+function updateSecretSaveHints() {
+  const pwHint = document.getElementById("save-password-hint");
+  const ppHint = document.getElementById("save-passphrase-hint");
+  const savePw = ($("save-password") as HTMLInputElement).checked;
+  const savePp = ($("save-passphrase") as HTMLInputElement | null)?.checked ?? false;
+  const profile = selectedProfileId
+    ? getProfiles().find((p) => p.id === selectedProfileId)
+    : undefined;
+  const authType = ($("auth-type") as HTMLSelectElement).value as AuthType;
+
+  if (pwHint) {
+    if (authType === "password" && savePw) {
+      pwHint.hidden = false;
+      pwHint.textContent = profile?.has_saved_password
+        ? "已保存登录密码；留空（或 ******）将使用凭据库中的密码。"
+        : "勾选后，连接/保存成功会把密码写入系统凭据库。";
+    } else {
+      pwHint.hidden = true;
+    }
+  }
+  if (ppHint) {
+    if (authType === "public_key" && savePp) {
+      ppHint.hidden = false;
+      ppHint.textContent = profile?.has_saved_passphrase
+        ? "已保存私钥口令；留空（或 ******）将使用凭据库中的口令。"
+        : "勾选后，连接/保存成功会把口令写入系统凭据库。";
+    } else {
+      ppHint.hidden = true;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +663,8 @@ let propsMode: PropsMode = "create";
 /** When reconnect / edit-runtime: target session id. */
 let propsTargetSessionId: string | null = null;
 let propsConnecting = false;
+/** After closing session-props, re-open the session manager (edit/new from manager). */
+let propsReturnToManager = false;
 let mgrSelectedId: string | null = null;
 
 function setPropsError(msg: string | null) {
@@ -633,9 +693,66 @@ function readForm() {
   return { authType, host, port, username, profileName };
 }
 
+/** Shown in password/passphrase fields when a secret is stored in the keyring. */
+const SECRET_PLACEHOLDER = "******";
+
+function isSecretPlaceholder(v: string | null | undefined): boolean {
+  if (v == null) return false;
+  const t = v.trim();
+  // Common mask lengths users might see / type by habit.
+  return t === SECRET_PLACEHOLDER || /^[*•●]{4,16}$/.test(t);
+}
+
+/** Form field value for connect/save: placeholder → treat as empty (use keyring). */
+function readSecretField(id: string): string | null {
+  const el = document.getElementById(id) as HTMLInputElement | null;
+  if (!el) return null;
+  const v = el.value;
+  if (!v || isSecretPlaceholder(v)) return null;
+  return v;
+}
+
 function clearFormSecrets() {
   ($("password") as HTMLInputElement).value = "";
   ($("passphrase") as HTMLInputElement).value = "";
+}
+
+/** Fill ****** when keyring has a saved secret (never the real password). */
+function applySavedSecretMasks(p: HostProfile) {
+  const pw = $("password") as HTMLInputElement;
+  const pp = $("passphrase") as HTMLInputElement;
+  if (p.auth_type === "password" && p.has_saved_password) {
+    pw.value = SECRET_PLACEHOLDER;
+    pw.dataset.masked = "1";
+  } else {
+    pw.value = "";
+    delete pw.dataset.masked;
+  }
+  if (p.auth_type === "public_key" && p.has_saved_passphrase) {
+    pp.value = SECRET_PLACEHOLDER;
+    pp.dataset.masked = "1";
+  } else {
+    pp.value = "";
+    delete pp.dataset.masked;
+  }
+}
+
+/** Clear mask on focus so the user can type a new secret. */
+function setupSecretMaskClearOnEdit() {
+  for (const id of ["password", "passphrase"]) {
+    const el = document.getElementById(id) as HTMLInputElement | null;
+    if (!el || el.dataset.maskHooked === "1") continue;
+    el.dataset.maskHooked = "1";
+    el.addEventListener("focus", () => {
+      if (el.dataset.masked === "1" || isSecretPlaceholder(el.value)) {
+        el.value = "";
+        delete el.dataset.masked;
+      }
+    });
+    el.addEventListener("input", () => {
+      if (el.dataset.masked === "1") delete el.dataset.masked;
+    });
+  }
 }
 
 function fillFormFromProfile(p: HostProfile) {
@@ -646,9 +763,12 @@ function fillFormFromProfile(p: HostProfile) {
   ($("username") as HTMLInputElement).value = p.username;
   ($("auth-type") as HTMLSelectElement).value = p.auth_type;
   ($("private-key-path") as HTMLInputElement).value = p.private_key_path || "";
-  ($("save-password") as HTMLInputElement).checked = p.has_saved_password;
-  clearFormSecrets();
+  ($("save-password") as HTMLInputElement).checked = !!p.has_saved_password;
+  const savePp = $("save-passphrase") as HTMLInputElement | null;
+  if (savePp) savePp.checked = !!p.has_saved_passphrase;
+  applySavedSecretMasks(p);
   syncAuthFields();
+  updateSecretSaveHints();
 }
 
 function fillFormFromSnapshot(s: ConnectFormSnapshot, title?: string) {
@@ -662,8 +782,11 @@ function fillFormFromSnapshot(s: ConnectFormSnapshot, title?: string) {
   ($("private-key-path") as HTMLInputElement).value =
     s.privateKeyPath || "";
   ($("save-password") as HTMLInputElement).checked = false;
+  const savePp = $("save-passphrase") as HTMLInputElement | null;
+  if (savePp) savePp.checked = false;
   clearFormSecrets();
   syncAuthFields();
+  updateSecretSaveHints();
 }
 
 function clearForm() {
@@ -675,8 +798,11 @@ function clearForm() {
   ($("auth-type") as HTMLSelectElement).value = "password";
   ($("private-key-path") as HTMLInputElement).value = "";
   ($("save-password") as HTMLInputElement).checked = false;
+  const savePp = $("save-passphrase") as HTMLInputElement | null;
+  if (savePp) savePp.checked = false;
   clearFormSecrets();
   syncAuthFields();
+  updateSecretSaveHints();
 }
 
 function setFormReadonly(ro: boolean) {
@@ -690,6 +816,7 @@ function setFormReadonly(ro: boolean) {
     "save-password",
     "private-key-path",
     "passphrase",
+    "save-passphrase",
   ]) {
     const el = document.getElementById(id) as
       | HTMLInputElement
@@ -701,18 +828,25 @@ function setFormReadonly(ro: boolean) {
 
 /**
  * Build auth payload. For secrets missing from the form, prompts the user
- * **before** connect (never persists passphrase to profiles.json).
+ * **before** connect (or uses keyring when saved). Secrets never go into
+ * profiles.json — only Windows Credential Manager when the user opts in.
  * Returns null if validation fails or user cancels a required prompt.
  */
 async function buildAuth(
   authType: AuthType,
 ): Promise<Record<string, unknown> | null> {
+  const profile = selectedProfileId
+    ? getProfiles().find((p) => p.id === selectedProfileId)
+    : undefined;
+
   if (authType === "password") {
     const save_password = ($("save-password") as HTMLInputElement).checked;
-    let password = ($("password") as HTMLInputElement).value || null;
-    const prompted = await ensurePassword(password);
+    // ****** means "use keyring", not a literal password.
+    let password = readSecretField("password");
+    const keyringHas = !!profile?.has_saved_password;
+    const prompted = await ensurePassword(password, keyringHas);
     if (prompted === undefined) {
-      setPropsError("已取消连接");
+      setPropsError("已取消连接或未填写密码");
       return null;
     }
     password = prompted || null;
@@ -729,19 +863,26 @@ async function buildAuth(
     setPropsError("请填写私钥路径");
     return null;
   }
-  let passphrase = ($("passphrase") as HTMLInputElement).value || null;
-  const prompted = await ensurePassphrase(passphrase);
+  const save_passphrase =
+    ($("save-passphrase") as HTMLInputElement | null)?.checked ?? false;
+  let passphrase = readSecretField("passphrase");
+  const keyringHasPp = !!profile?.has_saved_passphrase;
+  const prompted = await ensurePassphrase(passphrase, keyringHasPp);
   if (prompted === undefined) {
     setPropsError("已取消连接");
     return null;
   }
   passphrase = prompted || null;
-  // Reflect into form so a retry without re-open keeps the value for this dialog session.
-  ($("passphrase") as HTMLInputElement).value = passphrase || "";
+  // Reflect real typed passphrase into form (never write ****** back as real).
+  if (passphrase && !isSecretPlaceholder(passphrase)) {
+    ($("passphrase") as HTMLInputElement).value = passphrase;
+    delete ($("passphrase") as HTMLInputElement).dataset.masked;
+  }
   return {
     type: "public_key",
     private_key_path,
     passphrase,
+    save_passphrase,
   };
 }
 
@@ -782,10 +923,14 @@ async function saveProfileFromForm(
         save_password:
           authType === "password" &&
           ($("save-password") as HTMLInputElement).checked,
+        // Placeholder ****** must not be written to keyring as a real password.
         password:
-          authType === "password"
-            ? ($("password") as HTMLInputElement).value || null
-            : null,
+          authType === "password" ? readSecretField("password") : null,
+        save_passphrase:
+          authType === "public_key" &&
+          !!($("save-passphrase") as HTMLInputElement | null)?.checked,
+        passphrase:
+          authType === "public_key" ? readSecretField("passphrase") : null,
       },
     });
     selectedProfileId = profile.id;
@@ -2331,6 +2476,24 @@ async function connectWithForm(opts: {
     setPropsError("请填写主机与用户名");
     return false;
   }
+
+  // Saving secrets requires a profile_id (keyring is keyed by profile).
+  // If user checked save but has no profile yet, persist one first.
+  const wantSavePw =
+    authType === "password" &&
+    ($("save-password") as HTMLInputElement).checked;
+  const wantSavePp =
+    authType === "public_key" &&
+    !!($("save-passphrase") as HTMLInputElement | null)?.checked;
+  if ((wantSavePw || wantSavePp) && !selectedProfileId) {
+    const p = await saveProfileFromForm(null);
+    if (!p) {
+      setPropsError("保存凭据需要先创建会话配置，请检查主机/用户名后重试");
+      return false;
+    }
+    selectedProfileId = p.id;
+  }
+
   const auth = await buildAuth(authType);
   if (!auth) return false;
 
@@ -2612,18 +2775,23 @@ async function onPropsAction(action: string) {
   if (propsConnecting) return;
 
   if (action === "save") {
-    const id =
-      propsMode === "edit-profile" ? selectedProfileId : selectedProfileId;
+    const id = selectedProfileId;
     const p = await saveProfileFromForm(id);
     if (p) {
       showToast("配置已保存");
-      if (propsMode === "edit-profile") closePropsDialog();
-      renderManagerList();
+      // edit-profile (and save-only create from manager): close props → manager
+      if (propsMode === "edit-profile" || propsReturnToManager) {
+        closePropsDialog();
+      }
+      // If still on create form without return-to-manager, keep dialog open.
+      void loadProfiles().then(() => renderManagerList());
     }
     return;
   }
 
   if (action === "save-connect") {
+    // Connecting: do not bounce back to manager.
+    propsReturnToManager = false;
     const p = await saveProfileFromForm(selectedProfileId);
     if (!p) return;
     selectedProfileId = p.id;
@@ -2635,6 +2803,8 @@ async function onPropsAction(action: string) {
   }
 
   if (action === "connect") {
+    // Connecting from create: leave manager closed.
+    propsReturnToManager = false;
     if (propsMode === "reconnect" || propsMode === "edit-runtime") {
       await connectWithForm({
         reuseSessionId: propsTargetSessionId,
@@ -2646,9 +2816,13 @@ async function onPropsAction(action: string) {
   }
 }
 
-function openPropsDialog(mode: PropsMode, opts?: { sessionId?: string }) {
+function openPropsDialog(
+  mode: PropsMode,
+  opts?: { sessionId?: string; returnToManager?: boolean },
+) {
   propsMode = mode;
   propsTargetSessionId = opts?.sessionId ?? null;
+  propsReturnToManager = !!opts?.returnToManager;
   setPropsError(null);
   setFormReadonly(false);
 
@@ -2719,6 +2893,12 @@ function closePropsDialog() {
   if (dlg.open) dlg.close();
   setFormReadonly(false);
   propsConnecting = false;
+  const backToMgr = propsReturnToManager;
+  propsReturnToManager = false;
+  if (backToMgr) {
+    // Defer so the props <dialog> fully closes before re-opening manager.
+    void Promise.resolve().then(() => openManager());
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2757,6 +2937,165 @@ async function openManager() {
   if (!dlg.open) dlg.showModal();
 }
 
+interface ProfilesExportResult {
+  json: string;
+  profileCount: number;
+  secretsCount: number;
+  includeSecrets: boolean;
+  savedPath?: string | null;
+  cancelled?: boolean;
+}
+
+interface ProfilesImportResult {
+  imported: number;
+  updated: number;
+  created: number;
+  secretsRestored: number;
+  skipped: number;
+  mode: string;
+  warnings: string[];
+}
+
+async function exportProfilesFromManager() {
+  const profiles = getProfiles();
+  if (profiles.length === 0) {
+    showToast("没有可导出的会话配置");
+    return;
+  }
+
+  // Scope: selected one vs all.
+  let profileIds: string[] | null = null;
+  if (mgrSelectedId) {
+    const sel = profiles.find((p) => p.id === mgrSelectedId);
+    const label = sel
+      ? `${sel.name}（${sel.username}@${sel.host}）`
+      : mgrSelectedId.slice(0, 8);
+    const onlySelected = window.confirm(
+      `导出范围：\n\n` +
+        `· 选「确定」：仅导出当前选中的\n  ${label}\n\n` +
+        `· 选「取消」：导出全部 ${profiles.length} 条配置`,
+    );
+    if (onlySelected) {
+      profileIds = [mgrSelectedId];
+    }
+  } else {
+    const ok = window.confirm(
+      `当前未选中配置，将导出全部 ${profiles.length} 条。\n\n` +
+        `若要导出单条，请先在列表中点选该配置再点「导出…」。\n\n继续导出全部？`,
+    );
+    if (!ok) return;
+  }
+
+  let includeSecrets = window.confirm(
+    "是否在导出文件中包含已保存的登录密码 / 私钥口令？\n\n" +
+      "· 选「确定」：便于无缝迁移（文件含敏感信息，请妥善保管）\n" +
+      "· 选「取消」：仅导出主机/用户/路径等配置，不含密码",
+  );
+  if (includeSecrets) {
+    includeSecrets = window.confirm(
+      "二次确认：导出文件将包含【明文密码/口令】。\n\n" +
+        "请勿上传网盘、邮件或提交到 Git。用完后请删除该文件。\n\n继续导出？",
+    );
+  }
+  try {
+    // Native Save As dialog (default folder: Downloads); returns absolute path.
+    const r = await invoke<ProfilesExportResult>("export_profiles", {
+      req: {
+        includeSecrets,
+        profileIds: profileIds,
+      },
+    });
+    if (r.cancelled) {
+      showToast("已取消导出");
+      return;
+    }
+    opsLog("CFG", "export_profiles_ui", {
+      count: r.profileCount,
+      secrets: r.secretsCount,
+      include_secrets: r.includeSecrets,
+      path: r.savedPath ?? null,
+      selected_only: !!profileIds,
+    });
+    const pathHint = r.savedPath ? `\n${r.savedPath}` : "";
+    showToast(
+      `已导出 ${r.profileCount} 条配置` +
+        (r.includeSecrets
+          ? `（含 ${r.secretsCount} 条明文凭据，用后请删除文件）`
+          : "（不含密码）") +
+        pathHint,
+      6000,
+    );
+  } catch (e) {
+    showToast(`导出失败: ${e}`);
+    opsLog("ERR", "export_profiles_ui_failed", { error: String(e) });
+  }
+}
+
+async function importProfilesFromManager(file: File) {
+  let text: string;
+  try {
+    text = await file.text();
+  } catch (e) {
+    showToast(`无法读取文件: ${e}`);
+    return;
+  }
+
+  const replace = window.confirm(
+    "导入模式：\n\n" +
+      "· 选「确定」：用导入内容【完全替换】当前所有会话配置（危险）\n" +
+      "· 选「取消」：【合并】导入（同 id 更新，新 id 新增）",
+  );
+  const generateNewIds =
+    !replace &&
+    window.confirm(
+      "合并时是否为导入项【全部生成新 ID】？\n\n" +
+        "· 确定：作为副本导入，不覆盖本机同 id 配置\n" +
+        "· 取消：保留文件中的 id，同 id 会覆盖本机配置",
+    );
+
+  if (
+    replace &&
+    !window.confirm("确认【替换】全部会话配置？此操作会清空当前列表（含已存凭据）后导入。")
+  ) {
+    return;
+  }
+
+  try {
+    const r = await invoke<ProfilesImportResult>("import_profiles", {
+      req: {
+        json: text,
+        mode: replace ? "replace" : "merge",
+        generateNewIds,
+      },
+    });
+    await loadProfiles();
+    renderManagerList();
+    const warnN = r.warnings?.length ?? 0;
+    opsLog("CFG", "import_profiles_ui", {
+      mode: r.mode,
+      created: r.created,
+      updated: r.updated,
+      secrets: r.secretsRestored,
+      skipped: r.skipped,
+      warnings: warnN,
+    });
+    let msg = `导入完成：新增 ${r.created}，更新 ${r.updated}`;
+    if (r.secretsRestored > 0) msg += `，恢复凭据 ${r.secretsRestored}`;
+    if (r.skipped > 0) msg += `，跳过 ${r.skipped}`;
+    showToast(msg, 4000);
+    if (warnN > 0) {
+      const sample = r.warnings.slice(0, 5).join("\n");
+      window.alert(
+        `导入注意（${warnN} 条）：\n\n${sample}` +
+          (warnN > 5 ? `\n…另有 ${warnN - 5} 条` : ""),
+      );
+    }
+  } catch (e) {
+    showToast(`导入失败: ${e}`);
+    opsLog("ERR", "import_profiles_ui_failed", { error: String(e) });
+  }
+}
+
 async function openProfileAsNewTab(p: HostProfile) {
   fillFormFromProfile(p);
   ($("dlg-session-manager") as HTMLDialogElement).close();
@@ -2766,26 +3105,27 @@ async function openProfileAsNewTab(p: HostProfile) {
     return;
   }
 
-  // Secrets are never stored in profiles.json. Always prompt before connect when needed.
+  // Secrets never live in profiles.json. Keyring (optional) or prompt.
   let auth: Record<string, unknown>;
   if (p.auth_type === "password") {
-    const prompted = await ensurePassword(null);
+    const prompted = await ensurePassword(null, !!p.has_saved_password);
     if (prompted === undefined) {
       showToast("已取消连接");
       return;
     }
     auth = {
       type: "password",
-      // empty → backend may load from Windows Credential Manager via profile_id
+      // null/empty → backend loads from Windows Credential Manager via profile_id
       password: prompted || null,
-      save_password: false,
+      // keep flag so successful connect can refresh keyring if user re-saves later
+      save_password: !!p.has_saved_password,
     };
   } else {
     if (!p.private_key_path) {
       showToast("配置缺少私钥路径");
       return;
     }
-    const prompted = await ensurePassphrase(null);
+    const prompted = await ensurePassphrase(null, !!p.has_saved_passphrase);
     if (prompted === undefined) {
       showToast("已取消连接");
       return;
@@ -2794,6 +3134,7 @@ async function openProfileAsNewTab(p: HostProfile) {
       type: "public_key",
       private_key_path: p.private_key_path,
       passphrase: prompted || null,
+      save_passphrase: !!p.has_saved_passphrase,
     };
   }
 
@@ -2881,7 +3222,12 @@ function setupMenubar() {
   document.querySelectorAll("[data-dlg-close]").forEach((el) => {
     el.addEventListener("click", () => {
       const dlg = (el as HTMLElement).closest("dialog") as HTMLDialogElement;
-      if (dlg?.id === "dlg-session-props" && propsConnecting) return;
+      if (dlg?.id === "dlg-session-props") {
+        if (propsConnecting) return;
+        // Use closePropsDialog so return-to-manager works after edit/new.
+        closePropsDialog();
+        return;
+      }
       dlg?.close();
     });
   });
@@ -3026,7 +3372,217 @@ async function handleMenuAction(action: string) {
     case "shell-integration":
       ($("dlg-shell-help") as HTMLDialogElement).showModal();
       break;
+    case "open-mcp":
+      await openMcpDialog();
+      break;
   }
+}
+
+// ---------------------------------------------------------------------------
+// MCP server dialog (PR-M1 skeleton)
+// ---------------------------------------------------------------------------
+
+interface McpStatus {
+  enabled: boolean;
+  running: boolean;
+  bindHost: string;
+  port: number;
+  actualPort?: number | null;
+  token: string;
+  endpointUrl?: string | null;
+  healthUrl?: string | null;
+  clientConfigJson: string;
+  stdioClientConfigJson?: string;
+  exePath?: string | null;
+  lastError?: string | null;
+  allowPtyTools: boolean;
+  phase: string;
+}
+
+let mcpTokenVisible = false;
+
+function applyMcpStatusToForm(st: McpStatus) {
+  const en = $("mcp-enabled") as HTMLInputElement;
+  const port = $("mcp-port") as HTMLInputElement;
+  const statusText = $("mcp-status-text") as HTMLInputElement;
+  const health = $("mcp-health-url") as HTMLInputElement;
+  const token = $("mcp-token") as HTMLInputElement;
+  const cfg = $("mcp-client-config") as HTMLTextAreaElement;
+  const stdioCfg = $("mcp-stdio-config") as HTMLTextAreaElement | null;
+  const err = $("dlg-mcp-error");
+
+  en.checked = st.enabled;
+  port.value = String(st.port);
+  const runLabel = st.running
+    ? `运行中 :${st.actualPort ?? st.port}`
+    : st.enabled
+      ? "已启用但未监听"
+      : "已停止";
+  statusText.value = `${runLabel} · ${st.phase}`;
+  health.value = st.healthUrl || "";
+  token.value = st.token || "";
+  token.type = mcpTokenVisible ? "text" : "password";
+  cfg.value = st.clientConfigJson || "";
+  if (stdioCfg) {
+    stdioCfg.value = st.stdioClientConfigJson || "";
+  }
+
+  if (st.lastError) {
+    err.hidden = false;
+    err.textContent = st.lastError;
+  } else {
+    err.hidden = true;
+    err.textContent = "";
+  }
+  updateMcpBadge(st);
+}
+
+function updateMcpBadge(st: McpStatus) {
+  const badge = $("mcp-badge");
+  if (!badge) return;
+  if (st.running) {
+    badge.hidden = false;
+    badge.classList.remove("off");
+    badge.classList.add("on");
+    const p = st.actualPort ?? st.port;
+    badge.textContent = `MCP :${p}`;
+    badge.title = `MCP 运行中 http://127.0.0.1:${p}/ · 点击菜单「工具 → MCP 服务器」`;
+  } else if (st.enabled) {
+    badge.hidden = false;
+    badge.classList.remove("on");
+    badge.classList.add("off");
+    badge.textContent = "MCP !";
+    badge.title = st.lastError
+      ? `MCP 启用失败: ${st.lastError}`
+      : "MCP 已启用但未监听";
+  } else {
+    badge.hidden = true;
+    badge.classList.remove("on");
+    badge.classList.add("off");
+    badge.textContent = "MCP";
+  }
+}
+
+async function refreshMcpStatus(): Promise<McpStatus | null> {
+  try {
+    const st = await invoke<McpStatus>("mcp_get_status");
+    updateMcpBadge(st);
+    return st;
+  } catch (e) {
+    opsLog("ERR", "mcp_get_status failed", { error: String(e) });
+    return null;
+  }
+}
+
+async function openMcpDialog() {
+  const st = await refreshMcpStatus();
+  if (!st) {
+    showToast("无法读取 MCP 状态");
+    return;
+  }
+  applyMcpStatusToForm(st);
+  ($("dlg-mcp") as HTMLDialogElement).showModal();
+}
+
+function setupMcpDialog() {
+  $("mcp-btn-show-token").addEventListener("click", () => {
+    mcpTokenVisible = !mcpTokenVisible;
+    const token = $("mcp-token") as HTMLInputElement;
+    token.type = mcpTokenVisible ? "text" : "password";
+    ($("mcp-btn-show-token") as HTMLButtonElement).textContent = mcpTokenVisible
+      ? "隐藏"
+      : "显示";
+  });
+
+  $("mcp-btn-copy-token").addEventListener("click", async () => {
+    const token = ($("mcp-token") as HTMLInputElement).value;
+    if (!token) {
+      showToast("Token 为空");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(token);
+      showToast("Token 已复制");
+    } catch {
+      showToast("无法写入剪贴板");
+    }
+  });
+
+  $("mcp-btn-copy-config").addEventListener("click", async () => {
+    const text = ($("mcp-client-config") as HTMLTextAreaElement).value;
+    if (!text) {
+      showToast("配置为空");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast("HTTP Client 配置已复制");
+    } catch {
+      showToast("无法写入剪贴板");
+    }
+  });
+
+  $("mcp-btn-copy-stdio")?.addEventListener("click", async () => {
+    const text = ($("mcp-stdio-config") as HTMLTextAreaElement).value;
+    if (!text) {
+      showToast("stdio 配置为空");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast("stdio Client 配置已复制");
+    } catch {
+      showToast("无法写入剪贴板");
+    }
+  });
+
+  $("mcp-btn-regen").addEventListener("click", async () => {
+    if (
+      !window.confirm(
+        "重新生成 Token 后，已配置的 AI Client 需要更新 Authorization。继续？",
+      )
+    ) {
+      return;
+    }
+    try {
+      const st = await invoke<McpStatus>("mcp_regenerate_token");
+      applyMcpStatusToForm(st);
+      showToast("Token 已重新生成");
+      opsLog("MCP", "ui_token_regenerated");
+    } catch (e) {
+      showToast(String(e));
+    }
+  });
+
+  $("mcp-btn-apply").addEventListener("click", async () => {
+    const enabled = ($("mcp-enabled") as HTMLInputElement).checked;
+    const portRaw = Number(($("mcp-port") as HTMLInputElement).value);
+    if (!Number.isFinite(portRaw) || portRaw < 1 || portRaw > 65535) {
+      showToast("端口无效");
+      return;
+    }
+    try {
+      const st = await invoke<McpStatus>("mcp_apply", {
+        req: { enabled, port: Math.floor(portRaw) },
+      });
+      applyMcpStatusToForm(st);
+      if (enabled && st.running) {
+        showToast(`MCP 已启动 :${st.actualPort ?? st.port}`);
+      } else if (enabled && !st.running) {
+        showToast(st.lastError || "MCP 启用失败");
+      } else {
+        showToast("MCP 已关闭");
+      }
+      opsLog("MCP", "ui_apply", {
+        enabled: st.enabled,
+        running: st.running,
+        port: st.actualPort ?? st.port,
+      });
+    } catch (e) {
+      showToast(String(e));
+      opsLog("ERR", "mcp_apply failed", { error: String(e) });
+    }
+  });
 }
 
 function setupShortcuts() {
@@ -3265,7 +3821,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupShortcuts();
   await setupEvents();
 
-  $("auth-type").addEventListener("change", () => syncAuthFields());
+  $("auth-type").addEventListener("change", () => {
+    syncAuthFields();
+    updateSecretSaveHints();
+  });
+  $("save-password").addEventListener("change", () => updateSecretSaveHints());
+  document
+    .getElementById("save-passphrase")
+    ?.addEventListener("change", () => updateSecretSaveHints());
+  setupSecretMaskClearOnEdit();
 
   $("btn-new-tab").addEventListener("click", () => openPropsDialog("create"));
   $("btn-empty-new").addEventListener("click", () => openPropsDialog("create"));
@@ -3273,7 +3837,8 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   $("mgr-btn-new").addEventListener("click", () => {
     ($("dlg-session-manager") as HTMLDialogElement).close();
-    openPropsDialog("create");
+    // Cancel / 仅保存 → return to manager; 连接 paths clear the flag.
+    openPropsDialog("create", { returnToManager: true });
   });
   $("mgr-btn-edit").addEventListener("click", () => {
     if (!mgrSelectedId) {
@@ -3284,7 +3849,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (!p) return;
     fillFormFromProfile(p);
     ($("dlg-session-manager") as HTMLDialogElement).close();
-    openPropsDialog("edit-profile");
+    openPropsDialog("edit-profile", { returnToManager: true });
   });
   $("mgr-btn-delete").addEventListener("click", async () => {
     if (!mgrSelectedId) {
@@ -3311,8 +3876,25 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (p) void openProfileAsNewTab(p);
   });
 
+  $("mgr-btn-export")?.addEventListener("click", () => {
+    void exportProfilesFromManager();
+  });
+  $("mgr-btn-import")?.addEventListener("click", () => {
+    const input = $("mgr-import-file") as HTMLInputElement;
+    input.value = "";
+    input.click();
+  });
+  $("mgr-import-file")?.addEventListener("change", () => {
+    const input = $("mgr-import-file") as HTMLInputElement;
+    const file = input.files?.[0];
+    if (file) void importProfilesFromManager(file);
+  });
+
   // Prevent form submit default
   $("form-session-props").addEventListener("submit", (e) => e.preventDefault());
+
+  setupMcpDialog();
+  void refreshMcpStatus();
 
   window.addEventListener("resize", () => {
     if (windowResizeTimer != null) window.clearTimeout(windowResizeTimer);

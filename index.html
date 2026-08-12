@@ -105,6 +105,14 @@
                 <span class="menu-label">连接后自动打开 Xftp</span>
               </button>
               <button type="button" data-action="open-logs" role="menuitem">打开操作日志目录</button>
+              <button
+                type="button"
+                data-action="open-mcp"
+                role="menuitem"
+                title="启用本机 MCP，供 AI 工具连接（默认关闭）"
+              >
+                MCP 服务器…
+              </button>
               <button type="button" disabled title="后续版本" role="menuitem">密钥管理</button>
             </div>
           </div>
@@ -122,6 +130,12 @@
           <span id="status-text">未连接</span>
           <span class="mode-badge" id="mode-badge" title="输入模式">Shell</span>
           <span class="cwd" id="cwd-text" title="远端工作目录"></span>
+          <span
+            class="mcp-badge off"
+            id="mcp-badge"
+            title="MCP 服务器（工具 → MCP 服务器）"
+            hidden
+          >MCP</span>
         </div>
       </header>
 
@@ -184,8 +198,11 @@
             </label>
             <label class="checkbox">
               <input id="save-password" type="checkbox" />
-              保存密码到系统凭据库
+              保存登录密码到系统凭据库
             </label>
+            <p class="hint" id="save-password-hint" hidden>
+              已保存登录密码；留空将使用凭据库中的密码。
+            </p>
           </div>
           <div id="auth-key-fields" class="hidden">
             <label>
@@ -197,9 +214,16 @@
               />
             </label>
             <label>
-              私钥口令 (可选)
+              私钥口令 / 证书密码 (可选)
               <input id="passphrase" type="password" autocomplete="off" />
             </label>
+            <label class="checkbox">
+              <input id="save-passphrase" type="checkbox" />
+              保存私钥口令到系统凭据库
+            </label>
+            <p class="hint" id="save-passphrase-hint" hidden>
+              已保存私钥口令；留空将使用凭据库中的口令。无口令密钥可保持为空。
+            </p>
           </div>
         </div>
         <footer class="dlg-footer" id="dlg-props-footer">
@@ -215,13 +239,30 @@
         <button type="button" class="dlg-close" data-dlg-close title="关闭">×</button>
       </header>
       <div class="dlg-body">
-        <p class="hint">双击或选中后点「打开」将<strong>新建标签</strong>连接。删除配置不会关闭已打开的标签。</p>
+        <p class="hint">
+          双击或选中后点「打开」将<strong>新建标签</strong>连接。删除配置不会关闭已打开的标签。
+          可用「导出 / 导入」迁移会话到另一台电脑（私钥路径需在目标机仍有效；可选择是否导出已保存密码）。
+        </p>
         <ul id="mgr-profile-list" class="mgr-list" role="listbox"></ul>
+        <input
+          type="file"
+          id="mgr-import-file"
+          accept="application/json,.json"
+          hidden
+        />
       </div>
       <footer class="dlg-footer">
         <button type="button" id="mgr-btn-new">新建…</button>
         <button type="button" id="mgr-btn-edit">编辑…</button>
         <button type="button" id="mgr-btn-delete" class="danger">删除</button>
+        <button
+          type="button"
+          id="mgr-btn-export"
+          title="导出为 JSON（可仅导出当前选中的一条，或全部）"
+        >
+          导出…
+        </button>
+        <button type="button" id="mgr-btn-import" title="从 JSON 导入会话配置">导入…</button>
         <span class="dlg-spacer"></span>
         <button type="button" id="mgr-btn-open" class="primary">打开</button>
         <button type="button" data-dlg-close>关闭</button>
@@ -276,6 +317,69 @@
       <footer class="dlg-footer">
         <button type="button" id="dlg-secret-cancel">取消</button>
         <button type="button" id="dlg-secret-ok" class="primary">确定</button>
+      </footer>
+    </dialog>
+
+    <!-- MCP server settings (PR-M1 skeleton) -->
+    <dialog id="dlg-mcp" class="app-dialog dlg-wide" aria-labelledby="dlg-mcp-title">
+      <header class="dlg-header">
+        <h2 id="dlg-mcp-title">MCP 服务器</h2>
+        <button type="button" class="dlg-close" data-dlg-close title="关闭">×</button>
+      </header>
+      <div class="dlg-body">
+        <p class="hint">
+          将本机已连接的 SSH 会话暴露给 AI 工具（Cursor / Claude 等）。默认关闭；仅监听
+          <code>127.0.0.1</code>，需 Bearer token。工具：
+          <code>sessions_list</code>、<code>session_get</code>、<code>session_exec</code>（侧信道）、
+          <code>session_read_output</code>。JSON-RPC：<code>POST /mcp</code>。
+        </p>
+        <p class="error" id="dlg-mcp-error" hidden></p>
+        <label class="checkbox">
+          <input id="mcp-enabled" type="checkbox" />
+          启用 MCP 服务器
+        </label>
+        <div class="dlg-row">
+          <label>
+            端口（首选）
+            <input id="mcp-port" type="number" min="1" max="65535" value="39201" />
+          </label>
+          <label>
+            运行状态
+            <input id="mcp-status-text" type="text" readonly tabindex="-1" />
+          </label>
+        </div>
+        <label>
+          健康检查 URL
+          <input id="mcp-health-url" type="text" readonly tabindex="-1" placeholder="启用后显示" />
+        </label>
+        <label>
+          Bearer Token
+          <div class="mcp-token-row">
+            <input id="mcp-token" type="password" readonly autocomplete="off" spellcheck="false" />
+            <button type="button" id="mcp-btn-show-token" title="显示/隐藏">显示</button>
+            <button type="button" id="mcp-btn-copy-token" title="复制 token">复制</button>
+          </div>
+        </label>
+        <label>
+          HTTP Client 配置（url + Bearer；部分客户端支持）
+          <textarea id="mcp-client-config" rows="6" readonly spellcheck="false"></textarea>
+        </label>
+        <label>
+          stdio Client 配置（推荐 Cursor / Claude Desktop）
+          <textarea id="mcp-stdio-config" rows="7" readonly spellcheck="false"></textarea>
+        </label>
+        <p class="hint">
+          stdio 模式会启动 <code>anchorterm.exe mcp-stdio</code>，把 JSON-RPC 转到本机 HTTP MCP。
+          <strong>主程序须保持运行且 MCP 已启用</strong>。详见 <code>docs/mcp-user-guide.md</code>。
+        </p>
+      </div>
+      <footer class="dlg-footer">
+        <button type="button" id="mcp-btn-regen" title="使旧 Client 配置失效">重新生成 Token</button>
+        <button type="button" id="mcp-btn-copy-config">复制 HTTP 配置</button>
+        <button type="button" id="mcp-btn-copy-stdio">复制 stdio 配置</button>
+        <span class="dlg-spacer"></span>
+        <button type="button" id="mcp-btn-apply" class="primary">应用</button>
+        <button type="button" data-dlg-close>关闭</button>
       </footer>
     </dialog>
 

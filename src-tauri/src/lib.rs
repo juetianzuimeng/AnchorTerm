@@ -4,11 +4,18 @@ mod config;
 mod cwd;
 mod error;
 mod external_sftp;
+mod mcp;
 mod ops_log;
+mod output_ring;
 mod session;
 mod ssh;
 
 use app_state::AppState;
+
+/// CLI: `anchorterm mcp-stdio` — stdio MCP bridge (no GUI). See [`mcp::run_mcp_stdio`].
+pub fn run_mcp_stdio() -> Result<(), String> {
+    mcp::run_mcp_stdio()
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -39,6 +46,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
+        .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                mcp::bootstrap(handle).await;
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             session::connect,
             session::disconnect,
@@ -51,6 +65,8 @@ pub fn run() {
             session::resize,
             session::get_session_snapshot,
             session::list_profiles,
+            session::export_profiles,
+            session::import_profiles,
             session::save_profile,
             session::delete_profile,
             ops_log::ops_log,
@@ -59,6 +75,11 @@ pub fn run() {
             ssh::openssh::check_ssh,
             external_sftp::detect_xftp,
             external_sftp::launch_xftp,
+            mcp::mcp_get_status,
+            mcp::mcp_set_enabled,
+            mcp::mcp_regenerate_token,
+            mcp::mcp_update_settings,
+            mcp::mcp_apply,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AnchorTerm");

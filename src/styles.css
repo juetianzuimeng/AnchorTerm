@@ -225,6 +225,75 @@ body {
   animation: need-raw-pulse 1.4s ease-in-out infinite;
 }
 
+.mcp-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  line-height: 1.4;
+  cursor: default;
+}
+
+.mcp-badge.on {
+  color: #04160c;
+  background: var(--ok);
+  border-color: #2bb673;
+}
+
+.mcp-badge.off {
+  color: var(--muted);
+  background: #1a2332;
+}
+
+.mcp-token-row {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.mcp-token-row input {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
+.mcp-token-row button {
+  flex: 0 0 auto;
+  min-width: 52px;
+  padding: 6px 10px;
+}
+
+#mcp-client-config,
+#mcp-stdio-config {
+  width: 100%;
+  resize: vertical;
+  min-height: 100px;
+  background: var(--input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  outline: none;
+}
+
+#mcp-client-config:focus,
+#mcp-stdio-config:focus {
+  border-color: var(--accent);
+}
+
+#mcp-health-url,
+#mcp-status-text {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+}
+
 .dot.alt-screen {
   background: var(--warn);
   box-shadow: 0 0 0 3px rgba(240, 180, 41, 0.35);

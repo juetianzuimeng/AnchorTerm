@@ -205,6 +205,7 @@ fn prepare_auth_for_xftp(auth: Option<&AuthMethod>) -> Result<PreparedAuth, AppE
         Some(AuthMethod::PublicKey {
             private_key_path,
             passphrase,
+            ..
         }) if !private_key_path.is_empty() => {
             let pass = passphrase
                 .as_deref()

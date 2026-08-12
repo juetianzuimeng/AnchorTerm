@@ -14,9 +14,12 @@ pub struct HostProfile {
     /// Absolute path to OpenSSH private key (public_key auth only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_key_path: Option<String>,
-    /// Whether a password is stored in the OS keyring for this profile.
+    /// Whether a login password is stored in the OS keyring for this profile.
     #[serde(default)]
     pub has_saved_password: bool,
+    /// Whether a private-key passphrase is stored in the OS keyring.
+    #[serde(default)]
+    pub has_saved_passphrase: bool,
     #[serde(default)]
     pub reconnect_enabled: bool,
 }
@@ -39,6 +42,7 @@ impl HostProfile {
             auth_type,
             private_key_path,
             has_saved_password: false,
+            has_saved_passphrase: false,
             reconnect_enabled: true,
         }
     }
@@ -59,9 +63,15 @@ pub struct SaveProfileRequest {
     pub username: String,
     pub auth_type: AuthType,
     pub private_key_path: Option<String>,
-    /// When true and password provided, store in keyring.
+    /// When true and password provided, store login password in keyring.
     #[serde(default)]
     pub save_password: bool,
-    /// Password to save (never persisted in profiles.json).
+    /// Login password to save (never persisted in profiles.json).
     pub password: Option<String>,
+    /// When true and passphrase provided, store key passphrase in keyring.
+    #[serde(default)]
+    pub save_passphrase: bool,
+    /// Private-key passphrase to save (never persisted in profiles.json).
+    #[serde(default)]
+    pub passphrase: Option<String>,
 }

@@ -19,6 +19,9 @@ pub enum AuthMethod {
     PublicKey {
         private_key_path: String,
         passphrase: Option<String>,
+        /// Persist passphrase to OS credential store under profile_id.
+        #[serde(default)]
+        save_passphrase: bool,
     },
 }
 
@@ -39,6 +42,7 @@ impl fmt::Debug for AuthMethod {
             AuthMethod::PublicKey {
                 private_key_path,
                 passphrase,
+                save_passphrase,
             } => f
                 .debug_struct("PublicKey")
                 .field("private_key_path", private_key_path)
@@ -46,6 +50,7 @@ impl fmt::Debug for AuthMethod {
                     "passphrase",
                     &passphrase.as_ref().map(|_| "[redacted]").unwrap_or("[none]"),
                 )
+                .field("save_passphrase", save_passphrase)
                 .finish(),
         }
     }

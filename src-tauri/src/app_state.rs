@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::AuthMethod;
 use crate::cwd::CwdTracker;
 use crate::error::AppError;
+use crate::output_ring::OutputRing;
 use crate::ssh::complete_cache::SessionCompleteCache;
 use crate::ssh::openssh::SecureKeyMaterial;
 use crate::ssh::transport::ActiveTransport;
@@ -146,6 +147,10 @@ pub struct SessionRuntime {
     pub sep_empty_drops: AtomicU64,
     /// Last time on_data processed a chunk (ms since UNIX_EPOCH); 0 = never.
     pub sep_last_on_data_ms: AtomicU64,
+    /// Recent UI-visible terminal output for MCP `session_read_output` (PR-M4).
+    pub output_ring: Mutex<OutputRing>,
+    /// Concurrent MCP side-channel execs on this session.
+    pub mcp_exec_inflight: AtomicU32,
 }
 
 /// Pending filter for silent control injects (`stty` resize, post-cmd marker echo).
@@ -192,6 +197,8 @@ impl SessionRuntime {
             sep_bytes_out: AtomicU64::new(0),
             sep_empty_drops: AtomicU64::new(0),
             sep_last_on_data_ms: AtomicU64::new(0),
+            output_ring: Mutex::new(OutputRing::default()),
+            mcp_exec_inflight: AtomicU32::new(0),
         }
     }
 
@@ -565,15 +572,18 @@ fn find_slice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Process-wide app state: session map only (no UI focus).
+/// Process-wide app state: session map + MCP runtime (no UI focus).
 pub struct AppState {
     pub sessions: Mutex<HashMap<String, Arc<SessionRuntime>>>,
+    /// MCP server config + optional localhost listener (PR-M1).
+    pub mcp: Mutex<crate::mcp::McpRuntime>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            mcp: Mutex::new(crate::mcp::McpRuntime::default()),
         }
     }
 }

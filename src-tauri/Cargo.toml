@@ -26,7 +26,9 @@ thiserror = "2"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
-keyring = "3"
+# keyring 3.x has NO default features — without windows-native it uses an
+# in-memory mock store (set succeeds, survives only until process exit).
+keyring = { version = "3", features = ["windows-native"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
@@ -37,3 +39,5 @@ md-5 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 data-encoding = "2"
+# Native open/save dialogs (export path picker).
+rfd = "0.15"
