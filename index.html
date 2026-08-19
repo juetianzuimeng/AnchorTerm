@@ -23,7 +23,7 @@
           <div class="menu-item" data-menu="edit">
             <button type="button" class="menu-btn" role="menuitem">编辑(E)</button>
             <div class="menu-dropdown" role="menu">
-              <button type="button" data-action="copy" role="menuitem">复制 <span class="accel">Ctrl+Shift+C</span></button>
+              <button type="button" data-action="copy" role="menuitem">复制 <span class="accel">Ctrl+C</span></button>
               <button type="button" data-action="paste" role="menuitem">粘贴 <span class="accel">Ctrl+Shift+V</span></button>
               <button type="button" data-action="clear-draft" role="menuitem">清草稿</button>
               <button type="button" disabled title="后续版本" role="menuitem">查找</button>
@@ -240,9 +240,25 @@
       </header>
       <div class="dlg-body">
         <p class="hint">
-          双击或选中后点「打开」将<strong>新建标签</strong>连接。删除配置不会关闭已打开的标签。
-          可用「导出 / 导入」迁移会话到另一台电脑（私钥路径需在目标机仍有效；可选择是否导出已保存密码）。
+          勾选后可<strong>批量打开 / 导出 / 删除</strong>。点行选中后可编辑；双击或「打开」将<strong>新建标签</strong>连接。
+          删除配置不会关闭已打开的标签。导入时私钥路径需在目标机仍有效。
         </p>
+        <input
+          type="search"
+          id="mgr-search"
+          class="mgr-search"
+          placeholder="搜索名称或 IP"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="搜索会话名称或 IP"
+        />
+        <div class="mgr-toolbar">
+          <label class="mgr-select-all" for="mgr-check-all">
+            <input type="checkbox" id="mgr-check-all" />
+            全选
+          </label>
+          <span id="mgr-check-count" class="mgr-check-count"></span>
+        </div>
         <ul id="mgr-profile-list" class="mgr-list" role="listbox"></ul>
         <input
           type="file"
@@ -254,17 +270,31 @@
       <footer class="dlg-footer">
         <button type="button" id="mgr-btn-new">新建…</button>
         <button type="button" id="mgr-btn-edit">编辑…</button>
-        <button type="button" id="mgr-btn-delete" class="danger">删除</button>
+        <button
+          type="button"
+          id="mgr-btn-delete"
+          class="danger"
+          title="删除已勾选的会话；未勾选则删除当前选中项（不会关闭已打开的标签）"
+        >
+          删除
+        </button>
         <button
           type="button"
           id="mgr-btn-export"
-          title="导出为 JSON（可仅导出当前选中的一条，或全部）"
+          title="导出已勾选的会话；未勾选则按当前选中项或全部"
         >
           导出…
         </button>
         <button type="button" id="mgr-btn-import" title="从 JSON 导入会话配置">导入…</button>
         <span class="dlg-spacer"></span>
-        <button type="button" id="mgr-btn-open" class="primary">打开</button>
+        <button
+          type="button"
+          id="mgr-btn-open"
+          class="primary"
+          title="打开已勾选的会话（可多选）；未勾选则打开当前选中项"
+        >
+          打开
+        </button>
         <button type="button" data-dlg-close>关闭</button>
       </footer>
     </dialog>

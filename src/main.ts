@@ -666,6 +666,10 @@ let propsConnecting = false;
 /** After closing session-props, re-open the session manager (edit/new from manager). */
 let propsReturnToManager = false;
 let mgrSelectedId: string | null = null;
+/** Checked profile ids in the session manager (batch open / export). */
+const mgrCheckedIds = new Set<string>();
+/** Anchor for Shift+click checkbox range. */
+let mgrCheckAnchorId: string | null = null;
 
 function setPropsError(msg: string | null) {
   const el = $("dlg-props-error");
@@ -1188,6 +1192,19 @@ class SessionView {
 
   isLive(): boolean {
     return this.state === "connected";
+  }
+
+  /** Send ETX (Ctrl+C) to the remote PTY. */
+  sendInterrupt() {
+    if (!this.isLive()) return;
+    const bytes = new TextEncoder().encode("\x03");
+    invoke("write_bytes", {
+      sessionId: this.sessionId,
+      dataB64: bytesToBase64(bytes),
+    }).catch((e) => {
+      opsLog("ERR", "interrupt write failed", { error: String(e) });
+      this.setError(String(e));
+    });
   }
 
   isBusy(): boolean {
@@ -2905,36 +2922,189 @@ function closePropsDialog() {
 // Session manager
 // ---------------------------------------------------------------------------
 
+function pruneManagerChecks() {
+  const ids = new Set(getProfiles().map((p) => p.id));
+  for (const id of [...mgrCheckedIds]) {
+    if (!ids.has(id)) mgrCheckedIds.delete(id);
+  }
+  if (mgrCheckAnchorId && !ids.has(mgrCheckAnchorId)) mgrCheckAnchorId = null;
+}
+
+function managerSearchQuery(): string {
+  const el = document.getElementById("mgr-search") as HTMLInputElement | null;
+  return (el?.value ?? "").trim().toLowerCase();
+}
+
+function profileMatchesSearch(p: HostProfile, q: string): boolean {
+  if (!q) return true;
+  const name = p.name.toLowerCase();
+  const host = p.host.toLowerCase();
+  return q.split(/\s+/).every((t) => name.includes(t) || host.includes(t));
+}
+
+function visibleManagerProfiles(): HostProfile[] {
+  const q = managerSearchQuery();
+  const all = getProfiles();
+  if (!q) return all;
+  return all.filter((p) => profileMatchesSearch(p, q));
+}
+
+function checkedManagerProfiles(): HostProfile[] {
+  pruneManagerChecks();
+  return getProfiles().filter((p) => mgrCheckedIds.has(p.id));
+}
+
+function syncManagerCheckUi() {
+  pruneManagerChecks();
+  const all = getProfiles();
+  const visible = visibleManagerProfiles();
+  const n = mgrCheckedIds.size;
+  const visChecked = visible.filter((p) => mgrCheckedIds.has(p.id)).length;
+  const allBox = $("mgr-check-all") as HTMLInputElement | null;
+  if (allBox) {
+    allBox.disabled = visible.length === 0;
+    allBox.checked = visible.length > 0 && visChecked === visible.length;
+    allBox.indeterminate = visChecked > 0 && visChecked < visible.length;
+  }
+  const count = $("mgr-check-count");
+  if (count) {
+    const parts: string[] = [];
+    if (managerSearchQuery()) {
+      parts.push(`显示 ${visible.length} / ${all.length}`);
+    }
+    if (n > 0) parts.push(`已勾选 ${n} 条`);
+    count.textContent = parts.join(" · ");
+  }
+  const openBtn = $("mgr-btn-open") as HTMLButtonElement | null;
+  if (openBtn) openBtn.textContent = n > 1 ? `打开 (${n})` : "打开";
+  const exportBtn = $("mgr-btn-export") as HTMLButtonElement | null;
+  if (exportBtn) exportBtn.textContent = n > 1 ? `导出 (${n})…` : "导出…";
+  const deleteBtn = $("mgr-btn-delete") as HTMLButtonElement | null;
+  if (deleteBtn) deleteBtn.textContent = n > 1 ? `删除 (${n})` : "删除";
+}
+
+function applyManagerCheckRange(toId: string) {
+  const ids = visibleManagerProfiles().map((p) => p.id);
+  const a = mgrCheckAnchorId ? ids.indexOf(mgrCheckAnchorId) : -1;
+  const b = ids.indexOf(toId);
+  if (a < 0 || b < 0) {
+    mgrCheckedIds.add(toId);
+    mgrCheckAnchorId = toId;
+    return;
+  }
+  const lo = Math.min(a, b);
+  const hi = Math.max(a, b);
+  for (let i = lo; i <= hi; i++) mgrCheckedIds.add(ids[i]);
+}
+
+function setManagerSelected(id: string | null) {
+  mgrSelectedId = id;
+  $("mgr-profile-list")
+    .querySelectorAll("li")
+    .forEach((el) => {
+      el.classList.toggle(
+        "selected",
+        !!id && (el as HTMLElement).dataset.id === id,
+      );
+    });
+}
+
+function paintManagerChecks() {
+  $("mgr-profile-list")
+    .querySelectorAll("li")
+    .forEach((el) => {
+      const id = (el as HTMLElement).dataset.id;
+      const cb = el.querySelector(".mgr-item-check") as HTMLInputElement | null;
+      if (id && cb) cb.checked = mgrCheckedIds.has(id);
+    });
+  syncManagerCheckUi();
+}
+
 function renderManagerList() {
   const list = $("mgr-profile-list");
   list.innerHTML = "";
-  const profiles = getProfiles();
+  pruneManagerChecks();
+  const profiles = visibleManagerProfiles();
+  if (profiles.length === 0) {
+    const empty = document.createElement("li");
+    empty.className = "mgr-empty";
+    empty.textContent =
+      getProfiles().length === 0 ? "暂无保存的会话" : "无匹配的会话";
+    list.appendChild(empty);
+    syncManagerCheckUi();
+    return;
+  }
   for (const p of profiles) {
     const li = document.createElement("li");
     li.dataset.id = p.id;
+    li.setAttribute("role", "option");
     if (p.id === mgrSelectedId) li.classList.add("selected");
-    li.innerHTML = `<div class="name">${escapeHtml(p.name)}</div>
+
+    const check = document.createElement("input");
+    check.type = "checkbox";
+    check.className = "mgr-item-check";
+    check.checked = mgrCheckedIds.has(p.id);
+    check.title = "勾选以批量打开 / 导出 / 删除";
+    check.setAttribute("aria-label", `勾选 ${p.name}`);
+    check.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (e.detail > 1) {
+        e.preventDefault();
+        return;
+      }
+      if (e.shiftKey && mgrCheckAnchorId) {
+        e.preventDefault();
+        applyManagerCheckRange(p.id);
+        setManagerSelected(p.id);
+        paintManagerChecks();
+      }
+    });
+    check.addEventListener("change", () => {
+      if (check.checked) mgrCheckedIds.add(p.id);
+      else mgrCheckedIds.delete(p.id);
+      mgrCheckAnchorId = p.id;
+      setManagerSelected(p.id);
+      syncManagerCheckUi();
+    });
+    check.addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+    });
+
+    const body = document.createElement("div");
+    body.className = "mgr-item-body";
+    body.innerHTML = `<div class="name">${escapeHtml(p.name)}</div>
       <div class="meta">${escapeHtml(p.username)}@${escapeHtml(p.host)}:${p.port} · ${
         p.auth_type === "password" ? "密码" : "私钥"
       }</div>`;
+
+    li.append(check, body);
     li.addEventListener("click", () => {
-      mgrSelectedId = p.id;
-      renderManagerList();
+      setManagerSelected(p.id);
     });
     li.addEventListener("dblclick", () => {
-      mgrSelectedId = p.id;
+      setManagerSelected(p.id);
       void openProfileAsNewTab(p);
     });
     list.appendChild(li);
   }
+  syncManagerCheckUi();
 }
 
 async function openManager() {
   await loadProfiles();
-  mgrSelectedId = null;
-  renderManagerList();
   const dlg = $("dlg-session-manager") as HTMLDialogElement;
-  if (!dlg.open) dlg.showModal();
+  const wasOpen = dlg.open;
+  const list = $("mgr-profile-list");
+  const scrollTop = wasOpen ? list.scrollTop : 0;
+  renderManagerList();
+  if (wasOpen) {
+    list.scrollTop = scrollTop;
+  } else {
+    dlg.showModal();
+    const search = document.getElementById("mgr-search") as HTMLInputElement | null;
+    search?.focus();
+  }
 }
 
 interface ProfilesExportResult {
@@ -2963,9 +3133,12 @@ async function exportProfilesFromManager() {
     return;
   }
 
-  // Scope: selected one vs all.
+  // Scope: checked rows → those; else highlighted row (confirm vs all); else all.
   let profileIds: string[] | null = null;
-  if (mgrSelectedId) {
+  const checked = checkedManagerProfiles();
+  if (checked.length > 0) {
+    profileIds = checked.map((p) => p.id);
+  } else if (mgrSelectedId) {
     const sel = profiles.find((p) => p.id === mgrSelectedId);
     const label = sel
       ? `${sel.name}（${sel.username}@${sel.host}）`
@@ -2980,8 +3153,8 @@ async function exportProfilesFromManager() {
     }
   } else {
     const ok = window.confirm(
-      `当前未选中配置，将导出全部 ${profiles.length} 条。\n\n` +
-        `若要导出单条，请先在列表中点选该配置再点「导出…」。\n\n继续导出全部？`,
+      `未勾选会话，将导出全部 ${profiles.length} 条。\n\n` +
+        `若只导出部分，请先勾选再点「导出…」。\n\n继续导出全部？`,
     );
     if (!ok) return;
   }
@@ -3096,13 +3269,20 @@ async function importProfilesFromManager(file: File) {
   }
 }
 
-async function openProfileAsNewTab(p: HostProfile) {
+type OpenProfileResult = "ok" | "cancel" | "limit" | "skip" | "fail";
+
+async function openProfileAsNewTab(
+  p: HostProfile,
+  opts?: { closeManager?: boolean; quiet?: boolean },
+): Promise<OpenProfileResult> {
   fillFormFromProfile(p);
-  ($("dlg-session-manager") as HTMLDialogElement).close();
+  if (opts?.closeManager !== false) {
+    ($("dlg-session-manager") as HTMLDialogElement).close();
+  }
   selectedProfileId = p.id;
   if (sessions.size >= MAX_TABS) {
-    showToast(`最多打开 ${MAX_TABS} 个会话`);
-    return;
+    if (!opts?.quiet) showToast(`最多打开 ${MAX_TABS} 个会话`);
+    return "limit";
   }
 
   // Secrets never live in profiles.json. Keyring (optional) or prompt.
@@ -3110,8 +3290,8 @@ async function openProfileAsNewTab(p: HostProfile) {
   if (p.auth_type === "password") {
     const prompted = await ensurePassword(null, !!p.has_saved_password);
     if (prompted === undefined) {
-      showToast("已取消连接");
-      return;
+      if (!opts?.quiet) showToast("已取消连接");
+      return "cancel";
     }
     auth = {
       type: "password",
@@ -3122,13 +3302,13 @@ async function openProfileAsNewTab(p: HostProfile) {
     };
   } else {
     if (!p.private_key_path) {
-      showToast("配置缺少私钥路径");
-      return;
+      if (!opts?.quiet) showToast("配置缺少私钥路径");
+      return "skip";
     }
     const prompted = await ensurePassphrase(null, !!p.has_saved_passphrase);
     if (prompted === undefined) {
-      showToast("已取消连接");
-      return;
+      if (!opts?.quiet) showToast("已取消连接");
+      return "cancel";
     }
     auth = {
       type: "public_key",
@@ -3180,10 +3360,124 @@ async function openProfileAsNewTab(p: HostProfile) {
       }
     }
     requestAnimationFrame(() => view.fitAndResize());
+    if (view.state === "failed") {
+      if (!opts?.quiet) showToast(view.message || "连接失败");
+      return "fail";
+    }
+    return "ok";
   } catch (e) {
     view.setError(String(e));
     view.applyState("failed", String(e));
-    showToast(String(e));
+    if (!opts?.quiet) showToast(String(e));
+    return "fail";
+  }
+}
+
+function managerOpenTargets(): HostProfile[] {
+  const checked = checkedManagerProfiles();
+  if (checked.length > 0) return checked;
+  if (mgrSelectedId) {
+    const p = getProfiles().find((x) => x.id === mgrSelectedId);
+    if (p) return [p];
+  }
+  return [];
+}
+
+async function openManagerProfiles() {
+  const targets = managerOpenTargets();
+  if (targets.length === 0) {
+    showToast("请先勾选或选择要打开的会话");
+    return;
+  }
+  if (targets.length > 1) {
+    const room = Math.max(0, MAX_TABS - sessions.size);
+    if (room <= 0) {
+      showToast(`最多打开 ${MAX_TABS} 个会话`);
+      return;
+    }
+    let msg = `将打开已勾选的 ${targets.length} 个会话（每个新建标签）。继续？`;
+    if (targets.length > room) {
+      msg =
+        `当前还可打开 ${room} 个标签，已勾选 ${targets.length} 个。\n\n` +
+        `将只打开前 ${room} 个。继续？`;
+    }
+    if (!window.confirm(msg)) return;
+  }
+
+  ($("dlg-session-manager") as HTMLDialogElement).close();
+
+  let opened = 0;
+  let failed = 0;
+  let cancelled = 0;
+  let skipped = 0;
+  let limited = 0;
+  const batch = targets.length > 1;
+  for (let i = 0; i < targets.length; i++) {
+    if (sessions.size >= MAX_TABS) {
+      limited = targets.length - i;
+      break;
+    }
+    const r = await openProfileAsNewTab(targets[i], {
+      closeManager: false,
+      quiet: batch,
+    });
+    if (r === "ok") opened++;
+    else if (r === "fail") failed++;
+    else if (r === "cancel") cancelled++;
+    else if (r === "skip") skipped++;
+    else if (r === "limit") {
+      limited = targets.length - i;
+      break;
+    }
+  }
+  if (batch) {
+    const parts = [`已打开 ${opened} 个`];
+    if (failed) parts.push(`失败 ${failed} 个`);
+    if (cancelled) parts.push(`取消 ${cancelled} 个`);
+    if (skipped) parts.push(`跳过 ${skipped} 个`);
+    if (limited) parts.push(`标签已满未打开 ${limited} 个`);
+    showToast(parts.join("，"), 4500);
+  }
+}
+
+async function deleteManagerProfiles() {
+  const targets = managerOpenTargets();
+  if (targets.length === 0) {
+    showToast("请先勾选或选择要删除的会话");
+    return;
+  }
+  const n = targets.length;
+  const names = targets
+    .slice(0, 8)
+    .map((p) => `· ${p.name}（${p.username}@${p.host}）`)
+    .join("\n");
+  const extra = n > 8 ? `\n…另有 ${n - 8} 条` : "";
+  const ok = window.confirm(
+    (n > 1
+      ? `将删除已勾选的 ${n} 条主机配置（不会关闭已打开的标签）。\n\n${names}${extra}\n\n`
+      : `删除该主机配置？（不会关闭已打开的标签）\n\n${names}\n\n`) + "继续？",
+  );
+  if (!ok) return;
+
+  let deleted = 0;
+  const errors: string[] = [];
+  for (const p of targets) {
+    try {
+      await invoke("delete_profile", { id: p.id });
+      mgrCheckedIds.delete(p.id);
+      if (mgrSelectedId === p.id) mgrSelectedId = null;
+      deleted++;
+    } catch (e) {
+      errors.push(`${p.name}: ${e}`);
+    }
+  }
+  await loadProfiles();
+  renderManagerList();
+  if (errors.length === 0) {
+    showToast(n > 1 ? `已删除 ${deleted} 条配置` : "已删除配置");
+  } else {
+    showToast(`已删除 ${deleted} 条，失败 ${errors.length} 条`);
+    window.alert(`删除失败：\n\n${errors.slice(0, 8).join("\n")}`);
   }
 }
 
@@ -3585,6 +3879,25 @@ function setupMcpDialog() {
   });
 }
 
+function isCopyChord(e: KeyboardEvent): boolean {
+  if (e.altKey || e.shiftKey) return false;
+  if (!e.ctrlKey && !e.metaKey) return false;
+  return e.key === "c" || e.key === "C" || e.code === "KeyC";
+}
+
+/** True when Ctrl+C should stay native (dialogs, selected text in an input). */
+function shouldLetBrowserHandleCopy(e: KeyboardEvent): boolean {
+  const t = e.target;
+  if (!(t instanceof HTMLElement)) return false;
+  // xterm keeps selection on canvas; its helper textarea is usually empty.
+  if (t.classList.contains("xterm-helper-textarea")) return false;
+  if (t.closest("dialog")) return true;
+  if (t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement) {
+    return t.selectionStart !== t.selectionEnd;
+  }
+  return t.isContentEditable;
+}
+
 function setupShortcuts() {
   window.addEventListener("keydown", (e) => {
     const mod = e.ctrlKey || e.metaKey;
@@ -3631,6 +3944,28 @@ function setupShortcuts() {
       return;
     }
   });
+
+  // Capture: run before xterm maps Ctrl+C to ETX / SIGINT.
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      if (!isCopyChord(e)) return;
+      if (shouldLetBrowserHandleCopy(e)) return;
+      const active = getActive();
+      if (active?.term.hasSelection()) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!e.repeat) void handleMenuAction("copy");
+        return;
+      }
+      if (e.ctrlKey && !e.metaKey && active?.isLive()) {
+        e.preventDefault();
+        e.stopPropagation();
+        active.sendInterrupt();
+      }
+    },
+    true,
+  );
 }
 
 /** Set while shutting down so close-requested handlers do not re-enter. */
@@ -3851,29 +4186,44 @@ window.addEventListener("DOMContentLoaded", async () => {
     ($("dlg-session-manager") as HTMLDialogElement).close();
     openPropsDialog("edit-profile", { returnToManager: true });
   });
-  $("mgr-btn-delete").addEventListener("click", async () => {
-    if (!mgrSelectedId) {
-      showToast("请先选择配置");
-      return;
-    }
-    if (!window.confirm("删除该主机配置？（不会关闭已打开的标签）")) return;
-    try {
-      await invoke("delete_profile", { id: mgrSelectedId });
-      mgrSelectedId = null;
-      await loadProfiles();
-      renderManagerList();
-      showToast("已删除配置");
-    } catch (e) {
-      showToast(String(e));
-    }
+  $("mgr-btn-delete").addEventListener("click", () => {
+    void deleteManagerProfiles();
   });
   $("mgr-btn-open").addEventListener("click", () => {
-    if (!mgrSelectedId) {
-      showToast("请先选择配置");
-      return;
+    void openManagerProfiles();
+  });
+  $("mgr-check-all")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+  });
+  $("mgr-check-all")?.addEventListener("change", () => {
+    const allBox = $("mgr-check-all") as HTMLInputElement;
+    const visible = visibleManagerProfiles();
+    if (allBox.checked) {
+      for (const p of visible) mgrCheckedIds.add(p.id);
+    } else {
+      for (const p of visible) mgrCheckedIds.delete(p.id);
     }
-    const p = getProfiles().find((x) => x.id === mgrSelectedId);
-    if (p) void openProfileAsNewTab(p);
+    mgrCheckAnchorId = visible[0]?.id ?? null;
+    paintManagerChecks();
+  });
+  const mgrSearch = document.getElementById("mgr-search") as HTMLInputElement | null;
+  mgrSearch?.addEventListener("input", () => {
+    renderManagerList();
+  });
+  mgrSearch?.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && mgrSearch.value) {
+      e.preventDefault();
+      e.stopPropagation();
+      mgrSearch.value = "";
+      renderManagerList();
+    }
+  });
+  $("dlg-session-manager")?.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && (e.key === "f" || e.key === "F")) {
+      e.preventDefault();
+      mgrSearch?.focus();
+      mgrSearch?.select();
+    }
   });
 
   $("mgr-btn-export")?.addEventListener("click", () => {
