@@ -281,6 +281,7 @@ npm run pack:portable
 | [docs/PHASE1.md](docs/PHASE1.md) | 第一阶段方案 |
 | [docs/UI-MULTI-TAB.md](docs/UI-MULTI-TAB.md) | 多标签与菜单 UI |
 | [docs/ROADMAP-NEXT.md](docs/ROADMAP-NEXT.md) | 后续可选方向 |
+| [docs/mcp-user-guide.md](docs/mcp-user-guide.md) | **MCP**：AI 工具复用已连接 SSH 会话 |
 | [docs/shell-integration.md](docs/shell-integration.md) | 远端 OSC 7 安装 |
 | [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | 验收清单 |
 | [操作日志/README.md](操作日志/README.md) | 诊断日志约定 |
@@ -318,6 +319,7 @@ npm run pack:portable
 - [x] Tab 远端补全、Shell / TUI 模式  
 - [x] host+用户级 cwd / 命令历史记忆  
 - [x] Windows 安装包 / 便携包链路  
+- [x] **MCP**：复用已连接会话（HTTP 工具 + `mcp-stdio` 桥，见 [docs/mcp-user-guide.md](docs/mcp-user-guide.md)）  
 
 规划中 / 可选（详见 [docs/ROADMAP-NEXT.md](docs/ROADMAP-NEXT.md)）：
 

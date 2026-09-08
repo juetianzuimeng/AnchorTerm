@@ -83,6 +83,16 @@ Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
 
 更多操作（多标签、断线重连、快捷键）见仓库 [README.md](../README.md) 的「使用说明」。
 
+### 4.1 可选：给 AI 工具用 MCP
+
+若希望 Cursor / Claude 等通过 MCP 使用**已连接**的 SSH 会话：
+
+1. AnchorTerm 菜单 **工具 → MCP 服务器…** → 启用 → 应用  
+2. 复制 **stdio 配置** 到 Client（推荐）  
+3. 完整说明见 **[mcp-user-guide.md](mcp-user-guide.md)**  
+
+注意：启用 MCP 后，持有 Token 的本机进程可对已连接主机执行命令；默认关闭。
+
 ---
 
 ## 5. 配置、卸载与数据
@@ -91,6 +101,7 @@ Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
 |------|------|--------|
 | 主机配置 | `%APPDATA%\AnchorTerm\profiles.json` | **默认保留** |
 | 登录密码（若曾保存） | Windows 凭据管理器，服务名 `AnchorTerm` | 需手动删除 |
+| MCP 配置 / Token | `%APPDATA%\AnchorTerm\mcp.json` | 默认保留 |
 | 操作日志 | `%APPDATA%\AnchorTerm\logs\` | 默认保留；可用菜单「工具 → 打开操作日志目录」 |
 | 程序本体 | 安装目录（常见 `%LOCALAPPDATA%\AnchorTerm\`） | 卸载程序移除 |
 
