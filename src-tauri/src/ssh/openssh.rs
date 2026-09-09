@@ -471,15 +471,20 @@ fn build_ssh_args_inner(
     // Dead-link detection (e.g. unplugged NIC): plain TCP can stay ESTABLISHED for a
     // long time with no local I/O. OpenSSH client keepalives force a probe so the
     // child exits and we flip UI off "已连接".
-    // Target: notice within ~2s → ServerAliveInterval=1 × ServerAliveCountMax=2.
+    //
+    // Do **not** use Interval=1 CountMax=2 (~2s). Restore playbook + side-channel
+    // `test -d` (no mux on Windows) plus MCP scp easily stall keepalive ACKs;
+    // the interactive child then exits 255 ("Timeout, server not responding")
+    // mid-restore and auto-reconnect never settles.
+    // 5s × 3 ≈ 15s is still fast for unplug, long enough for restore.
     let mut args = vec![
         "-tt".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
         "-o".into(),
-        "ServerAliveInterval=1".into(),
+        "ServerAliveInterval=5".into(),
         "-o".into(),
-        "ServerAliveCountMax=2".into(),
+        "ServerAliveCountMax=3".into(),
         "-o".into(),
         "TCPKeepAlive=yes".into(),
         "-o".into(),
@@ -862,7 +867,7 @@ pub async fn connect_openssh(
     let _ = (params.cols, params.rows);
     crate::ops_log::log(
         "SSH",
-        "openssh auth ok; session ready (ServerAliveInterval=1 CountMax=2 TCPKeepAlive=yes)",
+        "openssh auth ok; session ready (ServerAliveInterval=5 CountMax=3 TCPKeepAlive=yes)",
     );
 
     Ok(OpensshTransport {

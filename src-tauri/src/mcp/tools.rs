@@ -87,7 +87,7 @@ pub fn tools_list_payload() -> Value {
             },
             {
                 "name": "session_file_upload",
-                "description": "上传文件到会话主机（侧信道）。content=小文件内联(≤4MiB,同步)；local_path=本机文件 scp（默认异步，适合 500MB+）。写入走 staging+mv 原子提交，默认 size 校验，失败/取消清理临时文件。异步时返回 job_id。",
+                "description": "上传文件到会话主机（侧信道）。content=小文件内联(≤4MiB,同步，不续传)；local_path=本机文件（默认异步，适合 500MB+），优先 rsync、不可用则 scp。单文件 staging+mv 原子提交，默认 size 校验；失败/取消默认删临时文件。异步返回 job_id。续传仅限同一次 job 内 rsync 自动重试（mcp.json transfer_max_retries）；cancel/失败后再调是新 job（新 staging 路径），默认从头传。scp 不续传。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -101,7 +101,7 @@ pub fn tools_list_payload() -> Value {
                         },
                         "content": {
                             "type": "string",
-                            "description": "内联文件内容（与 local_path 二选一；勿用于大文件）"
+                            "description": "内联文件内容（与 local_path 二选一；勿用于大文件；整段写入，不续传）"
                         },
                         "encoding": {
                             "type": "string",
@@ -121,7 +121,7 @@ pub fn tools_list_payload() -> Value {
                         },
                         "async": {
                             "type": "boolean",
-                            "description": "local_path 模式默认 true：立即返回 job_id；false 则同步等待 scp 结束（可能很长）"
+                            "description": "local_path 模式默认 true：立即返回 job_id；false 则同步等待传输结束（可能很长）"
                         },
                         "verify": {
                             "type": "string",
@@ -129,15 +129,15 @@ pub fn tools_list_payload() -> Value {
                         },
                         "cleanup_on_fail": {
                             "type": "boolean",
-                            "description": "失败/取消时删除远端/本机 staging 临时文件。默认 true。"
+                            "description": "失败/取消时删除远端 staging 临时文件。默认 true。新一次 upload 会换 job_id 和 staging 文件名，跨任务不能接上次半截文件。"
                         },
                         "recursive": {
                             "type": "boolean",
-                            "description": "目录递归上传（scp -r / rsync -a）。默认 false。"
+                            "description": "目录递归上传（rsync -a / scp -r）。默认 false。递归无原子 staging。"
                         },
                         "prefer_rsync": {
                             "type": "boolean",
-                            "description": "优先 rsync（--partial 续传）；不可用则 scp。默认读 mcp.json。"
+                            "description": "优先 rsync（--partial）。续传只作用于同一次 job 的自动重试，不是跨任务断点续传。无 rsync 则 scp（不续传）。省略则读 mcp.json（默认 true）。"
                         },
                         "timeout_secs": {
                             "type": "number",
@@ -153,7 +153,7 @@ pub fn tools_list_payload() -> Value {
             },
             {
                 "name": "session_file_download",
-                "description": "从会话主机下载文件（侧信道）。省略 local_path 则 content；指定 local_path 则 scp/rsync（默认异步）。本机路径受沙箱约束。",
+                "description": "从会话主机下载文件（侧信道）。省略 local_path 则 content 内联返回（不续传）；指定 local_path 则 rsync/scp（默认异步）。优先 rsync（--partial），否则 scp。单文件 staging 后 rename；失败/取消默认删本机临时文件。本机路径受沙箱约束。续传仅限同一次 job 内 rsync 自动重试；cancel/失败后再调是新 job，默认从头传。scp 不续传。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -167,7 +167,7 @@ pub fn tools_list_payload() -> Value {
                         },
                         "local_path": {
                             "type": "string",
-                            "description": "保存到本机路径（scp，大文件必须）；省略则 content 内联返回"
+                            "description": "保存到本机路径（rsync/scp，大文件必须）；省略则 content 内联返回"
                         },
                         "encoding": {
                             "type": "string",
@@ -175,7 +175,7 @@ pub fn tools_list_payload() -> Value {
                         },
                         "async": {
                             "type": "boolean",
-                            "description": "local_path 模式默认 true：立即返回 job_id"
+                            "description": "local_path 模式默认 true：立即返回 job_id；false 则同步等待传输结束（可能很长）"
                         },
                         "verify": {
                             "type": "string",
@@ -183,7 +183,7 @@ pub fn tools_list_payload() -> Value {
                         },
                         "cleanup_on_fail": {
                             "type": "boolean",
-                            "description": "失败/取消时删除本机 staging。默认 true。"
+                            "description": "失败/取消时删除本机 staging。默认 true。新一次 download 会换 job_id 和 staging 文件名，跨任务不能接上次半截文件。"
                         },
                         "overwrite": {
                             "type": "boolean",
@@ -191,11 +191,11 @@ pub fn tools_list_payload() -> Value {
                         },
                         "recursive": {
                             "type": "boolean",
-                            "description": "目录递归下载。默认 false。"
+                            "description": "目录递归下载（rsync -a / scp -r）。默认 false。递归无原子 staging。"
                         },
                         "prefer_rsync": {
                             "type": "boolean",
-                            "description": "优先 rsync（--partial 续传）；否则 scp。"
+                            "description": "优先 rsync（--partial）。续传只作用于同一次 job 的自动重试，不是跨任务断点续传。无 rsync 则 scp（不续传）。省略则读 mcp.json（默认 true）。"
                         },
                         "timeout_secs": {
                             "type": "number",
@@ -225,7 +225,7 @@ pub fn tools_list_payload() -> Value {
             },
             {
                 "name": "session_file_transfer_cancel",
-                "description": "取消进行中的异步 scp 传输（杀死 scp 子进程）。",
+                "description": "取消进行中的异步传输（杀死 rsync/scp 子进程）。默认 cleanup_on_fail 会删除 staging。取消后再 upload/download 是新 job，默认不从断点续传。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

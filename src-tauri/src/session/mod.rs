@@ -99,9 +99,19 @@ async fn connect_inner(
     is_reconnect: bool,
 ) -> Result<(), AppError> {
     {
-        let transport = rt.transport.lock().expect("transport lock");
-        if transport.is_some() {
-            return Err(AppError::AlreadyConnected);
+        let mut transport = rt.transport.lock().expect("transport lock");
+        if let Some(t) = transport.as_ref() {
+            if t.is_alive() {
+                return Err(AppError::AlreadyConnected);
+            }
+            // Child already dead but finish_session has not taken the slot yet.
+            // Drop it so this connect/reconnect can proceed instead of spinning
+            // on AlreadyConnected / exiting the reconnect loop.
+            crate::ops_log::log(
+                "SSH",
+                "connect_inner: dropping dead transport leftover",
+            );
+            *transport = None;
         }
     }
 
@@ -334,6 +344,9 @@ async fn connect_inner(
                         "SSH",
                         "connect_inner: PTY gone after restore; treating as connect failure",
                     );
+                    // finish_session already took transport / bumped restore_gen.
+                    // Returning Err lets the *same* reconnect loop retry; do not
+                    // spawn a second loop (see spawn_reconnect_loop in_flight).
                     return Err(AppError::Connect(
                         "连接在恢复工作目录过程中断开".into(),
                     ));
@@ -674,9 +687,10 @@ async fn run_restore_playbook(app: &AppHandle, rt: &SessionRuntime) {
     }
     emit_cwd(app, rt, &path);
 
-    // Give login shell time to finish .bashrc / print banner before injecting cd.
-    // Banner is muted (ui_mute); we only wait so `cd` lands on a ready shell.
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Prompt heuristic already fired before playbook start. A short settle is
+    // enough for .bashrc; a 1200ms idle wait used to overlap ServerAlive probes
+    // plus a slow side-channel dir check and drop the PTY.
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
     if !restore_still_valid(rt, gen) {
         abort_stale_restore(rt, gen, "after banner wait");
@@ -911,15 +925,18 @@ async fn query_dir_exists(rt: &SessionRuntime, path: &str) -> Result<bool, Strin
     let quoted = crate::cwd::shell_single_quote(path);
     let cmd = format!("test -d {quoted} && echo AT_DIR_OK || echo AT_DIR_MISSING");
     let cp = mux_control_path(rt);
-    let out = crate::ssh::openssh::openssh_exec_with_key_cache(
+    // Hard cap: a full extra SSH (no mux on Windows) must not stall restore
+    // for 5–15s while the interactive PTY sits idle.
+    let out = crate::ssh::openssh::openssh_exec_raw(
         &params,
         &cmd,
         &rt.side_channel_key,
         cp.as_deref(),
+        Duration::from_millis(2500),
     )
     .await
     .map_err(|e| e.to_string())?;
-    Ok(out.contains("AT_DIR_OK"))
+    Ok(out.stdout.contains("AT_DIR_OK"))
 }
 
 /// Local best-effort home from SSH username so relative `cd` tracking works
@@ -1048,6 +1065,12 @@ mod permanent_auth_tests {
         let e = AppError::Auth("认证失败：公钥被拒绝或私钥口令错误。".into());
         assert!(is_permanent_auth_failure(&e));
     }
+
+    #[test]
+    fn restore_drop_is_not_permanent() {
+        let e = AppError::Connect("连接在恢复工作目录过程中断开".into());
+        assert!(!is_permanent_auth_failure(&e));
+    }
 }
 
 /// Spawn background reconnect with a fixed 1s interval for a specific session.
@@ -1061,12 +1084,30 @@ pub fn spawn_reconnect_loop(app: AppHandle, session_id: String) {
     if !rt.auto_reconnect.load(Ordering::SeqCst) {
         return;
     }
+    // A loop already owns retries (typically still inside restore playbook when
+    // the PTY died). Spawning another one bumps reconnect_gen, paints a fresh
+    // attempt=1 「重连失败 (1)」, and opens a second ssh while the old one
+    // still has side-channel execs — the combo never recovers.
+    if rt.reconnect_in_flight.swap(true, Ordering::SeqCst) {
+        crate::ops_log::log(
+            "SSH",
+            "spawn_reconnect_loop skipped: reconnect already in flight",
+        );
+        return;
+    }
 
     let gen = rt.reconnect_gen.fetch_add(1, Ordering::SeqCst) + 1;
     let app2 = app.clone();
+    let sid = rt.id.clone();
 
     tokio::spawn(async move {
-        reconnect_loop(app2, rt, gen).await;
+        reconnect_loop(app2.clone(), Arc::clone(&rt), gen).await;
+        rt.reconnect_in_flight.store(false, Ordering::SeqCst);
+        // Race: PTY died after connect_inner Ok while this loop was exiting,
+        // and finish_session skipped spawn because in_flight was still true.
+        if rt.auto_reconnect.load(Ordering::SeqCst) && !rt.pty_is_live() {
+            spawn_reconnect_loop(app2, sid);
+        }
     });
 }
 
@@ -1088,7 +1129,9 @@ async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
             return;
         }
         // Already connected by someone else (restore playbook owns unmute).
-        if rt.transport.lock().expect("t").is_some() {
+        // Must use pty_is_live: a dead leftover transport.is_some() used to
+        // exit this loop while the UI stayed on 「重连失败 (1)」.
+        if rt.pty_is_live() {
             return;
         }
 
@@ -1113,7 +1156,7 @@ async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
             rt.cwd_freeze.store(false, Ordering::SeqCst);
             return;
         }
-        if rt.transport.lock().expect("t").is_some() {
+        if rt.pty_is_live() {
             return;
         }
 
@@ -1150,9 +1193,20 @@ async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
 
         match connect_inner(&app, Arc::clone(&rt), &mut req, true).await {
             Ok(()) => {
-                info!(attempt, "auto-reconnect succeeded");
-                crate::ops_log::log("SSH", &format!("auto-reconnect succeeded attempt={attempt}"));
-                return;
+                if rt.pty_is_live() {
+                    info!(attempt, "auto-reconnect succeeded");
+                    crate::ops_log::log(
+                        "SSH",
+                        &format!("auto-reconnect succeeded attempt={attempt}"),
+                    );
+                    return;
+                }
+                crate::ops_log::log(
+                    "SSH",
+                    &format!(
+                        "auto-reconnect Ok but PTY gone attempt={attempt}; retrying"
+                    ),
+                );
             }
             Err(e) => {
                 warn!(attempt, error = %e, "auto-reconnect attempt failed");
@@ -1160,6 +1214,10 @@ async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
                     "ERR",
                     &format!("auto-reconnect failed attempt={attempt} err={e}"),
                 );
+                if rt.reconnect_gen.load(Ordering::SeqCst) != gen {
+                    // A newer owner (manual connect / close) cancelled us.
+                    return;
+                }
                 // Only **real** credential/key failures stop the loop.
                 // Network blips ("Connection closed by host", reset, timeout) are
                 // AppError::Connect and must keep retrying after the cable is back.
@@ -1175,11 +1233,16 @@ async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
                     );
                     return;
                 }
+                let restore_drop = e.to_string().contains("恢复工作目录过程中断开");
                 {
                     let mut meta = rt.meta.lock().expect("meta lock");
                     meta.state = SessionState::Reconnecting;
                     meta.attempt = attempt;
-                    meta.message = Some(format!("重连失败 ({attempt}): {e}"));
+                    meta.message = Some(if restore_drop {
+                        format!("重连中 ({attempt})：恢复目录时连接断开，正在重试…")
+                    } else {
+                        format!("重连失败 ({attempt}): {e}")
+                    });
                 }
                 emit_state(&app, &rt);
             }

@@ -106,6 +106,10 @@ pub struct SessionRuntime {
     pub auto_reconnect: AtomicBool,
     /// Bumped to cancel in-flight reconnect loops.
     pub reconnect_gen: AtomicU64,
+    /// True while `reconnect_loop` is running. Prevents `finish_session` from
+    /// spawning a second loop (which reset attempt to 1 and painted a stale
+    /// 「重连失败 (1)」 over the live retry).
+    pub reconnect_in_flight: AtomicBool,
     /// While true, ignore OSC 7 cwd updates (prevents new shell $HOME from wiping restore target).
     pub cwd_freeze: AtomicBool,
     /// While true, do not emit remote bytes to the terminal UI.
@@ -180,6 +184,7 @@ impl SessionRuntime {
             cached: Mutex::new(None),
             auto_reconnect: AtomicBool::new(true),
             reconnect_gen: AtomicU64::new(0),
+            reconnect_in_flight: AtomicBool::new(false),
             cwd_freeze: AtomicBool::new(false),
             ui_mute: AtomicBool::new(false),
             cols: AtomicU32::new(80),
