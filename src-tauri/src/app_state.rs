@@ -16,6 +16,7 @@ use crate::cwd::CwdTracker;
 use crate::error::AppError;
 use crate::output_ring::OutputRing;
 use crate::ssh::complete_cache::SessionCompleteCache;
+use crate::ssh::forward::ForwardSet;
 use crate::ssh::openssh::SecureKeyMaterial;
 use crate::ssh::transport::ActiveTransport;
 
@@ -151,6 +152,8 @@ pub struct SessionRuntime {
     pub output_ring: Mutex<OutputRing>,
     /// Concurrent MCP side-channel execs on this session.
     pub mcp_exec_inflight: AtomicU32,
+    /// TCP forwards (`ssh -N -L` / `-R`) owned by this tab.
+    pub local_forwards: ForwardSet,
 }
 
 /// Pending filter for silent control injects (`stty` resize, post-cmd marker echo).
@@ -199,6 +202,7 @@ impl SessionRuntime {
             sep_last_on_data_ms: AtomicU64::new(0),
             output_ring: Mutex::new(OutputRing::default()),
             mcp_exec_inflight: AtomicU32::new(0),
+            local_forwards: ForwardSet::default(),
         }
     }
 

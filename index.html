@@ -59,6 +59,14 @@
               <button type="button" data-action="reconnect" role="menuitem">重新连接</button>
               <button type="button" data-action="close-tab" role="menuitem">关闭标签 <span class="accel">Ctrl+W</span></button>
               <button type="button" data-action="session-props" role="menuitem">会话属性…</button>
+              <button
+                type="button"
+                data-action="local-forward"
+                role="menuitem"
+                title="用当前会话凭据建立 ssh -N -L / -R 端口转发（需已连接）"
+              >
+                端口转发…
+              </button>
               <hr />
               <button
                 type="button"
@@ -142,6 +150,19 @@
       <div class="tab-bar" id="tab-bar" role="tablist" aria-label="会话标签">
         <div class="tab-bar-tabs" id="tab-bar-tabs"></div>
         <button type="button" id="btn-new-tab" class="tab-new" title="新建会话 (Ctrl+N)">+</button>
+      </div>
+
+      <div id="tab-ctx-menu" class="tab-ctx-menu hidden" role="menu" hidden>
+        <button type="button" data-tab-action="local-forward" role="menuitem">
+          端口转发…
+        </button>
+        <button type="button" data-tab-action="open-xftp" role="menuitem">打开 Xftp…</button>
+        <hr />
+        <button type="button" data-tab-action="disconnect" role="menuitem">断开</button>
+        <button type="button" data-tab-action="reconnect" role="menuitem">重新连接</button>
+        <button type="button" data-tab-action="session-props" role="menuitem">会话属性…</button>
+        <hr />
+        <button type="button" data-tab-action="close-tab" role="menuitem">关闭标签</button>
       </div>
 
       <main class="workspace" id="workspace">
@@ -409,6 +430,82 @@
         <button type="button" id="mcp-btn-copy-stdio">复制 stdio 配置</button>
         <span class="dlg-spacer"></span>
         <button type="button" id="mcp-btn-apply" class="primary">应用</button>
+        <button type="button" data-dlg-close>关闭</button>
+      </footer>
+    </dialog>
+
+    <!-- Port forward (ssh -N -L / -R) -->
+    <dialog id="dlg-local-forward" class="app-dialog dlg-wide" aria-labelledby="dlg-fwd-title">
+      <header class="dlg-header">
+        <h2 id="dlg-fwd-title">端口转发</h2>
+        <button type="button" class="dlg-close" data-dlg-close title="关闭">×</button>
+      </header>
+      <div class="dlg-body">
+        <div class="fwd-kind" role="radiogroup" aria-label="转发类型">
+          <label class="fwd-kind-opt">
+            <input type="radio" name="fwd-kind" id="fwd-kind-local" value="local" checked />
+            本地转发 (-L)
+          </label>
+          <label class="fwd-kind-opt">
+            <input type="radio" name="fwd-kind" id="fwd-kind-remote" value="remote" />
+            远程转发 (-R)
+          </label>
+        </div>
+        <p class="hint" id="fwd-hint"></p>
+        <p class="error" id="dlg-fwd-error" hidden></p>
+        <div class="dlg-row">
+          <label>
+            <span id="fwd-bind-label">本机监听地址</span>
+            <input
+              id="fwd-bind"
+              type="text"
+              value="127.0.0.1"
+              placeholder="默认 127.0.0.1"
+              autocomplete="off"
+            />
+          </label>
+          <label>
+            <span id="fwd-listen-label">本机端口</span>
+            <input
+              id="fwd-listen-port"
+              type="text"
+              inputmode="numeric"
+              value="6379"
+              placeholder="默认 6379"
+              autocomplete="off"
+            />
+          </label>
+        </div>
+        <div class="dlg-row">
+          <label>
+            <span id="fwd-dest-host-label">远端主机</span>
+            <input
+              id="fwd-dest-host"
+              type="text"
+              value="127.0.0.1"
+              placeholder="默认 127.0.0.1，可改为内网 IP"
+              autocomplete="off"
+            />
+          </label>
+          <label>
+            <span id="fwd-dest-port-label">远端端口</span>
+            <input
+              id="fwd-dest-port"
+              type="text"
+              inputmode="numeric"
+              value="6379"
+              placeholder="默认 6379"
+              autocomplete="off"
+            />
+          </label>
+        </div>
+        <p class="hint fwd-cmd" id="fwd-cmd-preview"></p>
+        <h3 class="fwd-list-title">当前转发</h3>
+        <ul id="fwd-list" class="fwd-list"></ul>
+      </div>
+      <footer class="dlg-footer">
+        <span class="dlg-spacer"></span>
+        <button type="button" id="fwd-btn-start" class="primary">开始转发</button>
         <button type="button" data-dlg-close>关闭</button>
       </footer>
     </dialog>

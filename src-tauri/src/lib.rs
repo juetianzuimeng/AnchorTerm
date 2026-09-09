@@ -80,6 +80,9 @@ pub fn run() {
             mcp::mcp_regenerate_token,
             mcp::mcp_update_settings,
             mcp::mcp_apply,
+            ssh::forward::start_local_forward,
+            ssh::forward::stop_local_forward,
+            ssh::forward::list_local_forwards,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AnchorTerm");

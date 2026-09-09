@@ -24,7 +24,8 @@ use crate::cwd::{restore_cd_command, CwdTracker};
 use crate::error::AppError;
 use crate::ssh::transport::{connect_session, write_stdin, ConnectParams, SessionCommand};
 
-const BACKOFF_SECS: &[u64] = &[1, 2, 5, 10, 30];
+/// Fixed delay between auto-reconnect attempts (no exponential backoff).
+const RECONNECT_INTERVAL_SECS: u64 = 1;
 
 fn emit_state(app: &AppHandle, rt: &SessionRuntime) {
     let _ = app.emit("session://state", rt.snapshot());
@@ -146,6 +147,16 @@ async fn connect_inner(
                     && p.username == req.username
             })
             .unwrap_or(false);
+
+        let same_ssh_target = prev
+            .as_ref()
+            .map(|p| {
+                p.host == req.host && p.username == req.username && p.port == req.port
+            })
+            .unwrap_or(false);
+        if !same_ssh_target {
+            crate::ssh::forward::drop_all(Some(app), &rt);
+        }
 
         let memory_path = if same_endpoint {
             rt.restore_target
@@ -335,6 +346,7 @@ async fn connect_inner(
                 seed_provisional_home(app, &rt);
                 schedule_seed_login_pwd(app, Arc::clone(&rt), 900);
             }
+            crate::ssh::forward::restart_dead_forwards(app, &rt).await;
             Ok(())
         }
         Err(e) => {
@@ -1038,7 +1050,7 @@ mod permanent_auth_tests {
     }
 }
 
-/// Spawn background reconnect with exponential backoff for a specific session.
+/// Spawn background reconnect with a fixed 1s interval for a specific session.
 pub fn spawn_reconnect_loop(app: AppHandle, session_id: String) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
@@ -1081,7 +1093,7 @@ async fn reconnect_loop(app: AppHandle, rt: Arc<SessionRuntime>, gen: u64) {
         }
 
         attempt = attempt.saturating_add(1);
-        let delay = BACKOFF_SECS[(attempt as usize - 1).min(BACKOFF_SECS.len() - 1)];
+        let delay = RECONNECT_INTERVAL_SECS;
 
         {
             let mut meta = rt.meta.lock().expect("meta lock");
@@ -1244,6 +1256,7 @@ fn close_session_inner(
     rt.reconnect_gen.fetch_add(1, Ordering::SeqCst);
     rt.cwd_freeze.store(false, Ordering::SeqCst);
     rt.set_ui_mute(false);
+    crate::ssh::forward::drop_all(Some(app), &rt);
     rt.clear_side_channel_key();
     crate::ssh::complete_cache::clear_session_cache(&rt);
     shutdown_session_mux(&rt);

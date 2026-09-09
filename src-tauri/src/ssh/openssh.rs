@@ -2092,6 +2092,257 @@ pub async fn openssh_exec_bytes(
     })
 }
 
+/// Long-lived `ssh -N -L` / `-R` child (no remote shell).
+pub(crate) struct RunningLocalForward {
+    pub child: std::sync::Mutex<Option<tokio::process::Child>>,
+    pub alive: Arc<AtomicBool>,
+    stderr_buf: Arc<Mutex<String>>,
+    /// Kept so Drop does not delete the askpass secret mid-auth; dropped after start.
+    _askpass: Option<AskPassMaterial>,
+    _secure_key: Option<SecureKeyMaterial>,
+}
+
+impl RunningLocalForward {
+    pub fn start_kill(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        if let Ok(mut g) = self.child.lock() {
+            if let Some(c) = g.as_mut() {
+                let _ = c.start_kill();
+            }
+        }
+    }
+
+    pub async fn stderr_snapshot(&self) -> String {
+        self.stderr_buf.lock().await.clone()
+    }
+}
+
+impl Drop for RunningLocalForward {
+    fn drop(&mut self) {
+        self.start_kill();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ForwardFlag {
+    Local,
+    Remote,
+}
+
+impl ForwardFlag {
+    pub(crate) fn as_ssh(self) -> &'static str {
+        match self {
+            ForwardFlag::Local => "-L",
+            ForwardFlag::Remote => "-R",
+        }
+    }
+}
+
+/// Spawn `ssh -N -n -L|-R <spec>` and wait until the process is still alive
+/// (forward bound) or it exits with an error.
+pub(crate) async fn start_port_forward_ssh(
+    params: &ConnectParams,
+    flag: ForwardFlag,
+    spec: &str,
+    key_cache: &std::sync::Mutex<Option<SecureKeyMaterial>>,
+    control_path: Option<&Path>,
+) -> Result<RunningLocalForward, AppError> {
+    let ssh = find_ssh()?;
+    let built = build_ssh_args_inner(params, Some(key_cache), control_path, MuxRole::Slave)?;
+    let mut args = built.args;
+    args.retain(|a| a != "-tt");
+    let mut prefix = vec![
+        "-N".into(),
+        "-n".into(),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+        flag.as_ssh().into(),
+        spec.to_string(),
+    ];
+    prefix.append(&mut args);
+
+    let mut cmd = Command::new(&ssh);
+    cmd.args(&prefix)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd.env_remove("TERM");
+
+    if let Some(ref ap) = built.askpass {
+        apply_askpass_env(&mut cmd, ap);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+
+    crate::ops_log::log(
+        "SSH",
+        &format!(
+            "port_forward spawn {}={} mux={}",
+            flag.as_ssh(),
+            spec,
+            control_path.is_some()
+        ),
+    );
+
+    let mut child = cmd.spawn().map_err(|e| {
+        crate::ops_log::log("ERR", &format!("port_forward spawn failed: {e}"));
+        AppError::Ssh(format!("启动端口转发失败: {e}"))
+    })?;
+
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::Ssh("ssh stderr 不可用".into()))?;
+    let err_buf = Arc::new(Mutex::new(String::new()));
+    let err_b = Arc::clone(&err_buf);
+    tokio::spawn(async move {
+        let mut r = stderr;
+        let mut tmp = [0u8; 2048];
+        loop {
+            match r.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut g = err_b.lock().await;
+                    if g.len() < 8192 {
+                        g.push_str(&String::from_utf8_lossy(&tmp[..n]));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let mut stable_since: Option<tokio::time::Instant> = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let err_text = err_buf.lock().await.clone();
+                crate::ops_log::log(
+                    "ERR",
+                    &format!(
+                        "port_forward exited during start status={status:?} err={}",
+                        err_text.chars().take(280).collect::<String>()
+                    ),
+                );
+                return Err(classify_forward_error(flag, &err_text, status.code()));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(AppError::Ssh(format!("查询转发进程失败: {e}")));
+            }
+        }
+
+        let err_text = err_buf.lock().await.clone();
+        let lower = err_text.to_ascii_lowercase();
+        if lower.contains("cannot listen")
+            || lower.contains("address already in use")
+            || lower.contains("could not request local forwarding")
+            || lower.contains("could not request remote forwarding")
+            || lower.contains("remote port forwarding failed")
+            || lower.contains("permission denied")
+            || lower.contains("administratively prohibited")
+        {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(classify_forward_error(flag, &err_text, None));
+        }
+
+        let now = tokio::time::Instant::now();
+        if stable_since.is_none() {
+            stable_since = Some(now);
+        }
+        // OpenSSH prints nothing on success. Stay up ~2s so fast bind/auth
+        // failures still surface here (ExitOnForwardFailure=yes).
+        if now.duration_since(stable_since.unwrap()) >= Duration::from_millis(3000) {
+            break;
+        }
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    if child.try_wait().ok().flatten().is_some() {
+        let err_text = err_buf.lock().await.clone();
+        return Err(classify_forward_error(flag, &err_text, None));
+    }
+
+    crate::ops_log::log(
+        "SSH",
+        &format!("port_forward listening {}={}", flag.as_ssh(), spec),
+    );
+    // Auth is done; drop the askpass secret file. Keep decrypted key until the
+    // tunnel process exits (OpenSSH still holds `-i` path).
+    drop(built.askpass);
+
+    Ok(RunningLocalForward {
+        child: std::sync::Mutex::new(Some(child)),
+        alive: Arc::new(AtomicBool::new(true)),
+        stderr_buf: err_buf,
+        _askpass: None,
+        _secure_key: built.secure_key,
+    })
+}
+
+pub(crate) fn classify_forward_error(
+    flag: ForwardFlag,
+    stderr: &str,
+    exit: Option<i32>,
+) -> AppError {
+    let l = stderr.to_ascii_lowercase();
+    // Windows OpenSSH reports WSAEACCES as "Permission denied" (not EADDRINUSE)
+    // when the local port is in use or in a Hyper-V/WSL excluded range.
+    if l.contains("permission denied")
+        && (l.contains("cannot listen")
+            || l.contains("bind [")
+            || l.contains("bind:"))
+    {
+        return AppError::Ssh(match flag {
+            ForwardFlag::Local => {
+                "本机端口无法监听（Permission denied）。端口可能已被占用，或被 Windows/Hyper-V/WSL 保留。请换一个本机端口（例如 16379）。"
+                    .into()
+            }
+            ForwardFlag::Remote => {
+                "远端端口无法监听（Permission denied）。请更换远端端口，或检查 GatewayPorts。"
+                    .into()
+            }
+        });
+    }
+    if l.contains("address already in use") || l.contains("cannot listen") {
+        return AppError::Ssh(match flag {
+            ForwardFlag::Local => {
+                "本机端口已被占用，无法监听。请更换本机端口后重试。".into()
+            }
+            ForwardFlag::Remote => {
+                "远端端口无法监听（已被占用，或服务器未允许 GatewayPorts）。请更换远端端口。"
+                    .into()
+            }
+        });
+    }
+    if l.contains("could not request local forwarding")
+        || l.contains("could not request remote forwarding")
+        || l.contains("remote port forwarding failed")
+        || l.contains("administratively prohibited")
+    {
+        return AppError::Ssh(match flag {
+            ForwardFlag::Local => {
+                "服务器拒绝了本地端口转发（AllowTcpForwarding）。".into()
+            }
+            ForwardFlag::Remote => {
+                "服务器拒绝了远程端口转发（AllowTcpForwarding / GatewayPorts）。".into()
+            }
+        });
+    }
+    classify_auth_error(stderr, exit)
+}
+
 /// Cap for scp stdout/stderr capture (quiet mode; avoid unbounded growth).
 const SCP_CAPTURE_MAX: usize = 64 * 1024;
 

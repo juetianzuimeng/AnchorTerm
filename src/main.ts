@@ -74,6 +74,32 @@ interface ErrorEvent {
   message: string;
 }
 
+type LocalForwardState = "starting" | "listening" | "failed" | "stopped";
+type PortForwardKind = "local" | "remote";
+
+interface LocalForwardInfo {
+  id: string;
+  kind?: PortForwardKind;
+  bind_address: string;
+  listen_port?: number;
+  dest_host?: string;
+  dest_port?: number;
+  /** @deprecated older local-only payload */
+  local_port?: number;
+  remote_host?: string;
+  remote_port?: number;
+  state: LocalForwardState;
+  message?: string | null;
+  ssh_arg?: string;
+  l_arg: string;
+}
+
+interface ForwardsEvent {
+  session_id?: string;
+  sessionId?: string;
+  forwards: LocalForwardInfo[];
+}
+
 interface PendingInputBuffer {
   text: string;
   cursor: number;
@@ -962,6 +988,8 @@ class SessionView {
   lastForm: ConnectFormSnapshot | null = null;
   /** True after auto-launch Xftp was attempted for this tab (once per lifetime). */
   xftpAutoLaunched = false;
+  /** Active / remembered local port forwards for this tab. */
+  forwards: LocalForwardInfo[] = [];
 
   term: Terminal;
   fitAddon: FitAddon;
@@ -2268,6 +2296,17 @@ function renderTabBar() {
     title.className = "tab-title";
     title.textContent = view.title;
 
+    const listening = view.forwards.filter((f) => f.state === "listening");
+    const fwdBadge = document.createElement("span");
+    if (listening.length > 0) {
+      const hasL = listening.some((f) => (f.kind || "local") === "local");
+      const hasR = listening.some((f) => f.kind === "remote");
+      fwdBadge.className = "tab-fwd";
+      fwdBadge.textContent = hasL && hasR ? "LR" : hasR ? "R" : "L";
+      fwdBadge.title = listening.map((f) => formatForwardLine(f)).join("\n");
+      tab.title += `\n端口转发 ×${listening.length}`;
+    }
+
     const close = document.createElement("button");
     close.type = "button";
     close.className = "tab-close";
@@ -2278,10 +2317,412 @@ function renderTabBar() {
       void closeSessionTab(view.sessionId);
     });
 
-    tab.append(dot, title, close);
+    if (listening.length > 0) {
+      tab.append(dot, title, fwdBadge, close);
+    } else {
+      tab.append(dot, title, close);
+    }
     tab.addEventListener("click", () => activate(view.sessionId));
+    tab.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      showTabContextMenu(view, ev.clientX, ev.clientY);
+    });
     host.appendChild(tab);
   }
+}
+
+let fwdDialogSessionId: string | null = null;
+
+function forwardKindOf(f: LocalForwardInfo): PortForwardKind {
+  return f.kind === "remote" ? "remote" : "local";
+}
+
+function forwardListenPort(f: LocalForwardInfo): number {
+  return f.listen_port ?? f.local_port ?? 0;
+}
+
+function forwardDestHost(f: LocalForwardInfo): string {
+  return f.dest_host ?? f.remote_host ?? "";
+}
+
+function forwardDestPort(f: LocalForwardInfo): number {
+  return f.dest_port ?? f.remote_port ?? 0;
+}
+
+function formatForwardLine(f: LocalForwardInfo): string {
+  const flag = forwardKindOf(f) === "remote" ? "-R" : "-L";
+  return `${flag} ${f.bind_address}:${forwardListenPort(f)} → ${forwardDestHost(f)}:${forwardDestPort(f)}`;
+}
+
+function readFwdKind(): PortForwardKind {
+  const remote = document.getElementById("fwd-kind-remote") as HTMLInputElement | null;
+  return remote?.checked ? "remote" : "local";
+}
+
+const FWD_DEFAULT_BIND = "127.0.0.1";
+const FWD_DEFAULT_DEST_HOST = "127.0.0.1";
+const FWD_DEFAULT_PORT = 6379;
+
+function fillEmptyFwdDefaults() {
+  const bind = document.getElementById("fwd-bind") as HTMLInputElement | null;
+  const listen = document.getElementById("fwd-listen-port") as HTMLInputElement | null;
+  const destHost = document.getElementById("fwd-dest-host") as HTMLInputElement | null;
+  const destPort = document.getElementById("fwd-dest-port") as HTMLInputElement | null;
+  if (bind && !bind.value.trim()) bind.value = FWD_DEFAULT_BIND;
+  if (listen && !listen.value.trim()) listen.value = String(FWD_DEFAULT_PORT);
+  if (destHost && !destHost.value.trim()) destHost.value = FWD_DEFAULT_DEST_HOST;
+  if (destPort && !destPort.value.trim()) destPort.value = String(FWD_DEFAULT_PORT);
+}
+
+function syncFwdKindLabels() {
+  const kind = readFwdKind();
+  const hint = document.getElementById("fwd-hint");
+  const bindLabel = document.getElementById("fwd-bind-label");
+  const listenLabel = document.getElementById("fwd-listen-label");
+  const destHostLabel = document.getElementById("fwd-dest-host-label");
+  const destPortLabel = document.getElementById("fwd-dest-port-label");
+  const destHost = document.getElementById("fwd-dest-host") as HTMLInputElement | null;
+  // Only fill blanks — never overwrite a value the user already edited.
+  fillEmptyFwdDefaults();
+  if (kind === "remote") {
+    if (hint) {
+      hint.innerHTML =
+        "把<strong>本机服务</strong>暴露到 SSH 服务器上，等价于 <code>ssh -N -R 远端端口:本机主机:本机端口 user@host</code>。地址和端口均有默认值，可直接改。远端监听默认仅本机回环；若要对外监听需服务器开启 GatewayPorts。";
+    }
+    if (bindLabel) bindLabel.textContent = "远端监听地址";
+    if (listenLabel) listenLabel.textContent = "远端端口";
+    if (destHostLabel) destHostLabel.textContent = "本机目标主机";
+    if (destPortLabel) destPortLabel.textContent = "本机端口";
+    if (destHost) destHost.placeholder = "默认 127.0.0.1";
+  } else {
+    if (hint) {
+      hint.innerHTML =
+        "把远端内网服务映射到本机，等价于 <code>ssh -N -L 本机端口:远端主机:远端端口 user@host</code>。端口默认 6379，主机默认 127.0.0.1，都可以改（例如改成 Redis 内网 IP）。";
+    }
+    if (bindLabel) bindLabel.textContent = "本机监听地址";
+    if (listenLabel) listenLabel.textContent = "本机端口";
+    if (destHostLabel) destHostLabel.textContent = "远端主机";
+    if (destPortLabel) destPortLabel.textContent = "远端端口";
+    if (destHost) destHost.placeholder = "默认 127.0.0.1，可改为内网 IP";
+  }
+  updateFwdCmdPreview();
+}
+
+function hideTabContextMenu() {
+  const menu = document.getElementById("tab-ctx-menu");
+  if (!menu) return;
+  menu.classList.add("hidden");
+  menu.setAttribute("hidden", "");
+}
+
+function showTabContextMenu(view: SessionView, x: number, y: number) {
+  closeAllMenus();
+  activate(view.sessionId);
+  const menu = $("tab-ctx-menu");
+  const connected = view.isLive();
+  const setEnabled = (action: string, on: boolean) => {
+    const btn = menu.querySelector(
+      `[data-tab-action="${action}"]`,
+    ) as HTMLButtonElement | null;
+    if (btn) btn.disabled = !on;
+  };
+  setEnabled("local-forward", connected);
+  setEnabled("open-xftp", connected);
+  setEnabled("disconnect", connected || view.state === "connecting" || view.state === "reconnecting");
+  setEnabled("reconnect", view.canReconnectSameTab());
+  setEnabled("session-props", true);
+  setEnabled("close-tab", true);
+
+  menu.classList.remove("hidden");
+  menu.removeAttribute("hidden");
+  const pad = 8;
+  const mw = menu.offsetWidth || 220;
+  const mh = menu.offsetHeight || 200;
+  const left = Math.min(x, window.innerWidth - mw - pad);
+  const top = Math.min(y, window.innerHeight - mh - pad);
+  menu.style.left = `${Math.max(pad, left)}px`;
+  menu.style.top = `${Math.max(pad, top)}px`;
+}
+
+function setupTabContextMenu() {
+  const menu = document.getElementById("tab-ctx-menu");
+  if (!menu) return;
+  menu.querySelectorAll("[data-tab-action]").forEach((el) => {
+    el.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const action = (el as HTMLElement).dataset.tabAction;
+      hideTabContextMenu();
+      if (action) void handleMenuAction(action);
+    });
+  });
+  document.addEventListener(
+    "mousedown",
+    (ev) => {
+      if (menu.classList.contains("hidden")) return;
+      if (menu.contains(ev.target as Node)) return;
+      hideTabContextMenu();
+    },
+    true,
+  );
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") hideTabContextMenu();
+  });
+  window.addEventListener("blur", () => hideTabContextMenu());
+}
+
+function setFwdError(msg: string | null) {
+  const el = $("dlg-fwd-error");
+  if (!msg) {
+    el.hidden = true;
+    el.textContent = "";
+    return;
+  }
+  el.hidden = false;
+  el.textContent = msg.replace(/^[A-Z_]+:\s*/, "");
+}
+
+function parsePortField(raw: string, fallback: number): { value: number; empty: boolean } {
+  const t = raw.trim();
+  if (!t) return { value: fallback, empty: true };
+  const n = Number(t);
+  return { value: n, empty: false };
+}
+
+function readFwdForm() {
+  const kind = readFwdKind();
+  const bind =
+    ($("fwd-bind") as HTMLInputElement).value.trim() || FWD_DEFAULT_BIND;
+  const listen = parsePortField(
+    ($("fwd-listen-port") as HTMLInputElement).value,
+    FWD_DEFAULT_PORT,
+  );
+  const destHost =
+    ($("fwd-dest-host") as HTMLInputElement).value.trim() || FWD_DEFAULT_DEST_HOST;
+  const dest = parsePortField(
+    ($("fwd-dest-port") as HTMLInputElement).value,
+    FWD_DEFAULT_PORT,
+  );
+  return {
+    kind,
+    bind,
+    listenPort: listen.value,
+    destHost,
+    destPort: dest.value,
+  };
+}
+
+function updateFwdCmdPreview() {
+  const el = document.getElementById("fwd-cmd-preview");
+  if (!el) return;
+  const view = fwdDialogSessionId
+    ? sessions.get(fwdDialogSessionId)
+    : getActive();
+  const { kind, bind, listenPort, destHost, destPort } = readFwdForm();
+  const host = view?.lastForm?.host || view?.host || "<host>";
+  const user = view?.lastForm?.username || view?.username || "<user>";
+  const port = view?.lastForm?.port || 22;
+  const flag = kind === "remote" ? "-R" : "-L";
+  const dh =
+    destHost || (kind === "remote" ? "127.0.0.1" : "<远端主机>");
+  const lp =
+    Number.isFinite(listenPort) && listenPort > 0
+      ? String(listenPort)
+      : kind === "remote"
+        ? "<远端端口>"
+        : "<本机端口>";
+  const dp =
+    Number.isFinite(destPort) && destPort > 0
+      ? String(destPort)
+      : kind === "remote"
+        ? "<本机端口>"
+        : "<远端端口>";
+  const spec =
+    !bind || bind === "127.0.0.1" || bind.toLowerCase() === "localhost"
+      ? `${lp}:${dh}:${dp}`
+      : `${bind}:${lp}:${dh}:${dp}`;
+  el.textContent = `ssh -N ${flag} ${spec} ${user}@${host} -p ${port}`;
+}
+
+function renderFwdList(view: SessionView | null) {
+  const ul = $("fwd-list");
+  ul.innerHTML = "";
+  const items = view?.forwards || [];
+  if (items.length === 0) {
+    const li = document.createElement("li");
+    li.className = "fwd-empty";
+    li.textContent = "暂无转发。填写上方参数后点「开始转发」。";
+    ul.appendChild(li);
+    return;
+  }
+  const labels: Record<LocalForwardState, string> = {
+    starting: "建立中…",
+    listening: "监听中",
+    failed: "已断开",
+    stopped: "已停止",
+  };
+  for (const f of items) {
+    const li = document.createElement("li");
+    const meta = document.createElement("div");
+    meta.className = "fwd-meta";
+    const spec = document.createElement("div");
+    spec.className = "fwd-spec";
+    spec.textContent = formatForwardLine(f);
+    const st = document.createElement("div");
+    st.className = `fwd-state ${f.state}`;
+    st.textContent = f.message
+      ? `${labels[f.state] || f.state} · ${f.message}`
+      : labels[f.state] || f.state;
+    meta.append(spec, st);
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.textContent = "停止";
+    stop.addEventListener("click", () => {
+      void stopLocalForward(view!.sessionId, f.id);
+    });
+    li.append(meta, stop);
+    ul.appendChild(li);
+  }
+}
+
+function applyForwardsToView(sid: string, forwards: LocalForwardInfo[]) {
+  const view = sessions.get(sid);
+  if (!view) return;
+  view.forwards = forwards;
+  renderTabBar();
+  if (fwdDialogSessionId === sid) {
+    renderFwdList(view);
+  }
+}
+
+async function openLocalForwardDialog(sessionId?: string) {
+  const view = sessionId
+    ? sessions.get(sessionId) ?? null
+    : getActive();
+  if (!view) {
+    showToast("请先打开并连接一个会话");
+    return;
+  }
+  if (!view.isLive()) {
+    showToast("请先连接会话后再建立端口转发");
+    return;
+  }
+  activate(view.sessionId);
+  fwdDialogSessionId = view.sessionId;
+  setFwdError(null);
+  try {
+    const list = await invoke<LocalForwardInfo[]>("list_local_forwards", {
+      sessionId: view.sessionId,
+    });
+    view.forwards = list;
+  } catch (e) {
+    opsLog("ERR", "list_local_forwards failed", { error: String(e) });
+  }
+  syncFwdKindLabels();
+  updateFwdCmdPreview();
+  renderFwdList(view);
+  ($("dlg-local-forward") as HTMLDialogElement).showModal();
+}
+
+async function startLocalForwardFromDialog() {
+  const sid = fwdDialogSessionId;
+  const view = sid ? sessions.get(sid) : null;
+  if (!view) {
+    setFwdError("会话不存在");
+    return;
+  }
+  if (!view.isLive()) {
+    setFwdError("会话未连接");
+    return;
+  }
+  const { kind, bind, listenPort, destHost, destPort } = readFwdForm();
+  if (!destHost) {
+    setFwdError(
+      kind === "remote"
+        ? "请填写本机目标主机（默认 127.0.0.1）"
+        : "请填写远端主机（默认 127.0.0.1，可改为 Redis 内网 IP）",
+    );
+    return;
+  }
+  if (!Number.isInteger(listenPort) || listenPort < 1 || listenPort > 65535) {
+    setFwdError(
+      kind === "remote"
+        ? "远端端口须为 1–65535（可留空使用默认 6379）"
+        : "本机端口须为 1–65535（可留空使用默认 6379）",
+    );
+    return;
+  }
+  if (!Number.isInteger(destPort) || destPort < 1 || destPort > 65535) {
+    setFwdError(
+      kind === "remote"
+        ? "本机端口须为 1–65535（可留空使用默认 6379）"
+        : "远端端口须为 1–65535（可留空使用默认 6379）",
+    );
+    return;
+  }
+  setFwdError(null);
+  const btn = $("fwd-btn-start") as HTMLButtonElement;
+  btn.disabled = true;
+  try {
+    const info = await invoke<LocalForwardInfo>("start_local_forward", {
+      req: {
+        session_id: view.sessionId,
+        kind,
+        listen_port: listenPort,
+        dest_host: destHost,
+        dest_port: destPort,
+        bind_address: bind,
+      },
+    });
+    const next = view.forwards.filter((f) => f.id !== info.id);
+    next.push(info);
+    applyForwardsToView(view.sessionId, next);
+    showToast(`已转发 ${formatForwardLine(info)}`);
+    opsLog("UI", "port_forward start ok", {
+      sid: view.sessionId.slice(0, 8),
+      kind,
+      spec: info.ssh_arg || info.l_arg,
+    });
+  } catch (e) {
+    const msg = String(e);
+    setFwdError(msg);
+    showToast(msg.replace(/^[A-Z_]+:\s*/, "") || "转发失败");
+    opsLog("ERR", "port_forward start failed", { error: msg });
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function stopLocalForward(sessionId: string, forwardId: string) {
+  try {
+    await invoke("stop_local_forward", { sessionId, forwardId });
+    const view = sessions.get(sessionId);
+    if (view) {
+      applyForwardsToView(
+        sessionId,
+        view.forwards.filter((f) => f.id !== forwardId),
+      );
+    }
+    showToast("已停止端口转发");
+  } catch (e) {
+    showToast(String(e).replace(/^[A-Z_]+:\s*/, "") || "停止失败");
+  }
+}
+
+function setupForwardDialog() {
+  const dlg = document.getElementById("dlg-local-forward");
+  if (!dlg) return;
+  $("fwd-btn-start").addEventListener("click", () => {
+    void startLocalForwardFromDialog();
+  });
+  for (const id of ["fwd-bind", "fwd-listen-port", "fwd-dest-host", "fwd-dest-port"]) {
+    const el = $(id) as HTMLInputElement;
+    el.addEventListener("input", () => updateFwdCmdPreview());
+    el.addEventListener("focus", () => el.select());
+  }
+  document.querySelectorAll('input[name="fwd-kind"]').forEach((el) => {
+    el.addEventListener("change", () => syncFwdKindLabels());
+  });
 }
 
 function syncGlobalStatusBar() {
@@ -3623,6 +4064,9 @@ async function handleMenuAction(action: string) {
         openPropsDialog("edit-runtime", { sessionId: active.sessionId });
       }
       break;
+    case "local-forward":
+      await openLocalForwardDialog(active?.sessionId);
+      break;
     case "open-logs": {
       // Prefer native backend open (explorer/xdg-open) — plugin-opener's
       // `openPath` needs path scope and is not in opener:default.
@@ -4139,6 +4583,16 @@ async function setupEvents() {
     }
     if (p.message) sessions.get(sid)!.setError(p.message);
   });
+
+  await listen<ForwardsEvent>("session://forwards", (event) => {
+    const p = event.payload;
+    const sid = payloadSessionId(p || {});
+    if (!sid || !sessions.has(sid)) {
+      eventRouteMiss("session://forwards", sid);
+      return;
+    }
+    applyForwardsToView(sid, p.forwards || []);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -4151,6 +4605,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   renderTabBar();
   syncGlobalStatusBar();
   setupMenubar();
+  setupTabContextMenu();
+  setupForwardDialog();
   syncCmdSeparatorMenu();
   syncXftpAutoMenu();
   setupShortcuts();
