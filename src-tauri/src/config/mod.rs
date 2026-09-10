@@ -1,3 +1,4 @@
+pub mod forwards;
 pub mod last_cwd;
 pub mod profile;
 pub mod transfer;
@@ -10,6 +11,7 @@ use crate::config::profile::{HostProfile, ProfileStore};
 use crate::error::AppError;
 
 pub use last_cwd::{clear_last_cwd, load_last_cwd, save_last_cwd};
+pub use forwards::{get_auto_restore, load_persisted, remove_rule, set_auto_restore, upsert_rule};
 pub use transfer::{
     export_profiles, import_profiles, ExportRequest, ExportResult, ImportRequest, ImportResult,
 };

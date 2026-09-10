@@ -4,13 +4,13 @@
 //! - Local (`-L`): `ssh -N -L [bind:]listen:dest_host:dest_port user@host -p port`
 //! - Remote (`-R`): `ssh -N -R [bind:]listen:dest_host:dest_port user@host -p port`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use crate::app_state::{AppState, SessionRuntime, SessionState};
@@ -64,14 +64,25 @@ pub enum ForwardState {
     Stopped,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForwardSpec {
     pub id: String,
+    #[serde(default)]
     pub kind: ForwardKind,
+    #[serde(default = "default_bind")]
     pub bind_address: String,
     pub listen_port: u16,
+    #[serde(default = "default_dest")]
     pub dest_host: String,
     pub dest_port: u16,
+}
+
+fn default_bind() -> String {
+    DEFAULT_BIND.to_string()
+}
+
+fn default_dest() -> String {
+    DEFAULT_DEST.to_string()
 }
 
 impl ForwardSpec {
@@ -140,6 +151,9 @@ impl ForwardInfo {
 pub struct ForwardsEvent {
     pub session_id: String,
     pub forwards: Vec<ForwardInfo>,
+    /// Whether auto-restore is enabled for this session's endpoint.
+    #[serde(default)]
+    pub auto_restore: bool,
 }
 
 struct LiveForward {
@@ -151,6 +165,9 @@ struct ForwardSetInner {
     desired: Vec<ForwardSpec>,
     live: HashMap<String, LiveForward>,
     last_error: HashMap<String, String>,
+    /// Ids whose last spawn failed permanently (port in use / AllowTcpForwarding
+    /// denied / agent-only auth). Not retried by `restart_dead_forwards`.
+    permanent_failed: HashSet<String>,
 }
 
 pub struct ForwardSet {
@@ -164,6 +181,7 @@ impl Default for ForwardSet {
                 desired: Vec::new(),
                 live: HashMap::new(),
                 last_error: HashMap::new(),
+                permanent_failed: HashSet::new(),
             }),
         }
     }
@@ -216,6 +234,7 @@ impl ForwardSet {
         g.live.clear();
         g.desired.clear();
         g.last_error.clear();
+        g.permanent_failed.clear();
     }
 
     fn take_dead_desired(&self) -> Vec<ForwardSpec> {
@@ -309,11 +328,25 @@ fn normalize_host(raw: &str, default: &str, label: &str) -> Result<String, AppEr
 }
 
 fn emit_forwards(app: &AppHandle, rt: &SessionRuntime) {
+    let auto_restore = rt
+        .cached
+        .lock()
+        .ok()
+        .and_then(|c| c.clone())
+        .map(|c| {
+            if c.host.is_empty() || c.username.is_empty() {
+                false
+            } else {
+                crate::config::get_auto_restore(&c.host, c.port, &c.username)
+            }
+        })
+        .unwrap_or(false);
     let _ = app.emit(
         "session://forwards",
         ForwardsEvent {
             session_id: rt.id.clone(),
             forwards: rt.local_forwards.snapshot(),
+            auto_restore,
         },
     );
 }
@@ -430,7 +463,12 @@ fn attach_wait_task(app: AppHandle, rt: Arc<SessionRuntime>, id: String, handle:
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     g.live.remove(&id);
-                    g.last_error.insert(id.clone(), msg);
+                    g.last_error.insert(id.clone(), msg.clone());
+                    // Permanent failure (port in use / AllowTcpForwarding denied /
+                    // agent-only auth) → do not retry on next reconnect.
+                    if forward_failure_is_permanent(&msg) {
+                        g.permanent_failed.insert(id.clone());
+                    }
                 }
                 crate::ops_log::log(
                     "SSH",
@@ -502,6 +540,8 @@ async fn spawn_and_attach(
             },
         );
     }
+    // Persist on start (id-scoped upsert — safe across concurrent tabs).
+    crate::config::upsert_rule(&params.host, params.port, &params.username, &spec);
     attach_wait_task(app.clone(), Arc::clone(rt), spec.id.clone(), handle);
     emit_forwards(app, rt);
 
@@ -526,6 +566,8 @@ pub async fn restart_dead_forwards(app: &AppHandle, rt: &Arc<SessionRuntime>) {
     if dead.is_empty() {
         return;
     }
+    let state_guard = app.state::<AppState>();
+    let state = state_guard.inner();
     crate::ops_log::log(
         "SSH",
         &format!(
@@ -535,6 +577,38 @@ pub async fn restart_dead_forwards(app: &AppHandle, rt: &Arc<SessionRuntime>) {
         ),
     );
     for spec in dead {
+        // Permanent failures are never retried.
+        if rt
+            .local_forwards
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .permanent_failed
+            .contains(&spec.id)
+        {
+            continue;
+        }
+        // Cross-session port conflict (another tab already bound it): skip for
+        // now, but stay retryable in case that tab closes.
+        if let Err(e) = validate_listen_conflict(&state, rt, &spec) {
+            {
+                let mut g = rt
+                    .local_forwards
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                g.last_error.insert(spec.id.clone(), e.to_string());
+            }
+            crate::ops_log::log(
+                "FWD",
+                &format!(
+                    "port_forward skip (conflict) sid={} spec={} err={e}",
+                    &rt.id[..rt.id.len().min(8)],
+                    spec.ssh_arg()
+                ),
+            );
+            continue;
+        }
         if let Err(e) = spawn_and_attach(app, rt, spec.clone()).await {
             {
                 let mut g = rt
@@ -555,6 +629,54 @@ pub async fn restart_dead_forwards(app: &AppHandle, rt: &Arc<SessionRuntime>) {
         }
     }
     emit_forwards(app, rt);
+}
+
+/// Load this endpoint's persisted rules into `desired` (if auto-restore is on)
+/// so `restart_dead_forwards` can spawn them after connect. Called on first
+/// connect, after `drop_all` for a changed target. Does NOT persist (disk is
+/// the source of truth). Does not emit — the subsequent `restart_dead_forwards`
+/// emits once the loaded (still-not-live) rules are picked up, at which point
+/// `rt.cached` is already populated.
+pub fn load_persisted_for(
+    rt: &SessionRuntime,
+    host: &str,
+    port: u16,
+    username: &str,
+) {
+    let ep = match crate::config::load_persisted(host, port, username) {
+        Some(ep) => ep,
+        None => return,
+    };
+    if !ep.auto_restore {
+        return;
+    }
+    let count = ep.rules.len();
+    {
+        let mut g = rt
+            .local_forwards
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for spec in ep.rules {
+            let dup = g
+                .desired
+                .iter()
+                .any(|s| s.kind == spec.kind && s.listen_port == spec.listen_port);
+            if !dup {
+                g.desired.push(spec);
+            }
+        }
+    }
+    crate::ops_log::log(
+        "FWD",
+        &format!(
+            "forwards auto-restore loaded sid={} host={} user={} count={}",
+            &rt.id[..rt.id.len().min(8)],
+            host,
+            username,
+            count
+        ),
+    );
 }
 
 #[derive(Debug, Deserialize)]
@@ -579,6 +701,85 @@ pub async fn start_local_forward(
         .map_err(Into::into)
 }
 
+/// Validate that `spec.listen_port` is free for this session: not already used
+/// by this session (excluding `spec.id` itself, so a stopped rule can be
+/// re-started) and not taken by another live session to the same endpoint.
+/// Shared by `start_local_forward` and `restart_dead_forwards` (auto-restore),
+/// so a second tab to the same host reports a clean conflict instead of
+/// double-binding the port.
+fn validate_listen_conflict(
+    state: &AppState,
+    rt: &SessionRuntime,
+    spec: &ForwardSpec,
+) -> Result<(), AppError> {
+    let sid = rt.id.clone();
+    {
+        let g = rt
+            .local_forwards
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dup = g.desired.iter().any(|s| {
+            s.id != spec.id && s.kind == spec.kind && s.listen_port == spec.listen_port
+        });
+        let live_dup = g.live.values().any(|l| {
+            l.spec.id != spec.id
+                && l.spec.kind == spec.kind
+                && l.spec.listen_port == spec.listen_port
+                && l.handle.alive.load(Ordering::SeqCst)
+        });
+        if dup || live_dup {
+            return Err(AppError::Message(match spec.kind {
+                ForwardKind::Local => {
+                    format!("本机端口 {} 已在本会话转发中", spec.listen_port)
+                }
+                ForwardKind::Remote => {
+                    format!("远端端口 {} 已在本会话转发中", spec.listen_port)
+                }
+            }));
+        }
+    }
+    match spec.kind {
+        ForwardKind::Local => {
+            if local_listen_taken_elsewhere(state, spec.listen_port, &sid) {
+                return Err(AppError::Message(format!(
+                    "本机端口 {} 已被其他会话占用",
+                    spec.listen_port
+                )));
+            }
+        }
+        ForwardKind::Remote => {
+            let cached = rt.cached.lock().expect("cached lock").clone();
+            if let Some(c) = cached {
+                if remote_listen_taken_elsewhere(state, &sid, &c.host, c.port, spec.listen_port) {
+                    return Err(AppError::Message(format!(
+                        "远端端口 {} 已在同一主机的其他会话转发中",
+                        spec.listen_port
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Permanent (non-retryable) failures detected from a classified error message.
+fn forward_failure_is_permanent(msg: &str) -> bool {
+    let l = msg.to_ascii_lowercase();
+    l.contains("address already in use")
+        || l.contains("permission denied")
+        || l.contains("已被占用")
+        || l.contains("已在本会话")
+        || l.contains("已被其他会话")
+        || l.contains("allowtcpforwarding")
+        || l.contains("gatewayports")
+        || l.contains("被拒绝")
+        || l.contains("无法监听")
+        || l.contains("ssh-agent")
+        || l.contains("agent only")
+        || l.contains("administratively prohibited")
+}
+
 async fn start_port_forward_inner(
     app: &AppHandle,
     state: &AppState,
@@ -588,14 +789,38 @@ async fn start_port_forward_inner(
     if sid.is_empty() {
         return Err(AppError::Message("session_id 不能为空".into()));
     }
-    let spec = parse_spec(
+    let rt = state.get_runtime(sid)?;
+
+    // Reuse a stopped rule's id when the same kind+listen_port is requested
+    // again (lets the list's "启动" button / a re-create with the same port
+    // reuse the persisted id instead of tripping the "already in session" check).
+    let existing_id = {
+        let g = rt
+            .local_forwards
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        g.desired
+            .iter()
+            .find(|s| {
+                s.kind == req.kind
+                    && s.listen_port == req.listen_port
+                    && !g.live.contains_key(&s.id)
+            })
+            .map(|s| s.id.clone())
+    };
+
+    let mut spec = parse_spec(
         req.kind,
         req.bind_address.as_deref(),
         req.listen_port,
         &req.dest_host,
         req.dest_port,
     )?;
-    let rt = state.get_runtime(sid)?;
+    if let Some(id) = existing_id {
+        spec.id = id;
+    }
+
     {
         let n = rt
             .local_forwards
@@ -610,43 +835,17 @@ async fn start_port_forward_inner(
             )));
         }
     }
-    if rt.local_forwards.has_listen(spec.kind, spec.listen_port) {
-        return Err(AppError::Message(match spec.kind {
-            ForwardKind::Local => {
-                format!("本机端口 {} 已在本会话转发中", spec.listen_port)
-            }
-            ForwardKind::Remote => {
-                format!("远端端口 {} 已在本会话转发中", spec.listen_port)
-            }
-        }));
-    }
-    match spec.kind {
-        ForwardKind::Local => {
-            if local_listen_taken_elsewhere(state, spec.listen_port, sid) {
-                return Err(AppError::Message(format!(
-                    "本机端口 {} 已被其他会话占用",
-                    spec.listen_port
-                )));
-            }
-        }
-        ForwardKind::Remote => {
-            let cached = rt.cached.lock().expect("cached lock").clone();
-            if let Some(c) = cached {
-                if remote_listen_taken_elsewhere(
-                    state,
-                    sid,
-                    &c.host,
-                    c.port,
-                    spec.listen_port,
-                ) {
-                    return Err(AppError::Message(format!(
-                        "远端端口 {} 已在同一主机的其他会话转发中",
-                        spec.listen_port
-                    )));
-                }
-            }
-        }
-    }
+
+    validate_listen_conflict(state, &rt, &spec)?;
+
+    // User explicitly (re)starting this rule: allow retries again.
+    rt.local_forwards
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .permanent_failed
+        .remove(&spec.id);
+
     spawn_and_attach(app, &rt, spec).await
 }
 
@@ -676,6 +875,12 @@ pub async fn stop_local_forward(
             live.handle.start_kill();
         }
     }
+    // Stop = forget the saved rule (so it won't auto-restore next time).
+    if let Some(c) = rt.cached.lock().expect("cached lock").clone() {
+        if !c.host.is_empty() && !c.username.is_empty() {
+            crate::config::remove_rule(&c.host, c.port, &c.username, id);
+        }
+    }
     crate::ops_log::log(
         "SSH",
         &format!(
@@ -697,6 +902,51 @@ pub async fn list_local_forwards(
         .get_runtime(session_id.trim())
         .map_err(|e| -> String { e.into() })?;
     Ok(rt.local_forwards.snapshot())
+}
+
+fn endpoint_of(rt: &SessionRuntime) -> Option<(String, u16, String)> {
+    rt.cached
+        .lock()
+        .ok()
+        .and_then(|c| c.clone())
+        .filter(|c| !c.host.is_empty() && !c.username.is_empty())
+        .map(|c| (c.host, c.port, c.username))
+}
+
+#[tauri::command]
+pub async fn get_forward_auto_restore(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<bool, String> {
+    let rt = state
+        .get_runtime(session_id.trim())
+        .map_err(|e| -> String { e.into() })?;
+    match endpoint_of(&rt) {
+        Some((host, port, user)) => Ok(crate::config::get_auto_restore(&host, port, &user)),
+        None => Ok(false),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetAutoRestoreRequest {
+    pub session_id: String,
+    pub enabled: bool,
+}
+
+#[tauri::command]
+pub async fn set_forward_auto_restore(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: SetAutoRestoreRequest,
+) -> Result<(), String> {
+    let rt = state
+        .get_runtime(req.session_id.trim())
+        .map_err(|e| -> String { e.into() })?;
+    if let Some((host, port, user)) = endpoint_of(&rt) {
+        crate::config::set_auto_restore(&host, port, &user, req.enabled);
+    }
+    emit_forwards(&app, &rt);
+    Ok(())
 }
 
 #[cfg(test)]

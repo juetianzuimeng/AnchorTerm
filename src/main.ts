@@ -98,6 +98,8 @@ interface ForwardsEvent {
   session_id?: string;
   sessionId?: string;
   forwards: LocalForwardInfo[];
+  /** Per-endpoint auto-restore switch (false when host not yet connected). */
+  auto_restore?: boolean;
 }
 
 interface PendingInputBuffer {
@@ -990,6 +992,8 @@ class SessionView {
   xftpAutoLaunched = false;
   /** Active / remembered local port forwards for this tab. */
   forwards: LocalForwardInfo[] = [];
+  /** Per-endpoint auto-restore switch (from the last forwards event). */
+  autoRestore = false;
 
   term: Terminal;
   fitAddon: FitAddon;
@@ -2581,14 +2585,42 @@ function renderFwdList(view: SessionView | null) {
       void stopLocalForward(view!.sessionId, f.id);
     });
     li.append(meta, stop);
+    if (f.state === "failed" || f.state === "stopped") {
+      const start = document.createElement("button");
+      start.type = "button";
+      start.className = "fwd-start-btn";
+      start.textContent = "启动";
+      start.addEventListener("click", () => {
+        void startLocalForwardFromList(view!.sessionId, f);
+      });
+      li.append(start);
+    }
     ul.appendChild(li);
   }
 }
 
-function applyForwardsToView(sid: string, forwards: LocalForwardInfo[]) {
+function applyForwardsToView(
+  sid: string,
+  forwards: LocalForwardInfo[],
+  autoRestore?: boolean,
+) {
   const view = sessions.get(sid);
   if (!view) return;
+  const prev = new Map(view.forwards.map((f) => [f.id, f.state]));
+  // Warn once on auto-restore failure (not manual starts, which the dialog
+  // already surfaces), without spamming on every reconnect event.
+  const newlyFailed = forwards.filter(
+    (f) => f.state === "failed" && prev.get(f.id) !== "failed",
+  );
+  if (newlyFailed.length > 0 && autoRestore === true) {
+    showToast(
+      `${newlyFailed.length} 条端口转发恢复失败（见转发列表）`,
+      undefined,
+      { tone: "warn" },
+    );
+  }
   view.forwards = forwards;
+  if (typeof autoRestore === "boolean") view.autoRestore = autoRestore;
   renderTabBar();
   if (fwdDialogSessionId === sid) {
     renderFwdList(view);
@@ -2621,6 +2653,22 @@ async function openLocalForwardDialog(sessionId?: string) {
   syncFwdKindLabels();
   updateFwdCmdPreview();
   renderFwdList(view);
+  // Per-endpoint auto-restore switch.
+  const cb = $("fwd-auto-restore") as HTMLInputElement | null;
+  const hint = $("fwd-autorestore-hint");
+  if (cb) {
+    try {
+      cb.checked = await invoke<boolean>("get_forward_auto_restore", {
+        sessionId: view.sessionId,
+      });
+    } catch {
+      cb.checked = false;
+    }
+  }
+  if (hint) {
+    hint.textContent =
+      "依赖已缓存的登录凭据；仅 ssh-agent 鉴权不被支持。关闭后已保存规则仍保留，但不自动恢复。";
+  }
   ($("dlg-local-forward") as HTMLDialogElement).showModal();
 }
 
@@ -2709,6 +2757,39 @@ async function stopLocalForward(sessionId: string, forwardId: string) {
   }
 }
 
+/** Re-start a persisted (stopped/failed) forward from its saved fields. */
+async function startLocalForwardFromList(
+  sessionId: string,
+  f: LocalForwardInfo,
+) {
+  const view = sessions.get(sessionId);
+  if (!view) return;
+  const kind = f.kind || (f.ssh_arg?.startsWith("-R") ? "remote" : "local");
+  const listenPort = f.listen_port ?? f.local_port ?? 0;
+  const destHost = f.dest_host ?? f.remote_host ?? "";
+  const destPort = f.dest_port ?? f.remote_port ?? 0;
+  if (!Number.isInteger(listenPort) || listenPort < 1) return;
+  try {
+    const info = await invoke<LocalForwardInfo>("start_local_forward", {
+      req: {
+        sessionId,
+        kind,
+        listen_port: listenPort,
+        dest_host: destHost,
+        dest_port: destPort,
+        bind_address: f.bind_address,
+      },
+    });
+    applyForwardsToView(
+      sessionId,
+      [...view.forwards.filter((x) => x.id !== info.id), info],
+    );
+    showToast(`已转发 ${formatForwardLine(info)}`);
+  } catch (e) {
+    showToast(String(e).replace(/^[A-Z_]+:\s*/, "") || "转发失败");
+  }
+}
+
 function setupForwardDialog() {
   const dlg = document.getElementById("dlg-local-forward");
   if (!dlg) return;
@@ -2723,6 +2804,21 @@ function setupForwardDialog() {
   document.querySelectorAll('input[name="fwd-kind"]').forEach((el) => {
     el.addEventListener("change", () => syncFwdKindLabels());
   });
+  const cb = $("fwd-auto-restore") as HTMLInputElement | null;
+  if (cb) {
+    cb.addEventListener("change", async () => {
+      const sid = fwdDialogSessionId;
+      if (!sid) return;
+      try {
+        await invoke("set_forward_auto_restore", {
+          req: { session_id: sid, enabled: cb.checked },
+        });
+        showToast(cb.checked ? "已开启自动恢复" : "已关闭自动恢复");
+      } catch (e) {
+        showToast(String(e).replace(/^[A-Z_]+:\s*/, "") || "设置失败");
+      }
+    });
+  }
 }
 
 function syncGlobalStatusBar() {
@@ -4591,7 +4687,7 @@ async function setupEvents() {
       eventRouteMiss("session://forwards", sid);
       return;
     }
-    applyForwardsToView(sid, p.forwards || []);
+    applyForwardsToView(sid, p.forwards || [], p.auto_restore);
   });
 }
 

@@ -83,6 +83,8 @@ pub fn run() {
             ssh::forward::start_local_forward,
             ssh::forward::stop_local_forward,
             ssh::forward::list_local_forwards,
+            ssh::forward::get_forward_auto_restore,
+            ssh::forward::set_forward_auto_restore,
         ])
         .run(tauri::generate_context!())
         .expect("error while running AnchorTerm");

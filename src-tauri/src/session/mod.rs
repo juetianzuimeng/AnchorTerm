@@ -168,6 +168,11 @@ async fn connect_inner(
             crate::ssh::forward::drop_all(Some(app), &rt);
         }
 
+        // Auto-restore persisted port forwards for this endpoint (if enabled).
+        // Runs before the `restart_dead_forwards` at the end of connect_inner so
+        // the loaded rules get spawned on the fresh connection.
+        crate::ssh::forward::load_persisted_for(&rt, &req.host, req.port, &req.username);
+
         let memory_path = if same_endpoint {
             rt.restore_target
                 .lock()
