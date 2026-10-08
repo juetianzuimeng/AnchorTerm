@@ -8,7 +8,6 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::config_dir;
 use crate::error::AppError;
 use crate::ops_log;
 
@@ -22,7 +21,9 @@ pub struct McpRuntimeFile {
 }
 
 pub fn runtime_path() -> Result<PathBuf, AppError> {
-    Ok(config_dir()?.join("mcp.runtime.json"))
+    let dir = std::env::current_dir()
+        .map_err(|e| AppError::Config(format!("获取当前目录失败: {}", e)))?;
+    Ok(dir.join("mcp.runtime.json"))
 }
 
 pub fn write_runtime(bind_host: &str, port: u16) -> Result<(), AppError> {

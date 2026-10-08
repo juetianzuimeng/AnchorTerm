@@ -8,9 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::config::config_dir;
 use crate::error::AppError;
-
 /// Default preferred listen port (may bump on conflict).
 pub const DEFAULT_MCP_PORT: u16 = 39201;
 
@@ -211,7 +209,9 @@ pub fn is_loopback_host(host: &str) -> bool {
 }
 
 pub fn mcp_config_path() -> Result<PathBuf, AppError> {
-    Ok(config_dir()?.join("mcp.json"))
+    let dir = std::env::current_dir()
+        .map_err(|e| AppError::Config(format!("获取当前目录失败: {}", e)))?;
+    Ok(dir.join("mcp.json"))
 }
 
 pub fn load_mcp_config() -> Result<McpConfig, AppError> {

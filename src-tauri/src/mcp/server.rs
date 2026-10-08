@@ -148,13 +148,30 @@ async fn accept_loop(
                         let app = app.clone();
                         let mcp_cfg = mcp_cfg.clone();
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                handle_connection(&mut socket, &app, &token, &mcp_cfg).await
-                            {
-                                ops_log::log(
-                                    "MCP",
-                                    &format!("conn err peer={peer} err={e}"),
-                                );
+                            ops_log::log("MCP", &format!("conn accepted peer={peer}"));
+                            let mut buffer = Vec::new();
+                            let mut req_count = 0;
+                            loop {
+                                match handle_connection(&mut socket, &mut buffer, &app, &token, &mcp_cfg, &peer).await {
+                                    Ok(true) => {
+                                        req_count += 1;
+                                        continue;
+                                    }
+                                    Ok(false) => {
+                                        ops_log::log(
+                                            "MCP",
+                                            &format!("conn closed peer={peer} reason=EOF requests={req_count}"),
+                                        );
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        ops_log::log(
+                                            "MCP",
+                                            &format!("conn closed peer={peer} reason='{e}' requests={req_count}"),
+                                        );
+                                        break;
+                                    }
+                                }
                             }
                         });
                     }
@@ -178,36 +195,56 @@ struct HttpRequest {
 
 async fn read_http_request(
     socket: &mut tokio::net::TcpStream,
-) -> Result<HttpRequest, String> {
-    let mut buf = Vec::with_capacity(4096);
+    buf: &mut Vec<u8>,
+) -> Result<Option<HttpRequest>, String> {
     let mut tmp = [0u8; 2048];
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 
     // Read until header end or cap.
     loop {
-        if tokio::time::Instant::now() > deadline {
-            return Err("read timeout".into());
+        if find_header_end(buf).is_some() {
+            break;
         }
-        let n = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut tmp))
-            .await
-            .map_err(|_| "read timeout".to_string())?
-            .map_err(|e| e.to_string())?;
+
+        if tokio::time::Instant::now() > deadline {
+            return Err("header read timeout".into());
+        }
+        
+        let read_timeout = if buf.is_empty() { Duration::from_secs(60) } else { Duration::from_secs(5) };
+        let n_res = tokio::time::timeout(read_timeout, socket.read(&mut tmp)).await;
+        
+        let n = match n_res {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(format!("socket read error: {e}")),
+            Err(_) => {
+                if buf.is_empty() {
+                    return Ok(None);
+                } else {
+                    return Err("read timeout (keep-alive/idle)".to_string());
+                }
+            }
+        };
+
         if n == 0 {
+            if buf.is_empty() {
+                return Ok(None);
+            }
             break;
         }
         buf.extend_from_slice(&tmp[..n]);
         if buf.len() > MAX_BODY_BYTES + 8192 {
             return Err("request too large".into());
         }
-        if find_header_end(&buf).is_some() {
-            break;
-        }
-        if buf.len() > 64 * 1024 {
+        if buf.len() > 64 * 1024 && find_header_end(buf).is_none() {
             return Err("headers too large".into());
         }
     }
 
-    let header_end = find_header_end(&buf).ok_or_else(|| "incomplete HTTP headers".to_string())?;
+    if buf.is_empty() {
+        return Ok(None);
+    }
+
+    let header_end = find_header_end(buf).ok_or_else(|| "incomplete HTTP headers".to_string())?;
     let header_bytes = &buf[..header_end];
     let headers = String::from_utf8_lossy(header_bytes).into_owned();
     let (method, path) = parse_request_line(&headers).unwrap_or(("GET".into(), "/".into()));
@@ -217,8 +254,8 @@ async fn read_http_request(
         return Err("body too large".into());
     }
 
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_length {
+    let total_required = header_end + content_length;
+    while buf.len() < total_required {
         if tokio::time::Instant::now() > deadline {
             return Err("body read timeout".into());
         }
@@ -229,19 +266,25 @@ async fn read_http_request(
         if n == 0 {
             break;
         }
-        body.extend_from_slice(&tmp[..n]);
-        if body.len() > MAX_BODY_BYTES {
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > MAX_BODY_BYTES + 8192 {
             return Err("body too large".into());
         }
     }
-    body.truncate(content_length);
 
-    Ok(HttpRequest {
+    if buf.len() < total_required {
+        return Err("incomplete body".into());
+    }
+
+    let body = buf[header_end..total_required].to_vec();
+    buf.drain(..total_required);
+
+    Ok(Some(HttpRequest {
         method,
         path,
         headers,
         body,
-    })
+    }))
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -262,17 +305,27 @@ fn parse_content_length(headers: &str) -> Option<usize> {
 
 async fn handle_connection(
     socket: &mut tokio::net::TcpStream,
+    buffer: &mut Vec<u8>,
     app: &AppHandle,
     expected_token: &str,
     mcp_cfg: &McpConfig,
-) -> Result<(), String> {
+    peer: &std::net::SocketAddr,
+) -> Result<bool, String> {
     let _ = socket.set_nodelay(true);
-    let req = read_http_request(socket).await?;
+    let req = match read_http_request(socket, buffer).await? {
+        Some(r) => r,
+        None => return Ok(false),
+    };
     let method = req.method.as_str();
     let path = req.path.as_str();
 
+    ops_log::log(
+        "MCP",
+        &format!("req peer={peer} method={method} path={path} body_len={}", req.body.len()),
+    );
+
     if !check_bearer(&req.headers, expected_token) {
-        ops_log::log("MCP", "deny bad_token");
+        ops_log::log("MCP", &format!("deny bad_token peer={peer}"));
         write_http(
             socket,
             401,
@@ -280,7 +333,7 @@ async fn handle_connection(
             r#"{"error":"unauthorized","message":"Bearer token required"}"#,
         )
         .await?;
-        return Ok(());
+        return Ok(true);
     }
 
     match (method, path) {
@@ -337,7 +390,7 @@ async fn handle_connection(
             .await?;
         }
         ("POST", "/mcp") | ("POST", "/mcp/") => {
-            let resp = handle_jsonrpc(app, mcp_cfg, &req.body).await;
+            let resp = handle_jsonrpc(app, mcp_cfg, &req.body, peer).await;
             write_http(
                 socket,
                 200,
@@ -347,7 +400,7 @@ async fn handle_connection(
             .await?;
         }
         ("POST", "/tools/call") | ("POST", "/tools/call/") => {
-            let resp = handle_rest_tools_call(app, mcp_cfg, &req.body).await;
+            let resp = handle_rest_tools_call(app, mcp_cfg, &req.body, peer).await;
             let status = if resp.get("error").is_some() { 400 } else { 200 };
             write_http(
                 socket,
@@ -358,6 +411,10 @@ async fn handle_connection(
             .await?;
         }
         _ => {
+            ops_log::log(
+                "MCP",
+                &format!("req 404 not found peer={peer} method={method} path={path}"),
+            );
             write_http(
                 socket,
                 404,
@@ -367,19 +424,21 @@ async fn handle_connection(
             .await?;
         }
     }
-    Ok(())
+    Ok(true)
 }
 
-async fn handle_jsonrpc(app: &AppHandle, cfg: &McpConfig, body: &[u8]) -> Value {
+async fn handle_jsonrpc(app: &AppHandle, cfg: &McpConfig, body: &[u8], peer: &std::net::SocketAddr) -> Value {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
+            ops_log::log("MCP", &format!("jsonrpc parse err peer={peer} err={e}"));
             return jsonrpc_error(Value::Null, -32700, format!("parse error: {e}"));
         }
     };
 
     // Batch not required for V1 — reject arrays politely.
     if parsed.is_array() {
+        ops_log::log("MCP", &format!("jsonrpc batch reject peer={peer}"));
         return jsonrpc_error(Value::Null, -32600, "batch JSON-RPC not supported");
     }
 
@@ -427,26 +486,35 @@ async fn handle_jsonrpc(app: &AppHandle, cfg: &McpConfig, body: &[u8]) -> Value 
                 .cloned()
                 .unwrap_or(json!({}));
             if name.is_empty() {
+                ops_log::log("MCP", &format!("jsonrpc tools/call missing name peer={peer}"));
                 return jsonrpc_error(id, -32602, "tools/call requires params.name");
             }
             match tools::call_tool(app, cfg, name, &arguments).await {
                 Ok(val) => jsonrpc_result(id, tool_result_mcp_content(&val, false)),
                 Err(e) => {
+                    ops_log::log("MCP", &format!("jsonrpc tool err peer={peer} name={name} err={e:?}"));
                     // MCP: tool errors often returned as result with isError=true
                     let err_val = e.to_json();
                     jsonrpc_result(id, tool_result_mcp_content(&err_val, true))
                 }
             }
         }
-        "" => jsonrpc_error(id, -32600, "missing method"),
-        other => jsonrpc_error(id, -32601, format!("method not found: {other}")),
+        "" => {
+            ops_log::log("MCP", &format!("jsonrpc missing method peer={peer}"));
+            jsonrpc_error(id, -32600, "missing method")
+        }
+        other => {
+            ops_log::log("MCP", &format!("jsonrpc method not found peer={peer} method={other}"));
+            jsonrpc_error(id, -32601, format!("method not found: {other}"))
+        }
     }
 }
 
-async fn handle_rest_tools_call(app: &AppHandle, cfg: &McpConfig, body: &[u8]) -> Value {
+async fn handle_rest_tools_call(app: &AppHandle, cfg: &McpConfig, body: &[u8], peer: &std::net::SocketAddr) -> Value {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
+            ops_log::log("MCP", &format!("rest tools parse err peer={peer} err={e}"));
             return json!({"error": "invalid_json", "message": e.to_string()});
         }
     };
@@ -459,6 +527,7 @@ async fn handle_rest_tools_call(app: &AppHandle, cfg: &McpConfig, body: &[u8]) -
         .cloned()
         .unwrap_or(json!({}));
     if name.is_empty() {
+        ops_log::log("MCP", &format!("rest tools missing name peer={peer}"));
         return json!({"error": "invalid_params", "message": "name is required"});
     }
     match tools::call_tool(app, cfg, name, &arguments).await {
@@ -527,7 +596,8 @@ async fn write_http(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {}\r\n\
-         Connection: close\r\n\
+         Connection: keep-alive\r\n\
+         Keep-Alive: timeout=60\r\n\
          Cache-Control: no-store\r\n\
          \r\n",
         body.len()
@@ -540,7 +610,6 @@ async fn write_http(
         .write_all(body.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
-    let _ = socket.shutdown().await;
     Ok(())
 }
 
