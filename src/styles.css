@@ -1517,6 +1517,7 @@ button.danger {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 4px;
+  margin-right: 36px;
 }
 
 .transfer-filename {
@@ -1558,14 +1559,26 @@ button.danger {
   position: absolute;
   top: 6px;
   right: 6px;
-  background: none;
-  border: none;
-  color: var(--text-muted);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
   cursor: pointer;
-  font-size: 14px;
+  font-size: 16px;
+  font-weight: bold;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s ease;
+  padding: 0;
+  line-height: 1;
 }
 
 .transfer-cancel:hover {
-  color: #ff4d4f;
+  background: rgba(227, 93, 106, 0.15);
+  color: var(--danger);
+  border-color: var(--danger);
 }
 

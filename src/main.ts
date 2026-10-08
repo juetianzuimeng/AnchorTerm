@@ -4140,6 +4140,10 @@ async function handleMenuAction(action: string) {
       if (titleEl) {
         titleEl.textContent = active ? `文件传输管理 (当前会话: ${active.title})` : "文件传输管理";
       }
+      const dirEl = $("transfer-current-dir");
+      if (dirEl) {
+        dirEl.textContent = (active && active.cwd) ? active.cwd : "~/";
+      }
       const dlg = $("dlg-transfer-manager") as HTMLDialogElement;
       if (!dlg.open) dlg.showModal();
       break;
@@ -4229,6 +4233,10 @@ async function handleMenuAction(action: string) {
       const titleEl = $("dlg-transfer-title");
       if (titleEl) {
         titleEl.textContent = active ? `文件传输管理 (当前会话: ${active.title})` : "文件传输管理";
+      }
+      const dirEl = $("transfer-current-dir");
+      if (dirEl) {
+        dirEl.textContent = active.cwd || "~/";
       }
       if (!dlg.open) dlg.showModal();
       break;
@@ -4966,7 +4974,7 @@ async function setupTransfers() {
   }
 
   // Dialog actions
-  $("btn-transfer-upload-pick").addEventListener("click", async () => {
+  $("transfer-upload-dropzone").addEventListener("click", async () => {
     try {
       const active = getActive();
       if (!active) return;
