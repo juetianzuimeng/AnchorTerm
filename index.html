@@ -32,7 +32,8 @@
           <div class="menu-item" data-menu="view">
             <button type="button" class="menu-btn" role="menuitem">查看(V)</button>
             <div class="menu-dropdown" role="menu">
-              <button type="button" data-action="toggle-mode" role="menuitem">切换输入模式 <span class="accel">Ctrl+Shift+M</span></button>
+              <button type="button" data-action="toggle-mode" role="menuitem">切换输入模式 <span class="accel">Ctrl+Shift+M</span></button><button type="button" data-action="toggle-sidebar" role="menuitem">显示/隐藏 Sftp 侧边栏 <span class="accel">Ctrl+E</span></button>
+              
               <button type="button" data-action="clear-screen" role="menuitem">清屏（仅本地）</button>
               <hr />
               <button
@@ -175,8 +176,46 @@
         <button type="button" data-tab-action="close-tab" role="menuitem">关闭标签</button>
       </div>
 
-      <main class="workspace" id="workspace">
-        <div id="session-views"></div>
+      <div id="sidebar-ctx-menu" class="tab-ctx-menu hidden" role="menu" hidden>
+        <button type="button" data-sidebar-action="open" role="menuitem">Open</button>
+        <button type="button" data-sidebar-action="open-default-text-editor" role="menuitem">Open with default text editor</button>
+        <button type="button" data-sidebar-action="open-with" role="menuitem">Open with...</button>
+        <button type="button" data-sidebar-action="open-default-program" role="menuitem">Open with default program...</button>
+        <button type="button" data-sidebar-action="compare-file" role="menuitem">Compare file with...</button>
+        <button type="button" data-sidebar-action="download" role="menuitem">Download</button>
+        <hr />
+        <button type="button" data-sidebar-action="delete" role="menuitem">Delete</button>
+        <button type="button" data-sidebar-action="rename" role="menuitem">Rename</button>
+        <hr />
+        <button type="button" data-sidebar-action="copy-path" role="menuitem">Copy file path</button>
+        <button type="button" data-sidebar-action="copy-path-term" role="menuitem">Copy file path to terminal (Middle mouse click)</button>
+        <button type="button" data-sidebar-action="properties" role="menuitem">Properties</button>
+        <button type="button" data-sidebar-action="permissions" role="menuitem">Permissions</button>
+      </div>
+
+      <div class="main-wrapper">
+        <aside id="sidebar" class="sidebar hidden">
+          <div class="sidebar-header">
+            <span class="sidebar-title">Sftp (<span id="sidebar-host"></span>)</span>
+            <div class="sidebar-actions">
+              <button id="btn-sidebar-refresh" class="icon-btn" title="刷新">↻</button>
+              <button id="btn-sidebar-close" class="icon-btn" title="关闭侧边栏">×</button>
+            </div>
+          </div>
+          <div class="sidebar-path">
+            <button id="btn-sidebar-up" class="icon-btn" title="上一级">↑</button>
+            <input type="text" id="sidebar-path-input" spellcheck="false" autocomplete="off" />
+            <button id="btn-sidebar-go" class="icon-btn" title="跳转">→</button>
+          </div>
+          <div id="sidebar-tree" class="sidebar-tree">
+            <!-- Dynamically populated -->
+          </div>
+        </aside>
+        
+        <div id="sidebar-resizer" class="sidebar-resizer hidden"></div>
+
+        <main class="workspace" id="workspace">
+          <div id="session-views"></div>
         <div id="empty-state" class="empty-state">
           <p class="empty-title">尚未打开会话</p>
           <p class="empty-hint">通过菜单「文件 → 新建会话」或下方按钮开始</p>
@@ -186,6 +225,7 @@
           </div>
         </div>
       </main>
+      </div>
     </div>
 
     <!-- Session properties dialog -->
@@ -604,7 +644,11 @@
     <div id="transfer-panel" class="transfer-panel hidden">
       <div class="transfer-header">
         <span class="transfer-title">文件传输 (<span id="transfer-count">0</span>)</span>
-        <button id="btn-transfer-toggle" class="icon-btn" title="收起/展开">▼</button>
+        <div style="display: flex; gap: 4px; align-items: center;">
+          <button id="btn-transfer-open-mgr" class="icon-btn" title="打开传输主界面" style="font-size: 11px;">主界面</button>
+          <button id="btn-transfer-toggle" class="icon-btn" title="收起/展开">▼</button>
+          <button id="btn-transfer-close" class="icon-btn" title="关闭" style="font-size: 14px;">×</button>
+        </div>
       </div>
       <div id="transfer-list" class="transfer-list">
         <!-- dynamically populated -->

@@ -4932,6 +4932,30 @@ async function setupTransfers() {
     toggleBtn.textContent = panel.classList.contains("collapsed") ? "▲" : "▼";
   });
 
+  const openMgrBtn = $("btn-transfer-open-mgr");
+  if (openMgrBtn) {
+    openMgrBtn.addEventListener("click", () => {
+      const active = getActive();
+      const dlg = $("dlg-transfer-manager") as HTMLDialogElement;
+      const titleEl = $("dlg-transfer-title");
+      if (titleEl) {
+        titleEl.textContent = active ? `文件传输管理 (当前会话: ${active.title})` : "文件传输管理";
+      }
+      const dirEl = $("transfer-current-dir");
+      if (dirEl) {
+        dirEl.textContent = (active && active.cwd) ? active.cwd : "~/";
+      }
+      if (dlg && !dlg.open) dlg.showModal();
+    });
+  }
+
+  const closeBtn = $("btn-transfer-close");
+  if (closeBtn) {
+    closeBtn.addEventListener("click", () => {
+      panel.classList.add("hidden");
+    });
+  }
+
   try {
     const win = getCurrentWindow();
     await win.onDragDropEvent(async (event) => {
@@ -5070,11 +5094,28 @@ async function setupTransfers() {
   });
 
   const dialogListEl = $("transfer-manager-list");
+  
+  const knownJobIds = new Set<string>();
 
   setInterval(async () => {
     try {
       const jobs = await invoke<any[]>("mcp_ui_transfer_list", { sessionId: null });
-      if (jobs.length > 0) {
+      let hasNewJob = false;
+      const currentIds = new Set<string>();
+      
+      for (const job of jobs) {
+        currentIds.add(job.job_id);
+        if (!knownJobIds.has(job.job_id)) {
+          hasNewJob = true;
+          knownJobIds.add(job.job_id);
+        }
+      }
+      
+      for (const id of knownJobIds) {
+        if (!currentIds.has(id)) knownJobIds.delete(id);
+      }
+      
+      if (hasNewJob) {
         panel.classList.remove("hidden");
       }
       
@@ -5158,7 +5199,7 @@ async function setupTransfers() {
         
         let detailText = formatBytes(transferred);
         if (total) detailText += ` / ${formatBytes(total)}`;
-        if (job.percent) detailText += ` (${job.percent.toFixed(1)}%)`;
+        if (job.percent !== undefined && job.percent !== null) detailText += ` (${job.percent.toFixed(1)}%)`;
         
         const speedEl = document.createElement("span");
         speedEl.textContent = speed;
@@ -5170,16 +5211,6 @@ async function setupTransfers() {
            bytesEl.style.color = "#ff4d4f";
            bytesEl.title = job.error;
         }
-
-        const metaEl = document.createElement("div");
-        metaEl.style.fontSize = "11px";
-        metaEl.style.color = "var(--text-color, #999)";
-        metaEl.style.marginTop = "2px";
-        const startStr = job.started_unix_ms ? new Date(job.started_unix_ms).toLocaleString() : '-';
-        const endStr = job.finished_unix_ms ? new Date(job.finished_unix_ms).toLocaleString() : '-';
-        const sv = sessions.get(job.session_id);
-        const sessionName = sv ? sv.title : job.session_id.substring(0,8);
-        metaEl.textContent = `ID: ${job.job_id.substring(0,8)} | 会话: ${sessionName} | 开始: ${startStr} | 结束: ${endStr}`;
 
         const warningSpan = document.createElement("span");
         let installBtn: HTMLButtonElement | null = null;
@@ -5211,31 +5242,72 @@ async function setupTransfers() {
              }
            };
         }
-        
-        details.appendChild(speedEl);
-        details.appendChild(bytesEl);
+
+        const leftDetails = document.createElement("div");
+        leftDetails.style.display = "flex";
+        leftDetails.style.alignItems = "center";
+        leftDetails.appendChild(bytesEl);
         if (warningSpan.textContent) {
-           details.appendChild(warningSpan);
-           if (installBtn) details.appendChild(installBtn);
+           leftDetails.appendChild(warningSpan);
+           if (installBtn) leftDetails.appendChild(installBtn);
         }
-        details.appendChild(metaEl);
+        
+        details.appendChild(leftDetails);
+        details.appendChild(speedEl);
+
+        const metaEl = document.createElement("div");
+        metaEl.style.fontSize = "11px";
+        metaEl.style.color = "var(--text-color, #999)";
+        metaEl.style.marginTop = "6px";
+        metaEl.style.display = "flex";
+        metaEl.style.flexWrap = "wrap";
+        metaEl.style.gap = "4px";
+        
+        const startStr = job.started_unix_ms ? new Date(job.started_unix_ms).toLocaleString() : '-';
+        const endStr = job.finished_unix_ms ? new Date(job.finished_unix_ms).toLocaleString() : '-';
+        const sv = sessions.get(job.session_id);
+        const sessionName = sv ? sv.title : job.session_id.substring(0,8);
+        
+        const idSpan = document.createElement("span");
+        idSpan.textContent = `ID: ${job.job_id.substring(0,8)}`;
+        const sessionSpan = document.createElement("span");
+        sessionSpan.textContent = ` | 会话: ${sessionName}`;
+        const startSpan = document.createElement("span");
+        startSpan.textContent = ` | 开始: ${startStr}`;
+        const endSpan = document.createElement("span");
+        endSpan.textContent = ` | 结束: ${endStr}`;
+        metaEl.appendChild(idSpan);
+        metaEl.appendChild(sessionSpan);
+        metaEl.appendChild(startSpan);
+        metaEl.appendChild(endSpan);
         
         const pathsDiv = document.createElement("div");
         pathsDiv.className = "transfer-paths";
         pathsDiv.style.fontSize = "11px";
         pathsDiv.style.color = "var(--text-color, #888)";
-        pathsDiv.style.marginBottom = "4px";
+        pathsDiv.style.marginBottom = "6px";
         pathsDiv.style.wordBreak = "break-all";
+        pathsDiv.style.lineHeight = "1.3";
+        
+        const srcPath = document.createElement("div");
+        const dstPath = document.createElement("div");
+        dstPath.style.marginTop = "2px";
+        
         if (job.direction === "upload") {
-          pathsDiv.textContent = `源: ${job.local_path} -> 目标: ${job.remote_path}`;
+          srcPath.textContent = `源: ${job.local_path}`;
+          dstPath.textContent = `目标: ${job.remote_path}`;
         } else {
-          pathsDiv.textContent = `源: ${job.remote_path} -> 目标: ${job.local_path}`;
+          srcPath.textContent = `源: ${job.remote_path}`;
+          dstPath.textContent = `目标: ${job.local_path}`;
         }
+        pathsDiv.appendChild(srcPath);
+        pathsDiv.appendChild(dstPath);
         
         el.appendChild(header);
         el.appendChild(pathsDiv);
         el.appendChild(progress);
         el.appendChild(details);
+        el.appendChild(metaEl);
         
         listEl.appendChild(el);
         if (dialogListEl) {
