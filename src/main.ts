@@ -3611,12 +3611,17 @@ function renderManagerList() {
       e.preventDefault();
     });
 
+    let authDisplay = p.auth_type === "password" ? "密码" : "私钥";
+    if (p.auth_type === "password" && p.has_saved_password) {
+      authDisplay += ` <span title="系统凭据库中已保存该会话的密码" style="color: var(--accent); font-size: 0.9em; margin-left: 2px;">(已存密码)</span>`;
+    } else if (p.auth_type === "public_key" && p.has_saved_passphrase) {
+      authDisplay += ` <span title="系统凭据库中已保存该会话的私钥口令" style="color: var(--accent); font-size: 0.9em; margin-left: 2px;">(已存口令)</span>`;
+    }
+
     const body = document.createElement("div");
     body.className = "mgr-item-body";
     body.innerHTML = `<div class="name">${escapeHtml(p.name)}</div>
-      <div class="meta">${escapeHtml(p.username)}@${escapeHtml(p.host)}:${p.port} · ${
-        p.auth_type === "password" ? "密码" : "私钥"
-      }</div>`;
+      <div class="meta">${escapeHtml(p.username)}@${escapeHtml(p.host)}:${p.port} · ${authDisplay}</div>`;
 
     li.append(check, body);
     li.addEventListener("click", () => {
