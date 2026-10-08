@@ -2002,3 +2002,107 @@ pub async fn delete_profile(id: String) -> Result<(), String> {
 // silence unused import warning if CwdTracker only used via path
 #[allow(dead_code)]
 fn _cwd_type(_: &CwdTracker) {}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+#[tauri::command]
+pub async fn sftp_list_dir(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<Vec<FileEntry>, String> {
+    let rt = state
+        .get_runtime(&session_id)
+        .map_err(|e| -> String { e.into() })?;
+
+    let params = connect_params_from_cache(&rt)?;
+    let command = crate::ssh::complete::build_list_dir_command(&path, 5000);
+    let cp = mux_control_path(&rt);
+
+    let output = crate::ssh::openssh::openssh_exec_with_key_cache(
+        &params,
+        &command,
+        &rt.side_channel_key,
+        cp.as_deref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut lines = output.lines();
+    let status = lines.next().unwrap_or("").trim();
+    if status == "ERR_CD" {
+        return Err("找不到目录或没有权限".to_string());
+    } else if status != "OK" {
+        return Err(format!("列出目录失败: {}", status));
+    }
+    let _mode = lines.next();
+    
+    let mut entries = Vec::new();
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("d\t") {
+            entries.push(FileEntry {
+                name: rest.to_string(),
+                is_dir: true,
+            });
+        } else if let Some(rest) = line.strip_prefix("f\t") {
+            entries.push(FileEntry {
+                name: rest.to_string(),
+                is_dir: false,
+            });
+        }
+    }
+    
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+    Ok(entries)
+}
+
+#[tauri::command]
+pub async fn local_open_file(
+    path: String,
+    mode: String,
+) -> Result<(), String> {
+    use std::process::Command;
+    
+    #[cfg(target_os = "windows")]
+    let path = path.replace("/", "\\");
+
+    match mode.as_str() {
+        "text-editor" => {
+            Command::new("notepad").arg(&path).spawn().map_err(|e| e.to_string())?;
+        }
+        "open-with" => {
+            Command::new("rundll32.exe")
+                .arg("shell32.dll,OpenAs_RunDLL")
+                .arg(&path)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        }
+        _ => {
+            // "default" and others
+            #[cfg(target_os = "windows")]
+            {
+                // rundll32 url.dll,FileProtocolHandler 是一种在 Windows 下非常稳定的打开文件或 URL 的方式
+                Command::new("rundll32.exe")
+                    .arg("url.dll,FileProtocolHandler")
+                    .arg(&path)
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+            }
+            #[cfg(not(target_os = "windows"))]
+            opener::open(&path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_app_temp_dir() -> Result<String, String> {
+    let p = std::env::current_dir().map_err(|e| e.to_string())?.join("temp");
+    std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
+    Ok(p.to_string_lossy().into_owned())
+}
+

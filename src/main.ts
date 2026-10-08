@@ -4,6 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { join } from "@tauri-apps/api/path";
 import {
   openPath,
   openUrl,
@@ -2943,6 +2944,7 @@ function activate(sessionId: string) {
 
   if (prev !== sessionId) {
     opsLog("UI", "tab_activate", { sid: sessionId.slice(0, 8) });
+    sidebarManager.sync();
   }
 }
 
@@ -4114,6 +4116,9 @@ async function handleMenuAction(action: string) {
     case "clear-draft":
       active?.clearDraft();
       break;
+    case "toggle-sidebar":
+      sidebarManager.toggle();
+      break;
     case "toggle-mode":
       active?.toggleInputMode();
       break;
@@ -4670,7 +4675,10 @@ async function setupEvents() {
       path: p.cwd,
       sid: sid.slice(0, 8),
     });
-    if (activeSessionId === sid) syncGlobalStatusBar();
+    if (activeSessionId === sid) {
+      syncGlobalStatusBar();
+      sidebarManager.sync();
+    }
   });
 
   await listen<SessionSnapshot & { sessionId?: string }>(
@@ -4727,7 +4735,8 @@ async function setupEvents() {
 // Boot
 // ---------------------------------------------------------------------------
 
-window.addEventListener("DOMContentLoaded", async () => {
+window.addEventListener("DOMContentLoaded", async () => {    sidebarManager.init();
+
   syncAuthFields();
   updateEmptyState();
   renderTabBar();
@@ -5211,7 +5220,20 @@ async function setupTransfers() {
         }
         details.appendChild(metaEl);
         
+        const pathsDiv = document.createElement("div");
+        pathsDiv.className = "transfer-paths";
+        pathsDiv.style.fontSize = "11px";
+        pathsDiv.style.color = "var(--text-color, #888)";
+        pathsDiv.style.marginBottom = "4px";
+        pathsDiv.style.wordBreak = "break-all";
+        if (job.direction === "upload") {
+          pathsDiv.textContent = `源: ${job.local_path} -> 目标: ${job.remote_path}`;
+        } else {
+          pathsDiv.textContent = `源: ${job.remote_path} -> 目标: ${job.local_path}`;
+        }
+        
         el.appendChild(header);
+        el.appendChild(pathsDiv);
         el.appendChild(progress);
         el.appendChild(details);
         
@@ -5284,3 +5306,350 @@ function showSshMissingDialog(r: SshCheckResult) {
   if (!dlg.open) dlg.showModal();
   showToast("未检测到系统 OpenSSH（ssh.exe）", 4500);
 }
+class SidebarManager {
+  treeEl = document.getElementById("sidebar-tree") as HTMLDivElement;
+  pathInput = document.getElementById("sidebar-path-input") as HTMLInputElement;
+  btnRefresh = document.getElementById("btn-sidebar-refresh") as HTMLButtonElement;
+  btnUp = document.getElementById("btn-sidebar-up") as HTMLButtonElement;
+  btnGo = document.getElementById("btn-sidebar-go") as HTMLButtonElement;
+  btnClose = document.getElementById("btn-sidebar-close") as HTMLButtonElement;
+  hostEl = document.getElementById("sidebar-host") as HTMLSpanElement;
+  sidebarEl = document.getElementById("sidebar") as HTMLElement;
+  resizerEl = document.getElementById("sidebar-resizer") as HTMLElement;
+  ctxMenu = document.getElementById("sidebar-ctx-menu") as HTMLDivElement;
+  ctxTarget: { filename: string, isDir: boolean } | null = null;
+  isResizing = false;
+
+  init() {
+    this.resizerEl.addEventListener("mousedown", (e) => {
+      this.isResizing = true;
+      document.body.style.cursor = "ew-resize";
+      this.sidebarEl.style.transition = "none";
+      this.resizerEl.classList.add("resizing");
+      e.preventDefault();
+    });
+
+    document.addEventListener("mousemove", (e) => {
+      if (!this.isResizing) return;
+      let newWidth = e.clientX;
+      if (newWidth < 150) newWidth = 150;
+      if (newWidth > 800) newWidth = 800;
+      this.sidebarEl.style.flex = `0 0 ${newWidth}px`;
+      requestAnimationFrame(() => {
+        if (activeSessionId) {
+           sessions.get(activeSessionId)?.fitAndResize();
+        }
+      });
+    });
+
+    document.addEventListener("mouseup", () => {
+      if (this.isResizing) {
+        this.isResizing = false;
+        document.body.style.cursor = "";
+        this.sidebarEl.style.transition = "";
+        this.resizerEl.classList.remove("resizing");
+      }
+    });
+
+    this.btnRefresh.addEventListener("click", () => this.refresh());
+    this.btnUp.addEventListener("click", () => this.goUp());
+    this.btnGo.addEventListener("click", () => this.goPath(this.pathInput.value));
+    this.btnClose.addEventListener("click", () => this.toggle(false));
+    this.pathInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        this.goPath(this.pathInput.value);
+      }
+    });
+
+    // Toggle menu event
+    document.addEventListener("click", (e) => {
+      const btn = (e.target as HTMLElement).closest("button[data-action='toggle-sidebar']");
+      if (btn) {
+        this.toggle();
+      }
+    });
+    
+    // Global hotkey Ctrl+E
+    window.addEventListener("keydown", (e) => {
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "e") {
+        e.preventDefault();
+        this.toggle();
+      }
+    });
+
+    // Context menu events
+    this.ctxMenu.querySelectorAll("[data-sidebar-action]").forEach((el) => {
+      el.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const action = (el as HTMLElement).dataset.sidebarAction;
+        this.hideContextMenu();
+        if (action) this.handleCtxAction(action);
+      });
+    });
+
+    document.addEventListener("mousedown", (ev) => {
+      if (this.ctxMenu.classList.contains("hidden")) return;
+      if (this.ctxMenu.contains(ev.target as Node)) return;
+      this.hideContextMenu();
+    }, true);
+    
+    document.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") this.hideContextMenu();
+    });
+    window.addEventListener("blur", () => this.hideContextMenu());
+  }
+
+  toggle(show?: boolean) {
+    if (show === undefined) {
+      this.sidebarEl.classList.toggle("hidden");
+      this.resizerEl.classList.toggle("hidden");
+    } else {
+      this.sidebarEl.classList.toggle("hidden", !show);
+      this.resizerEl.classList.toggle("hidden", !show);
+    }
+    // Need to trigger terminal resize
+    requestAnimationFrame(() => {
+      if (activeSessionId) {
+         sessions.get(activeSessionId)?.fitAndResize();
+      }
+    });
+    
+    // If we just showed it, sync it
+    if (!this.sidebarEl.classList.contains("hidden")) {
+      this.sync();
+    }
+  }
+
+  async sync() {
+    if (!activeSessionId || this.sidebarEl.classList.contains("hidden")) {
+      return;
+    }
+    const view = sessions.get(activeSessionId);
+    if (!view) return;
+
+    this.hostEl.textContent = view.host;
+    
+    const targetPath = (view as any).sidebarPath || view.cwd || "/";
+    this.pathInput.value = targetPath;
+    this.pathInput.title = targetPath;
+    
+    this.treeEl.innerHTML = '<div style="padding: 10px; color: var(--muted); text-align: center;">加载中...</div>';
+    
+    try {
+      const entries = await invoke<any[]>("sftp_list_dir", {
+        sessionId: activeSessionId,
+        path: targetPath,
+      });
+      
+      this.treeEl.innerHTML = "";
+      for (const entry of entries) {
+        const item = document.createElement("div");
+        item.className = "tree-item " + (entry.is_dir ? "dir" : "file");
+        
+        const icon = document.createElement("span");
+        icon.className = "tree-item-icon";
+        icon.textContent = entry.is_dir ? "📁" : "📄";
+        
+        const name = document.createElement("span");
+        name.textContent = entry.name;
+        
+        item.appendChild(icon);
+        item.appendChild(name);
+        
+        item.addEventListener("dblclick", () => {
+          if (entry.is_dir) {
+            let nextPath = targetPath;
+            if (!nextPath.endsWith("/")) nextPath += "/";
+            nextPath += entry.name;
+            this.goPath(nextPath);
+          }
+        });
+        
+        item.addEventListener("contextmenu", (e) => {
+          e.preventDefault();
+          this.ctxTarget = { filename: entry.name, isDir: entry.is_dir };
+          this.showContextMenu(e.clientX, e.clientY);
+        });
+
+        item.addEventListener("mousedown", (e) => {
+          if (e.button === 1) { // Middle click
+            e.preventDefault();
+            this.ctxTarget = { filename: entry.name, isDir: entry.is_dir };
+            this.handleCtxAction("copy-path-term");
+          }
+        });
+        
+        this.treeEl.appendChild(item);
+      }
+    } catch (e: any) {
+      this.treeEl.innerHTML = `<div style="padding: 10px; color: var(--fail);">${e}</div>`;
+    }
+  }
+  
+  refresh() {
+    this.sync();
+  }
+  
+  goUp() {
+    let p = this.pathInput.value;
+    if (p.endsWith("/")) p = p.slice(0, -1);
+    const lastSlash = p.lastIndexOf("/");
+    if (lastSlash >= 0) {
+      p = p.slice(0, lastSlash) || "/";
+      this.goPath(p);
+    }
+  }
+  
+  goPath(p: string) {
+    if (!activeSessionId) return;
+    const view = sessions.get(activeSessionId);
+    if (view) {
+      (view as any).sidebarPath = p;
+      this.sync();
+    }
+  }
+
+  showContextMenu(x: number, y: number) {
+    closeAllMenus();
+    this.ctxMenu.classList.remove("hidden");
+    this.ctxMenu.removeAttribute("hidden");
+    const pad = 8;
+    const w = this.ctxMenu.offsetWidth || 220;
+    const h = this.ctxMenu.offsetHeight || 150;
+    let left = x;
+    let top = y;
+    if (left + w > window.innerWidth) left = window.innerWidth - w - pad;
+    if (top + h > window.innerHeight) top = window.innerHeight - h - pad;
+    this.ctxMenu.style.left = `${Math.max(pad, left)}px`;
+    this.ctxMenu.style.top = `${Math.max(pad, top)}px`;
+  }
+
+  hideContextMenu() {
+    this.ctxMenu.classList.add("hidden");
+    this.ctxMenu.setAttribute("hidden", "");
+  }
+  
+  async handleCtxAction(action: string) {
+    if (!this.ctxTarget) return;
+    const { filename, isDir } = this.ctxTarget;
+    let p = this.pathInput.value;
+    if (!p.endsWith("/")) p += "/";
+    const fullPath = p + filename;
+
+    switch (action) {
+      case "open":
+      case "open-default-program":
+      case "open-default-text-editor":
+      case "open-with":
+        if (isDir) {
+          this.goPath(fullPath);
+        } else {
+          showToast(`正在下载 ${filename} 以打开...`);
+          try {
+            const tmp = await invoke<string>("get_app_temp_dir");
+            const localPath = await join(tmp, filename);
+            const res = await invoke<any>("mcp_ui_transfer_start", {
+              sessionId: activeSessionId,
+              remotePath: fullPath,
+              localPath,
+              direction: "download",
+              resumeJobId: null,
+              cleanupOnFail: true
+            });
+            const jobId = typeof res === "string" ? res : res?.job_id;
+            const pollInterval = setInterval(async () => {
+              try {
+                const jobs = await invoke<any[]>("mcp_ui_transfer_list", { sessionId: null });
+                const job = jobs.find(j => j.job_id === jobId);
+                if (!job) return;
+                
+                if (job.status === "succeeded") {
+                  clearInterval(pollInterval);
+                  showToast("下载完成，正在打开...");
+                  if (action === "open-default-text-editor") {
+                    await invoke("local_open_file", { path: localPath, mode: "text-editor" });
+                  } else if (action === "open-with") {
+                    await invoke("local_open_file", { path: localPath, mode: "open-with" });
+                  } else {
+                    await invoke("local_open_file", { path: localPath, mode: "default" });
+                  }
+                } else if (job.status === "failed" || job.status === "cancelled") {
+                  clearInterval(pollInterval);
+                  showToast(`下载失败: ${job.error_msg || job.status}`);
+                }
+              } catch (e) {
+                // Ignore errors during polling
+              }
+            }, 1000);
+          } catch (e: any) {
+            showToast(`无法打开文件: ${e}`);
+          }
+        }
+        break;
+      case "download": {
+        const localPath = await saveDialog({
+          title: "选择保存位置",
+          defaultPath: filename
+        });
+        if (localPath) {
+          try {
+            await invoke<string>("mcp_ui_transfer_start", {
+              sessionId: activeSessionId,
+              remotePath: fullPath,
+              localPath,
+              direction: "download",
+              resumeJobId: null,
+              cleanupOnFail: true
+            });
+            showToast(`已将 ${filename} 加入下载队列`);
+            const panel = document.getElementById("transfer-panel");
+            if (panel) panel.classList.remove("hidden");
+          } catch (e: any) {
+            showToast(`下载失败: ${e}`);
+          }
+        }
+        break;
+      }
+      case "compare-file":
+      case "properties":
+      case "permissions":
+        showToast("该功能正在开发中...");
+        break;
+      case "delete":
+        if (confirm(`确定要删除 ${filename} 吗？`)) {
+          const view = sessions.get(activeSessionId!);
+          if (view) {
+            view.draftInput.value = `rm -rf "${fullPath}"`;
+            view.draftInput.focus();
+            showToast("已将删除命令输入终端");
+          }
+        }
+        break;
+      case "rename":
+        const newName = prompt("请输入新名称", filename);
+        if (newName && newName !== filename) {
+          const view = sessions.get(activeSessionId!);
+          if (view) {
+            view.draftInput.value = `mv "${fullPath}" "${p}${newName}"`;
+            view.draftInput.focus();
+            showToast("已将重命名命令输入终端");
+          }
+        }
+        break;
+      case "copy-path":
+        navigator.clipboard.writeText(fullPath).then(() => showToast("已复制文件路径"));
+        break;
+      case "copy-path-term": {
+        const view = sessions.get(activeSessionId!);
+        if (view) {
+          view.draftInput.value += `"${fullPath}" `;
+          view.draftInput.focus();
+        }
+        break;
+      }
+    }
+  }
+}
+
+const sidebarManager = new SidebarManager();

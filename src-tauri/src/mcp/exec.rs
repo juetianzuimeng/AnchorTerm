@@ -18,7 +18,7 @@ use crate::ssh::transport::ConnectParams;
 /// Hard upper bound for tool-supplied timeout.
 pub const MAX_TIMEOUT_SECS: u64 = 120;
 /// Soft concurrency limit per session.
-pub const MAX_INFLIGHT_EXEC: u32 = 2;
+pub const MAX_INFLIGHT_EXEC: u32 = 6;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecToolResult {
