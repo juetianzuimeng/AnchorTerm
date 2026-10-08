@@ -5,6 +5,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
+    "prebuild": "cd src-tauri/scripts && fetch_tools.bat && cd ../../",
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",

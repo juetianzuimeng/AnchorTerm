@@ -19,6 +19,7 @@ mod tools;
 mod transfer;
 mod transfer_util;
 mod sftp;
+mod resources;
 
 pub use config::McpConfig;
 pub use transfer::JobRegistry;

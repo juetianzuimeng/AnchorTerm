@@ -43,6 +43,12 @@ $releaseDir = Split-Path $exe
 Get-ChildItem -Path $releaseDir -Filter "*.dll" -File -ErrorAction SilentlyContinue |
     ForEach-Object { Copy-Item -Force $_.FullName $stage }
 
+# Copy resources folder if it exists (for tools, assets, etc.)
+$resourcesDir = Join-Path $releaseDir "resources"
+if (Test-Path $resourcesDir) {
+    Copy-Item -Recurse -Force $resourcesDir $stage
+}
+
 # Brief readme inside zip (ASCII filename for PowerShell encoding safety)
 $readme = @"
 AnchorTerm $version - portable (Windows x64)

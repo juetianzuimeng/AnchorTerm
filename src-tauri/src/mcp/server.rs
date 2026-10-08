@@ -389,6 +389,26 @@ async fn handle_connection(
             )
             .await?;
         }
+        ("GET", "/resources") | ("GET", "/resources/") => {
+            let body = super::resources::resources_list_payload();
+            write_http(
+                socket,
+                200,
+                "application/json; charset=utf-8",
+                &body.to_string(),
+            )
+            .await?;
+        }
+        ("GET", "/resources/templates") | ("GET", "/resources/templates/") => {
+            let body = super::resources::resource_templates_list_payload();
+            write_http(
+                socket,
+                200,
+                "application/json; charset=utf-8",
+                &body.to_string(),
+            )
+            .await?;
+        }
         ("POST", "/mcp") | ("POST", "/mcp/") => {
             let resp = handle_jsonrpc(app, mcp_cfg, &req.body, peer).await;
             write_http(
@@ -457,7 +477,11 @@ async fn handle_jsonrpc(app: &AppHandle, cfg: &McpConfig, body: &[u8], peer: &st
             let result = json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": {
-                    "tools": { "listChanged": false }
+                    "tools": { "listChanged": false },
+                    "resources": {
+                        "subscribe": false,
+                        "listChanged": false
+                    }
                 },
                 "serverInfo": {
                     "name": "anchorterm",
@@ -476,6 +500,18 @@ async fn handle_jsonrpc(app: &AppHandle, cfg: &McpConfig, body: &[u8], peer: &st
         }
         "ping" => jsonrpc_result(id, json!({})),
         "tools/list" => jsonrpc_result(id, tools::tools_list_payload()),
+        "resources/list" => jsonrpc_result(id, super::resources::resources_list_payload()),
+        "resources/templates/list" => jsonrpc_result(id, super::resources::resource_templates_list_payload()),
+        "resources/read" => {
+            let uri = params.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+            if uri.is_empty() {
+                return jsonrpc_error(id, -32602, "resources/read requires params.uri");
+            }
+            match super::resources::read_resource_payload(uri) {
+                Ok(val) => jsonrpc_result(id, val),
+                Err(e) => jsonrpc_error(id, -32602, e.to_string()),
+            }
+        }
         "tools/call" => {
             let name = params
                 .get("name")

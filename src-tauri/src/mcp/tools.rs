@@ -350,6 +350,32 @@ pub fn tools_list_payload() -> Value {
                     },
                     "required": ["forward_id"]
                 }
+            },
+            {
+                "name": "session_deploy_tool",
+                "description": "一键将内部运维工具部署到远端主机会话中（专供不支持 MCP Resources 的 AI 客户端使用）。内置工具包括：at-mysql（MySQL 诊断）、at-redis（Redis 诊断）、spring-connection（Spring 凭据提取）。部署成功后返回远端绝对路径。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "会话 UUID；可省略则使用默认会话"
+                        },
+                        "tool_name": {
+                            "type": "string",
+                            "description": "要部署的工具名称（如 at-mysql, at-redis, spring-connection）"
+                        },
+                        "arch": {
+                            "type": "string",
+                            "description": "目标机器架构：amd64 或 arm64"
+                        },
+                        "remote_dir": {
+                            "type": "string",
+                            "description": "远端保存的目录（强烈建议使用 /tmp 等临时目录隔离）"
+                        }
+                    },
+                    "required": ["tool_name", "arch", "remote_dir"]
+                }
             }
         ]
     })
@@ -378,6 +404,7 @@ pub async fn call_tool(
         "session_forward_list" => tool_session_forward_list(app, cfg, arguments),
         "session_forward_start" => tool_session_forward_start(app, cfg, arguments).await,
         "session_forward_stop" => tool_session_forward_stop(app, cfg, arguments).await,
+        "session_deploy_tool" => tool_session_deploy_tool(app, cfg, arguments).await,
         other => Err(ToolError::invalid(format!("unknown tool: {other}"))),
     };
     let ms = t0.elapsed().as_millis();
@@ -811,4 +838,69 @@ async fn tool_session_forward_stop(
         .map_err(|e| ToolError::internal(e.to_string()))?;
 
     Ok(json!({ "success": true }))
+}
+
+async fn tool_session_deploy_tool(
+    app: &AppHandle,
+    cfg: &McpConfig,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    let sid = resolve_session_id(arg_str(arguments, "session_id"), cfg)?;
+    check_session_allowed(&sid, cfg)?;
+    let tool_name = arg_str(arguments, "tool_name")
+        .ok_or_else(|| ToolError::invalid("tool_name is required"))?;
+    let arch = arg_str(arguments, "arch")
+        .ok_or_else(|| ToolError::invalid("arch is required"))?;
+    let remote_dir = arg_str(arguments, "remote_dir")
+        .ok_or_else(|| ToolError::invalid("remote_dir is required"))?;
+        
+    let uri = format!("anchorterm://tools/{tool_name}/linux-{arch}");
+    let res = super::resources::read_resource_payload(&uri)
+        .map_err(|e| ToolError::internal(format!("未找到内置工具 {} {}: {}", tool_name, arch, e)))?;
+        
+    let local_path = res.get("_meta")
+        .and_then(|m| m.get("local_path"))
+        .and_then(|l| l.as_str())
+        .ok_or_else(|| ToolError::internal("获取本地工具路径失败"))?
+        .to_string();
+        
+    let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), tool_name);
+    
+    let st = state(app)?;
+    let rt = st
+        .get_runtime(&sid)
+        .map_err(|_| ToolError::not_found(format!("session not found: {sid}")))?;
+    let registry = transfer_jobs(app)?;
+
+    let transfer_res = transfer::session_file_upload(
+        rt.clone(),
+        cfg,
+        &registry,
+        transfer::FileTransferArgs {
+            remote_path: &remote_path,
+            content: None,
+            encoding: None,
+            local_path: Some(&local_path),
+            create_dirs: true,
+            overwrite: true,
+            timeout_secs: Some(120),
+            max_bytes: None,
+            async_mode: Some(false),
+            verify: transfer::VerifyMode::Size,
+            cleanup_on_fail: true,
+            recursive: false,
+            prefer_rsync: Some(true),
+            resume_job_id: None,
+        },
+    ).await?;
+    
+    // Grant execute permissions
+    session_exec(&rt, cfg, &format!("chmod +x {}", remote_path), None, Some(10)).await?;
+    
+    Ok(json!({
+        "success": true,
+        "message": format!("工具 {} 已经成功部署并赋予可执行权限", tool_name),
+        "remote_path": remote_path,
+        "transfer_info": transfer_res
+    }))
 }
