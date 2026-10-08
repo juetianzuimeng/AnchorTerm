@@ -161,6 +161,17 @@ pub struct SessionRuntime {
     pub local_forwards: ForwardSet,
 }
 
+/// RAII guard for `mcp_exec_inflight` to ensure it is decremented even if a future is cancelled.
+pub struct McpInflightGuard<'a> {
+    pub rt: &'a SessionRuntime,
+}
+
+impl<'a> Drop for McpInflightGuard<'a> {
+    fn drop(&mut self) {
+        self.rt.mcp_exec_inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Pending filter for silent control injects (`stty` resize, post-cmd marker echo).
 pub struct EchoSuppress {
     /// Exact command text without trailing CR/LF (as typed to the shell).

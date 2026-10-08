@@ -503,7 +503,7 @@ fn require_connected(rt: &SessionRuntime) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn begin_inflight(rt: &SessionRuntime) -> Result<(), ToolError> {
+fn begin_inflight<'a>(rt: &'a SessionRuntime) -> Result<crate::app_state::McpInflightGuard<'a>, ToolError> {
     let inflight = rt.mcp_exec_inflight.fetch_add(1, Ordering::SeqCst);
     if inflight >= MAX_INFLIGHT {
         rt.mcp_exec_inflight.fetch_sub(1, Ordering::SeqCst);
@@ -511,11 +511,7 @@ fn begin_inflight(rt: &SessionRuntime) -> Result<(), ToolError> {
             "too many concurrent side-channel ops on this session (max {MAX_INFLIGHT})"
         )));
     }
-    Ok(())
-}
-
-fn end_inflight(rt: &SessionRuntime) {
-    rt.mcp_exec_inflight.fetch_sub(1, Ordering::SeqCst);
+    Ok(crate::app_state::McpInflightGuard { rt })
 }
 
 pub fn resolve_remote_path(remote: &str, cwd: Option<&str>) -> Result<String, ToolError> {
@@ -2206,15 +2202,18 @@ fn spawn_path_job(
             st.updated_unix_ms = Some(now_unix_ms());
         }
 
-        if let Err(e) = begin_inflight(&rt) {
-            let mut st = job_run.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.status = TransferJobStatus::Failed;
-            st.phase = Some("failed".into());
-            st.error = Some(e.message);
-            st.finished_unix_ms = Some(now_unix_ms());
-            st.updated_unix_ms = Some(now_unix_ms());
-            return;
-        }
+        let _guard = match begin_inflight(&rt) {
+            Ok(g) => g,
+            Err(e) => {
+                let mut st = job_run.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.status = TransferJobStatus::Failed;
+                st.phase = Some("failed".into());
+                st.error = Some(e.message);
+                st.finished_unix_ms = Some(now_unix_ms());
+                st.updated_unix_ms = Some(now_unix_ms());
+                return;
+            }
+        };
 
         let outcome = execute_path_transfer(
             &rt,
@@ -2224,8 +2223,6 @@ fn spawn_path_job(
             Some(Arc::clone(&job_run)),
         )
         .await;
-
-        end_inflight(&rt);
 
         let mut st = job_run.state.lock().unwrap_or_else(|e| e.into_inner());
         st.finished_unix_ms = Some(now_unix_ms());
@@ -2456,7 +2453,7 @@ pub async fn session_file_upload(
             }));
         }
 
-        begin_inflight(&rt)?;
+        let _guard = begin_inflight(&rt)?;
         let t0 = Instant::now();
         let params = connect_params_from_rt(&rt)?;
         let plan = PathTransferOpts {
@@ -2479,7 +2476,6 @@ pub async fn session_file_upload(
             progress_poll_secs: cfg.transfer_progress_poll_secs,
         };
         let outcome = execute_path_transfer(&rt, &params, &plan, None, None).await;
-        end_inflight(&rt);
         let done = outcome.map_err(|(e, _)| e)?;
         warnings.extend(done.warnings);
         return Ok(serde_json::to_value(UploadResult {
@@ -2518,7 +2514,7 @@ pub async fn session_file_upload(
         ));
     }
 
-    begin_inflight(&rt)?;
+    let _guard = begin_inflight(&rt)?;
     let t0 = Instant::now();
     let timeout = Duration::from_secs(resolve_content_timeout_secs(args.timeout_secs, cfg));
     let params = connect_params_from_rt(&rt)?;
@@ -2548,7 +2544,6 @@ pub async fn session_file_upload(
         &job_id,
     )
     .await;
-    end_inflight(&rt);
     let done = done?;
     warnings.extend(done.warnings);
 
@@ -2666,7 +2661,7 @@ pub async fn session_file_download(
             }));
         }
 
-        begin_inflight(&rt)?;
+        let _guard = begin_inflight(&rt)?;
         let t0 = Instant::now();
         let params = connect_params_from_rt(&rt)?;
         let plan = PathTransferOpts {
@@ -2689,7 +2684,6 @@ pub async fn session_file_download(
             progress_poll_secs: cfg.transfer_progress_poll_secs,
         };
         let outcome = execute_path_transfer(&rt, &params, &plan, None, None).await;
-        end_inflight(&rt);
         let done = outcome.map_err(|(e, _)| e)?;
         warnings.extend(done.warnings);
         return Ok(serde_json::to_value(DownloadResult {
@@ -2720,7 +2714,7 @@ pub async fn session_file_download(
     }
 
     let limit = resolve_max_transfer_bytes(args.max_bytes);
-    begin_inflight(&rt)?;
+    let _guard = begin_inflight(&rt)?;
     let t0 = Instant::now();
     let timeout = Duration::from_secs(resolve_content_timeout_secs(args.timeout_secs, cfg));
     let params = connect_params_from_rt(&rt)?;
@@ -2732,7 +2726,6 @@ pub async fn session_file_download(
         match remote_file_size(&params, &rt, &remote, timeout.min(Duration::from_secs(60))).await {
             Ok(s) => Some(s),
             Err(e) => {
-                end_inflight(&rt);
                 return Err(e);
             }
         }
@@ -2772,7 +2765,6 @@ pub async fn session_file_download(
         limit + 1,
     )
     .await;
-    end_inflight(&rt);
     let res = res.map_err(map_transfer_err)?;
 
     if res.exit_code.unwrap_or(1) != 0 {

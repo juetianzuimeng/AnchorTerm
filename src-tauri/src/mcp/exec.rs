@@ -266,12 +266,9 @@ pub async fn session_exec(
             "too many concurrent execs on this session (max {MAX_INFLIGHT_EXEC})"
         )));
     }
+    let _guard = crate::app_state::McpInflightGuard { rt };
 
-    let result = session_exec_inner(rt, cfg, command, cwd_override, timeout_secs).await;
-
-    rt.mcp_exec_inflight
-        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    result
+    session_exec_inner(rt, cfg, command, cwd_override, timeout_secs).await
 }
 
 async fn session_exec_inner(
