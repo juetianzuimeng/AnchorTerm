@@ -1751,6 +1751,7 @@ async fn finish_session(app: AppHandle, session_id: String, manual: bool) {
             .ok()
             .and_then(|c| c.last_known().map(|s| s.to_string())),
         attempt: None,
+        mcp_inflight: Some(rt.mcp_exec_inflight.load(std::sync::atomic::Ordering::SeqCst)),
     };
     let do_reconnect = !is_manual && auto;
     drop(meta);

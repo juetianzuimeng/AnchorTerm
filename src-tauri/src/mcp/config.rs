@@ -111,7 +111,7 @@ fn default_transfer_verify() -> String {
 }
 
 fn default_transfer_max_retries() -> u32 {
-    2
+    6
 }
 
 fn default_transfer_retry_backoff() -> u64 {

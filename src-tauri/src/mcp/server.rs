@@ -298,6 +298,8 @@ async fn handle_connection(
                     "session_file_download",
                     "session_file_transfer_status",
                     "session_file_transfer_cancel",
+                    "session_file_transfer_pause",
+                    "session_file_transfer_resume",
                     "session_file_transfer_list"
                 ]
             });

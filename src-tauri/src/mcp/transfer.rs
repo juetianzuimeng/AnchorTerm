@@ -37,7 +37,7 @@ use crate::ssh::transport::ConnectParams;
 // ── limits ──────────────────────────────────────────────────────────────────
 
 pub const DEFAULT_MAX_TRANSFER_BYTES: usize = 1_048_576;
-pub const HARD_MAX_TRANSFER_BYTES: usize = 4 * 1024 * 1024;
+pub const HARD_MAX_TRANSFER_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_CONTENT_TIMEOUT_SECS: u64 = 60;
 const MAX_INFLIGHT: u32 = 2;
 const MAX_JOBS: usize = 64;
@@ -146,6 +146,7 @@ pub enum TransferDirection {
 pub enum TransferJobStatus {
     Queued,
     Running,
+    Paused,
     Succeeded,
     Failed,
     Cancelled,
@@ -194,17 +195,18 @@ pub struct TransferJobSnapshot {
     pub duration_ms: Option<u64>,
 }
 
-struct TransferJob {
-    id: String,
-    session_id: String,
-    direction: TransferDirection,
-    local_path: String,
-    remote_path: String,
-    cancel: Arc<AtomicBool>,
-    state: Mutex<TransferJobState>,
+pub struct TransferJob {
+    pub id: String,
+    pub session_id: String,
+    pub direction: TransferDirection,
+    pub local_path: String,
+    pub remote_path: String,
+    pub cancel: Arc<AtomicBool>,
+    pub pause: Arc<AtomicBool>,
+    pub state: Mutex<TransferJobState>,
 }
 
-struct TransferJobState {
+pub struct TransferJobState {
     status: TransferJobStatus,
     phase: Option<String>,
     bytes_total: Option<u64>,
@@ -261,7 +263,7 @@ impl TransferJob {
     }
 }
 
-fn set_job_progress(
+pub fn set_job_progress(
     job: &TransferJob,
     phase: &str,
     bytes_done: Option<u64>,
@@ -321,6 +323,17 @@ impl JobRegistry {
         out
     }
 
+    pub fn clear_done(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|_, job| {
+            let st = job.state.lock().unwrap_or_else(|e| e.into_inner());
+            matches!(
+                st.status,
+                TransferJobStatus::Queued | TransferJobStatus::Running | TransferJobStatus::Paused
+            )
+        });
+    }
+
     /// Count queued/running jobs (for concurrency caps).
     pub fn count_active(&self) -> usize {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -344,7 +357,7 @@ impl JobRegistry {
             TransferJobStatus::Succeeded
             | TransferJobStatus::Failed
             | TransferJobStatus::Cancelled => {}
-            TransferJobStatus::Queued | TransferJobStatus::Running => {
+            TransferJobStatus::Queued | TransferJobStatus::Running | TransferJobStatus::Paused => {
                 job.cancel.store(true, Ordering::SeqCst);
                 st.phase = Some("cancelling".into());
                 st.updated_unix_ms = Some(now_unix_ms());
@@ -356,6 +369,42 @@ impl JobRegistry {
                     st.cleaned_up = Some(true);
                 }
             }
+        }
+        drop(st);
+        Ok(job.snapshot())
+    }
+
+    pub fn pause(&self, id: &str) -> Result<TransferJobSnapshot, ToolError> {
+        let job = self
+            .get(id)
+            .ok_or_else(|| ToolError::not_found(format!("transfer job not found: {id}")))?;
+        let mut st = job.state.lock().unwrap_or_else(|e| e.into_inner());
+        match st.status {
+            TransferJobStatus::Running => {
+                job.pause.store(true, Ordering::SeqCst);
+                st.status = TransferJobStatus::Paused;
+                st.phase = Some("paused".into());
+                st.updated_unix_ms = Some(now_unix_ms());
+            }
+            _ => {}
+        }
+        drop(st);
+        Ok(job.snapshot())
+    }
+
+    pub fn resume(&self, id: &str) -> Result<TransferJobSnapshot, ToolError> {
+        let job = self
+            .get(id)
+            .ok_or_else(|| ToolError::not_found(format!("transfer job not found: {id}")))?;
+        let mut st = job.state.lock().unwrap_or_else(|e| e.into_inner());
+        match st.status {
+            TransferJobStatus::Paused => {
+                job.pause.store(false, Ordering::SeqCst);
+                st.status = TransferJobStatus::Running;
+                st.phase = Some("running".into());
+                st.updated_unix_ms = Some(now_unix_ms());
+            }
+            _ => {}
         }
         drop(st);
         Ok(job.snapshot())
@@ -577,21 +626,17 @@ fn check_cancel(cancel: &Option<Arc<AtomicBool>>) -> Result<(), ToolError> {
 
 // ── staging paths ───────────────────────────────────────────────────────────
 
-/// Remote staging path next to final (same directory).
 pub fn remote_staging_path(final_path: &str, job_id: &str) -> String {
-    let short = &job_id[..job_id.len().min(8)];
-    format!("{final_path}.anchorterm-part-{short}")
+    format!("{final_path}.anchorterm-part-{job_id}")
 }
 
-/// Local staging file in the same directory as the final destination.
 pub fn local_staging_path(final_path: &Path, job_id: &str) -> PathBuf {
-    let short = &job_id[..job_id.len().min(8)];
     let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
     let name = final_path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "download.bin".into());
-    parent.join(format!(".anchorterm-part-{short}-{name}"))
+    parent.join(format!("{name}.anchorterm-part-{job_id}"))
 }
 
 // ── hash / size ────────────────────────────────────────────────────────────
@@ -735,7 +780,8 @@ async fn remote_mv(
     timeout: Duration,
 ) -> Result<(), ToolError> {
     let cmd = format!(
-        "mv -f -- {} {}",
+        "rm -f -- {} ; mv -f -- {} {}",
+        shell_single_quote(to),
         shell_single_quote(from),
         shell_single_quote(to)
     );
@@ -908,6 +954,7 @@ struct PathTransferOpts {
     local_final: PathBuf,
     remote_final: String,
     job_id: String,
+    is_resume: bool,
     expected_bytes: Option<u64>,
     create_dirs: bool,
     overwrite: bool,
@@ -1317,8 +1364,10 @@ async fn execute_path_transfer(
                 ),
             );
 
-            // Always try to remove stale stage from a previous crash.
-            let _ = remote_rm(params, rt, &remote_stage, short_timeout).await;
+            if !opts.is_resume {
+                // Always try to remove stale stage from a previous crash unless resuming.
+                let _ = remote_rm(params, rt, &remote_stage, short_timeout).await;
+            }
 
             if let Err(e) = prep_remote_final(
                 params,
@@ -1338,6 +1387,11 @@ async fn execute_path_transfer(
 
             let stop_progress = Arc::new(AtomicBool::new(false));
             let poll_handle = match (&progress_job, &opts.progress_rt) {
+                (Some(job), Some(rt_arc)) if !opts.recursive && !opts.prefer_rsync => {
+                    // When prefer_rsync=false, we use SFTP which natively updates progress.
+                    // We don't need a polling thread that fights with SFTP.
+                    None
+                },
                 (Some(job), Some(rt_arc)) if !opts.recursive => Some(spawn_progress_poller(
                     Arc::clone(job),
                     params.clone(),
@@ -1369,21 +1423,42 @@ async fn execute_path_transfer(
                 )
                 .await
             } else {
-                run_transport(
+                let mut start_offset = if let Ok(sz) = remote_file_size(params, rt, &remote_stage, short_timeout).await {
+                    sz
+                } else {
+                    0
+                };
+
+                if start_offset > 0 && opts.is_resume {
+                    if start_offset > expected {
+                        warnings.push("remote staging file is larger than local file, restarting from 0".into());
+                        let _ = remote_rm(params, rt, &remote_stage, short_timeout).await;
+                        start_offset = 0;
+                    }
+                }
+                let sftp_fut = crate::mcp::sftp::run_sftp_transfer(
                     params,
-                    rt,
                     TransferDirection::Upload,
                     &opts.local_final,
                     &remote_stage,
-                    opts.timeout,
-                    cancel.clone(),
-                    false,
-                    opts.prefer_rsync,
+                    start_offset,
+                    progress_job.as_ref().unwrap().clone(),
                     opts.max_retries,
                     opts.retry_backoff,
-                    &mut warnings,
-                )
-                .await
+                );
+                let cancel_c = cancel.clone();
+                let cancel_fut = async move {
+                    loop {
+                        if cancel_c.as_ref().map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
+                            return Err(ToolError::cancelled("Transfer cancelled by user"));
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                };
+                tokio::select! {
+                    res = sftp_fut => res,
+                    res = cancel_fut => res,
+                }
             };
 
             stop_progress.store(true, Ordering::SeqCst);
@@ -1549,8 +1624,10 @@ async fn execute_path_transfer(
         }
         TransferDirection::Download => {
             let local_stage = local_staging_path(&opts.local_final, &opts.job_id);
-            // Remove stale local stage.
-            let _ = std::fs::remove_file(&local_stage);
+            if !opts.is_resume {
+                // Remove stale local stage unless resuming.
+                let _ = std::fs::remove_file(&local_stage);
+            }
 
             if let Some(parent) = opts.local_final.parent() {
                 if !parent.as_os_str().is_empty() {
@@ -1588,6 +1665,10 @@ async fn execute_path_transfer(
 
             let stop_progress = Arc::new(AtomicBool::new(false));
             let poll_handle = match (&progress_job, &opts.progress_rt) {
+                (Some(_job), Some(_rt_arc)) if !opts.recursive && !opts.prefer_rsync => {
+                    // SFTP natively updates progress, no poller needed
+                    None
+                },
                 (Some(job), Some(rt_arc)) => Some(spawn_progress_poller(
                     Arc::clone(job),
                     params.clone(),
@@ -1622,21 +1703,44 @@ async fn execute_path_transfer(
                 )
                 .await
             } else {
-                run_transport(
+                let mut start_offset = if let Ok(metadata) = std::fs::metadata(&local_stage) {
+                    metadata.len()
+                } else {
+                    0
+                };
+
+                if start_offset > 0 && opts.is_resume {
+                    if let Some(expected) = remote_sz {
+                        if start_offset > expected {
+                            warnings.push("local staging file is larger than expected remote file, restarting from 0".into());
+                            let _ = std::fs::remove_file(&local_stage);
+                            start_offset = 0;
+                        }
+                    }
+                }
+                let sftp_fut = crate::mcp::sftp::run_sftp_transfer(
                     params,
-                    rt,
                     TransferDirection::Download,
                     &local_stage,
                     &opts.remote_final,
-                    opts.timeout,
-                    cancel.clone(),
-                    false,
-                    opts.prefer_rsync,
+                    start_offset,
+                    progress_job.as_ref().unwrap().clone(),
                     opts.max_retries,
                     opts.retry_backoff,
-                    &mut warnings,
-                )
-                .await
+                );
+                let cancel_c = cancel.clone();
+                let cancel_fut = async move {
+                    loop {
+                        if cancel_c.as_ref().map(|c| c.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(false) {
+                            return Err(ToolError::cancelled("Transfer cancelled by user"));
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                };
+                tokio::select! {
+                    res = sftp_fut => res,
+                    res = cancel_fut => res,
+                }
             };
 
             stop_progress.store(true, Ordering::SeqCst);
@@ -1985,6 +2089,7 @@ struct SpawnOpts {
     max_retries: u32,
     retry_backoff: Duration,
     progress_poll_secs: u64,
+    resume_job_id: Option<String>,
 }
 
 fn spawn_path_job(
@@ -1993,8 +2098,22 @@ fn spawn_path_job(
     opts: SpawnOpts,
 ) -> Result<TransferJobSnapshot, ToolError> {
     require_connected(&rt)?;
+
+    let active_jobs = registry.list(None);
+    for active_job in active_jobs {
+        if active_job.remote_path == opts.remote && active_job.direction == opts.direction {
+            if active_job.status == TransferJobStatus::Running
+                || active_job.status == TransferJobStatus::Queued
+            {
+                return Err(ToolError::busy(
+                    "当前已有针对该目标路径的任务在传输，不允许并发传输到同一文件。",
+                ));
+            }
+        }
+    }
+
     let params = connect_params_from_rt(&rt)?;
-    let job_id = Uuid::new_v4().to_string();
+    let job_id = opts.resume_job_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
     let cancel = Arc::new(AtomicBool::new(false));
     let created = now_unix_ms();
     let job = Arc::new(TransferJob {
@@ -2004,6 +2123,7 @@ fn spawn_path_job(
         local_path: opts.local.display().to_string(),
         remote_path: opts.remote.clone(),
         cancel: Arc::clone(&cancel),
+        pause: Arc::new(AtomicBool::new(false)),
         state: Mutex::new(TransferJobState {
             status: TransferJobStatus::Queued,
             phase: Some("queued".into()),
@@ -2048,6 +2168,7 @@ fn spawn_path_job(
         local_final: opts.local,
         remote_final: opts.remote,
         job_id: job_id.clone(),
+        is_resume: opts.resume_job_id.is_some(),
         expected_bytes: opts.bytes_total,
         create_dirs: opts.create_dirs,
         overwrite: opts.overwrite,
@@ -2191,6 +2312,7 @@ pub struct FileTransferArgs<'a> {
     pub cleanup_on_fail: bool,
     pub recursive: bool,
     pub prefer_rsync: Option<bool>,
+    pub resume_job_id: Option<&'a str>,
 }
 
 pub async fn session_file_upload(
@@ -2316,6 +2438,7 @@ pub async fn session_file_upload(
                     max_retries: cfg.transfer_max_retries,
                     retry_backoff: Duration::from_secs(cfg.transfer_retry_backoff_secs),
                     progress_poll_secs: cfg.transfer_progress_poll_secs,
+                    resume_job_id: args.resume_job_id.map(|s| s.to_string()),
                 },
             )?;
             return Ok(json!({
@@ -2340,7 +2463,8 @@ pub async fn session_file_upload(
             direction: TransferDirection::Upload,
             local_final: local,
             remote_final: remote.clone(),
-            job_id: Uuid::new_v4().to_string(),
+            job_id: args.resume_job_id.map(|s| s.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()),
+            is_resume: args.resume_job_id.is_some(),
             expected_bytes: Some(size),
             create_dirs: args.create_dirs,
             overwrite: args.overwrite,
@@ -2524,6 +2648,7 @@ pub async fn session_file_download(
                     max_retries: cfg.transfer_max_retries,
                     retry_backoff: Duration::from_secs(cfg.transfer_retry_backoff_secs),
                     progress_poll_secs: cfg.transfer_progress_poll_secs,
+                    resume_job_id: args.resume_job_id.map(|s| s.to_string()),
                 },
             )?;
             return Ok(json!({
@@ -2548,7 +2673,8 @@ pub async fn session_file_download(
             direction: TransferDirection::Download,
             local_final: dest.clone(),
             remote_final: remote.clone(),
-            job_id: Uuid::new_v4().to_string(),
+            job_id: args.resume_job_id.map(|s| s.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()),
+            is_resume: args.resume_job_id.is_some(),
             expected_bytes: None,
             create_dirs: false,
             overwrite: args.overwrite,
@@ -2780,6 +2906,24 @@ pub fn transfer_cancel(registry: &JobRegistry, job_id: &str) -> Result<Value, To
     }))
 }
 
+pub fn transfer_pause(registry: &JobRegistry, job_id: &str) -> Result<Value, ToolError> {
+    let snap = registry.pause(job_id.trim())?;
+    Ok(json!({
+        "paused": matches!(snap.status, TransferJobStatus::Paused),
+        "job": snap,
+        "message": "pause requested",
+    }))
+}
+
+pub fn transfer_resume(registry: &JobRegistry, job_id: &str) -> Result<Value, ToolError> {
+    let snap = registry.resume(job_id.trim())?;
+    Ok(json!({
+        "resumed": matches!(snap.status, TransferJobStatus::Running),
+        "job": snap,
+        "message": "resume requested",
+    }))
+}
+
 pub fn transfer_list(
     registry: &JobRegistry,
     session_id: Option<&str>,
@@ -2852,5 +2996,54 @@ mod tests {
     fn job_registry_cancel_unknown() {
         let reg = JobRegistry::default();
         assert!(reg.cancel("nope").is_err());
+    }
+
+    #[test]
+    fn test_job_registry_pause_resume() {
+        use std::sync::atomic::AtomicBool;
+        let registry = JobRegistry::default();
+        let job_id = "test-job-123".to_string();
+        
+        let job = Arc::new(TransferJob {
+            id: job_id.clone(),
+            session_id: "test-session".to_string(),
+            direction: TransferDirection::Upload,
+            local_path: "/tmp/local".to_string(),
+            remote_path: "/tmp/remote".to_string(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(AtomicBool::new(false)),
+            state: Mutex::new(TransferJobState {
+                status: TransferJobStatus::Running,
+                phase: Some("running".to_string()),
+                bytes_total: Some(100),
+                bytes_transferred: Some(10),
+                percent: Some(10.0),
+                bytes_per_sec: None,
+                updated_unix_ms: Some(0),
+                progress_source: None,
+                error: None,
+                warnings: vec![],
+                verified: None,
+                verify_mode: None,
+                sha256: None,
+                cleaned_up: None,
+                created_unix_ms: 0,
+                started_unix_ms: Some(0),
+                finished_unix_ms: None,
+            }),
+        });
+
+        registry.insert(job.clone());
+
+        // Test Pause
+        assert!(!job.pause.load(std::sync::atomic::Ordering::SeqCst));
+        let snap = registry.pause(&job_id).unwrap();
+        assert!(matches!(snap.status, TransferJobStatus::Paused));
+        assert!(job.pause.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Test Resume
+        let snap2 = registry.resume(&job_id).unwrap();
+        assert!(matches!(snap2.status, TransferJobStatus::Running));
+        assert!(!job.pause.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

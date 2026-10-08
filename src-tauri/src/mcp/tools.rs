@@ -17,7 +17,7 @@ pub fn tools_list_payload() -> Value {
         "tools": [
             {
                 "name": "sessions_list",
-                "description": "列出 AnchorTerm 中的 SSH 会话快照（session_id、状态、主机、用户名、当前工作目录 cwd）。",
+                "description": "列出 AnchorTerm 中的 SSH 会话快照（session_id、状态、主机、用户名、当前工作目录 cwd、mcp_inflight 并发信道数等）。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -30,7 +30,7 @@ pub fn tools_list_payload() -> Value {
             },
             {
                 "name": "session_get",
-                "description": "按 session_id 获取单个会话的快照信息。",
+                "description": "按 session_id 获取单个会话的快照信息（含 mcp_inflight 并发数）。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -87,7 +87,7 @@ pub fn tools_list_payload() -> Value {
             },
             {
                 "name": "session_file_upload",
-                "description": "上传文件到会话主机（侧信道）。content=小文件内联(≤4MiB,同步，不续传)；local_path=本机文件（默认异步，适合 500MB+），优先 rsync、不可用则 scp。单文件 staging+mv 原子提交，默认 size 校验；失败/取消默认删临时文件。异步返回 job_id。续传仅限同一次 job 内 rsync 自动重试（mcp.json transfer_max_retries）；cancel/失败后再调是新 job（新 staging 路径），默认从头传。scp 不续传。",
+                "description": "上传文件到会话主机（侧信道）。content=小文件内联(≤1MiB)；local_path=本机大文件，优先 rsync、不可用则 scp。单文件 staging+mv 原子提交；支持通过传入 resume_job_id 进行安全的跨任务断点续传（依赖 rsync，scp 将从头覆盖）。如果不提供 resume_job_id 且同路径存在失败的旧任务，将作为新任务重新发起。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -129,7 +129,7 @@ pub fn tools_list_payload() -> Value {
                         },
                         "cleanup_on_fail": {
                             "type": "boolean",
-                            "description": "失败/取消时删除远端 staging 临时文件。默认 true。新一次 upload 会换 job_id 和 staging 文件名，跨任务不能接上次半截文件。"
+                            "description": "失败/取消时删除远端 staging 临时文件。默认 true。如果设为 false，则保留半截文件，后续可使用 resume_job_id 精确续传。"
                         },
                         "recursive": {
                             "type": "boolean",
@@ -137,7 +137,11 @@ pub fn tools_list_payload() -> Value {
                         },
                         "prefer_rsync": {
                             "type": "boolean",
-                            "description": "优先 rsync（--partial）。续传只作用于同一次 job 的自动重试，不是跨任务断点续传。无 rsync 则 scp（不续传）。省略则读 mcp.json（默认 true）。"
+                            "description": "优先 rsync（--partial）。无 rsync 则 scp（不续传）。省略则读 mcp.json（默认 true）。"
+                        },
+                        "resume_job_id": {
+                            "type": "string",
+                            "description": "如果传入之前的 job_id，系统将复用该 ID 以进行精确的跨任务断点续传（必须配合 local_path 并确保 remote_path 一致）。若该远端路径正在被其他任务传输，系统将拒绝本次操作以防并发覆盖。"
                         },
                         "timeout_secs": {
                             "type": "number",
@@ -145,7 +149,7 @@ pub fn tools_list_payload() -> Value {
                         },
                         "max_bytes": {
                             "type": "number",
-                            "description": "content 模式最大字节数（默认 1048576，最大 4MiB）"
+                            "description": "content 模式最大字节数（默认/最大 1048576，即 1MB）"
                         }
                     },
                     "required": ["remote_path"]
@@ -153,7 +157,7 @@ pub fn tools_list_payload() -> Value {
             },
             {
                 "name": "session_file_download",
-                "description": "从会话主机下载文件（侧信道）。省略 local_path 则 content 内联返回（不续传）；指定 local_path 则 rsync/scp（默认异步）。优先 rsync（--partial），否则 scp。单文件 staging 后 rename；失败/取消默认删本机临时文件。本机路径受沙箱约束。续传仅限同一次 job 内 rsync 自动重试；cancel/失败后再调是新 job，默认从头传。scp 不续传。",
+                "description": "从会话主机下载文件（侧信道）。省略 local_path 则 content 内联返回；指定 local_path 则 rsync/scp（默认异步）。单文件 staging 后 rename；支持通过传入 resume_job_id 恢复失败/取消的历史任务进行断点续传（依赖 rsync，scp 将从头覆盖）。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -183,7 +187,7 @@ pub fn tools_list_payload() -> Value {
                         },
                         "cleanup_on_fail": {
                             "type": "boolean",
-                            "description": "失败/取消时删除本机 staging。默认 true。新一次 download 会换 job_id 和 staging 文件名，跨任务不能接上次半截文件。"
+                            "description": "失败/取消时删除本机 staging。默认 true。如果设为 false，则保留半截文件，后续可使用 resume_job_id 精确续传。"
                         },
                         "overwrite": {
                             "type": "boolean",
@@ -195,7 +199,11 @@ pub fn tools_list_payload() -> Value {
                         },
                         "prefer_rsync": {
                             "type": "boolean",
-                            "description": "优先 rsync（--partial）。续传只作用于同一次 job 的自动重试，不是跨任务断点续传。无 rsync 则 scp（不续传）。省略则读 mcp.json（默认 true）。"
+                            "description": "优先 rsync（--partial）。无 rsync 则 scp（不续传）。省略则读 mcp.json（默认 true）。"
+                        },
+                        "resume_job_id": {
+                            "type": "string",
+                            "description": "传入被中断的任务 job_id，尝试复用该 ID 进行断点续传。防止并发覆盖。"
                         },
                         "timeout_secs": {
                             "type": "number",
@@ -203,7 +211,7 @@ pub fn tools_list_payload() -> Value {
                         },
                         "max_bytes": {
                             "type": "number",
-                            "description": "content 模式最大返回字节数（默认 1MiB，最大 4MiB）"
+                            "description": "content 模式最大返回字节数（默认/最大 1MiB）"
                         }
                     },
                     "required": ["remote_path"]
@@ -232,6 +240,34 @@ pub fn tools_list_payload() -> Value {
                         "job_id": {
                             "type": "string",
                             "description": "要取消的 job_id"
+                        }
+                    },
+                    "required": ["job_id"]
+                }
+            },
+            {
+                "name": "session_file_transfer_pause",
+                "description": "暂停进行中的异步传输任务。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "要暂停的 job_id"
+                        }
+                    },
+                    "required": ["job_id"]
+                }
+            },
+            {
+                "name": "session_file_transfer_resume",
+                "description": "恢复已暂停的异步传输任务。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "要恢复的 job_id"
                         }
                     },
                     "required": ["job_id"]
@@ -271,6 +307,8 @@ pub async fn call_tool(
         "session_file_download" => tool_session_file_download(app, cfg, arguments).await,
         "session_file_transfer_status" => tool_session_file_transfer_status(app, arguments),
         "session_file_transfer_cancel" => tool_session_file_transfer_cancel(app, arguments),
+        "session_file_transfer_pause" => tool_session_file_transfer_pause(app, arguments),
+        "session_file_transfer_resume" => tool_session_file_transfer_resume(app, arguments),
         "session_file_transfer_list" => tool_session_file_transfer_list(app, arguments),
         other => Err(ToolError::invalid(format!("unknown tool: {other}"))),
     };
@@ -317,6 +355,7 @@ fn snapshot_to_json(snap: &crate::app_state::SessionSnapshot) -> Value {
         "cwd": snap.cwd,
         "message": snap.message,
         "attempt": snap.attempt,
+        "mcp_inflight": snap.mcp_inflight,
     })
 }
 
@@ -470,6 +509,7 @@ async fn tool_session_file_upload(
     let cleanup_on_fail = transfer::arg_bool(arguments, "cleanup_on_fail", true);
     let recursive = transfer::arg_bool(arguments, "recursive", false);
     let prefer_rsync = arguments.get("prefer_rsync").and_then(|v| v.as_bool());
+    let resume_job_id = arguments.get("resume_job_id").and_then(|v| v.as_str());
 
     let st = state(app)?;
     let rt = st
@@ -495,6 +535,7 @@ async fn tool_session_file_upload(
             cleanup_on_fail,
             recursive,
             prefer_rsync,
+            resume_job_id,
         },
     )
     .await
@@ -523,6 +564,7 @@ async fn tool_session_file_download(
     let overwrite = transfer::arg_bool(arguments, "overwrite", true);
     let recursive = transfer::arg_bool(arguments, "recursive", false);
     let prefer_rsync = arguments.get("prefer_rsync").and_then(|v| v.as_bool());
+    let resume_job_id = arguments.get("resume_job_id").and_then(|v| v.as_str());
 
     let st = state(app)?;
     let rt = st
@@ -548,6 +590,7 @@ async fn tool_session_file_download(
             cleanup_on_fail,
             recursive,
             prefer_rsync,
+            resume_job_id,
         },
     )
     .await
@@ -575,6 +618,30 @@ fn tool_session_file_transfer_cancel(
         .ok_or_else(|| ToolError::invalid("job_id is required"))?;
     let registry = transfer_jobs(app)?;
     transfer::transfer_cancel(&registry, job_id)
+}
+
+fn tool_session_file_transfer_pause(
+    app: &AppHandle,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    let job_id = arg_str(arguments, "job_id")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ToolError::invalid("job_id is required"))?;
+    let registry = transfer_jobs(app)?;
+    transfer::transfer_pause(&registry, job_id)
+}
+
+fn tool_session_file_transfer_resume(
+    app: &AppHandle,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    let job_id = arg_str(arguments, "job_id")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ToolError::invalid("job_id is required"))?;
+    let registry = transfer_jobs(app)?;
+    transfer::transfer_resume(&registry, job_id)
 }
 
 fn tool_session_file_transfer_list(

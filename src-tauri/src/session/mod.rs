@@ -1346,6 +1346,7 @@ fn close_session_inner(
             message: Some("会话已关闭".into()),
             cwd: None,
             attempt: None,
+            mcp_inflight: None,
         },
     );
     crate::ops_log::log(

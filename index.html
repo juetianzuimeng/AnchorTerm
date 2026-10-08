@@ -67,6 +67,14 @@
               >
                 端口转发…
               </button>
+              <button
+                type="button"
+                data-action="open-transfer-manager"
+                role="menuitem"
+                title="打开文件传输管理器（需已连接）"
+              >
+                文件传输…
+              </button>
               <hr />
               <button
                 type="button"
@@ -112,6 +120,7 @@
                 <span class="menu-check" aria-hidden="true"></span>
                 <span class="menu-label">连接后自动打开 Xftp</span>
               </button>
+              <button type="button" data-action="open-transfer-manager" role="menuitem">文件传输管理…</button>
               <button type="button" data-action="open-logs" role="menuitem">打开操作日志目录</button>
               <button
                 type="button"
@@ -157,6 +166,7 @@
           端口转发…
         </button>
         <button type="button" data-tab-action="open-xftp" role="menuitem">打开 Xftp…</button>
+        <button type="button" data-tab-action="transfer-manager" role="menuitem">文件传输管理…</button>
         <hr />
         <button type="button" data-tab-action="disconnect" role="menuitem">断开</button>
         <button type="button" data-tab-action="reconnect" role="menuitem">重新连接</button>
@@ -515,6 +525,48 @@
       </footer>
     </dialog>
 
+    <!-- File Transfer Manager -->
+    <dialog id="dlg-transfer-manager" class="app-dialog dlg-wide" aria-labelledby="dlg-transfer-title">
+      <header class="dlg-header">
+        <h2 id="dlg-transfer-title">文件传输管理</h2>
+        <button type="button" class="dlg-close" data-dlg-close title="关闭">×</button>
+      </header>
+      <div class="dlg-body">
+        <div class="dlg-row" style="align-items: flex-end;">
+          <label style="flex: 1;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+              <span>上传本机文件到当前目录：</span>
+              <label style="font-weight: normal; font-size: 12px; cursor: pointer;" title="打勾后，若取消或失败，远程服务器将不会删除已传了一半的临时文件，下次传可续传。">
+                <input type="checkbox" id="transfer-keep-temp" /> 保留临时文件
+              </label>
+            </div>
+            <input type="file" id="transfer-upload-input" multiple style="display:none;" />
+            <button type="button" id="btn-transfer-upload-pick">选择文件并上传...</button>
+          </label>
+          <label style="flex: 1; margin-left: 12px;">
+            <span>下载远端文件到本机：</span>
+            <div style="display: flex; gap: 8px;">
+              <input type="text" id="transfer-download-path" placeholder="输入远端绝对路径" style="flex: 1;" />
+              <button type="button" id="btn-transfer-download-start">下载</button>
+            </div>
+          </label>
+        </div>
+        <hr />
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <h3 class="fwd-list-title" style="margin: 0;">传输任务列表</h3>
+          <button type="button" id="btn-transfer-clear-done" class="icon-btn" style="font-size:12px;">清除已完成</button>
+        </div>
+        <div id="transfer-manager-list" class="transfer-list" style="max-height: 400px; margin-top: 8px;">
+          <!-- dynamically populated -->
+        </div>
+      </div>
+      <footer class="dlg-footer">
+        <span class="hint">提示：您也可以直接将文件拖拽进终端窗口进行快速上传。</span>
+        <span class="dlg-spacer"></span>
+        <button type="button" data-dlg-close>关闭</button>
+      </footer>
+    </dialog>
+
     <!-- Missing system OpenSSH (startup check) -->
     <dialog id="dlg-ssh-missing" class="app-dialog" aria-labelledby="dlg-ssh-missing-title">
       <header class="dlg-header">
@@ -539,5 +591,16 @@
         <button type="button" data-dlg-close class="primary">知道了</button>
       </footer>
     </dialog>
+
+    <!-- UI Panel for File Transfers -->
+    <div id="transfer-panel" class="transfer-panel hidden">
+      <div class="transfer-header">
+        <span class="transfer-title">文件传输 (<span id="transfer-count">0</span>)</span>
+        <button id="btn-transfer-toggle" class="icon-btn" title="收起/展开">▼</button>
+      </div>
+      <div id="transfer-list" class="transfer-list">
+        <!-- dynamically populated -->
+      </div>
+    </div>
   </body>
 </html>

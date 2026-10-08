@@ -47,6 +47,7 @@ pub struct SessionSnapshot {
     pub message: Option<String>,
     pub cwd: Option<String>,
     pub attempt: Option<u32>,
+    pub mcp_inflight: Option<u32>,
 }
 
 /// Event payload for `session://data` (PR2 object shape).
@@ -496,6 +497,7 @@ impl SessionRuntime {
             message: meta.message.clone(),
             cwd,
             attempt,
+            mcp_inflight: Some(self.mcp_exec_inflight.load(Ordering::SeqCst)),
         }
     }
 

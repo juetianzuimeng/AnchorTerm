@@ -1454,3 +1454,118 @@ button.danger {
     transform: rotate(360deg);
   }
 }
+
+/* File Transfer Panel */
+.transfer-panel {
+  position: fixed;
+  bottom: 80px;
+  right: 24px;
+  width: 320px;
+  background-color: var(--surface-1);
+  border: 1px solid var(--border-light);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  display: flex;
+  flex-direction: column;
+  z-index: 10000;
+  transition: transform 0.2s;
+}
+
+.transfer-panel.hidden {
+  display: none;
+}
+
+.transfer-panel.collapsed .transfer-list {
+  display: none;
+}
+
+.transfer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-light);
+  background-color: var(--surface-2);
+  border-radius: 8px 8px 0 0;
+  font-weight: 500;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.transfer-list {
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.transfer-item {
+  display: flex;
+  flex-direction: column;
+  background-color: var(--surface-0);
+  border: 1px solid var(--border-light);
+  border-radius: 4px;
+  padding: 8px;
+  font-size: 12px;
+  position: relative;
+}
+
+.transfer-item-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.transfer-filename {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.transfer-status {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.transfer-progress-bar {
+  height: 4px;
+  background-color: var(--surface-3);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+
+.transfer-progress-fill {
+  height: 100%;
+  background-color: var(--accent);
+  width: 0%;
+  transition: width 0.2s;
+}
+
+.transfer-details {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.transfer-cancel {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.transfer-cancel:hover {
+  color: #ff4d4f;
+}
+

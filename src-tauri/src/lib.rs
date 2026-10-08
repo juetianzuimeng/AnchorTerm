@@ -44,6 +44,7 @@ pub fn run() {
     }
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .setup(|app| {
@@ -80,6 +81,10 @@ pub fn run() {
             mcp::mcp_regenerate_token,
             mcp::mcp_update_settings,
             mcp::mcp_apply,
+            mcp::mcp_ui_transfer_start,
+            mcp::mcp_ui_transfer_list,
+            mcp::mcp_ui_transfer_cancel,
+            mcp::mcp_ui_transfer_clear_done,
             ssh::forward::start_local_forward,
             ssh::forward::stop_local_forward,
             ssh::forward::list_local_forwards,

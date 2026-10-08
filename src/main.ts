@@ -9,6 +9,7 @@ import {
   openUrl,
   revealItemInDir,
 } from "@tauri-apps/plugin-opener";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -4134,6 +4135,15 @@ async function handleMenuAction(action: string) {
     case "open-xftp":
       await openXftpForActive();
       break;
+    case "transfer-manager": {
+      const titleEl = $("dlg-transfer-title");
+      if (titleEl) {
+        titleEl.textContent = active ? `文件传输管理 (当前会话: ${active.title})` : "文件传输管理";
+      }
+      const dlg = $("dlg-transfer-manager") as HTMLDialogElement;
+      if (!dlg.open) dlg.showModal();
+      break;
+    }
     case "toggle-xftp-auto":
       setXftpAutoLaunchEnabled(!isXftpAutoLaunchEnabled());
       showToast(
@@ -4209,6 +4219,20 @@ async function handleMenuAction(action: string) {
     case "open-mcp":
       await openMcpDialog();
       break;
+    case "open-transfer-manager": {
+      const active = getActive();
+      if (!active) {
+        showToast("请先连接一个会话");
+        break;
+      }
+      const dlg = $("dlg-transfer-manager") as HTMLDialogElement;
+      const titleEl = $("dlg-transfer-title");
+      if (titleEl) {
+        titleEl.textContent = active ? `文件传输管理 (当前会话: ${active.title})` : "文件传输管理";
+      }
+      if (!dlg.open) dlg.showModal();
+      break;
+    }
   }
 }
 
@@ -4867,7 +4891,353 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   // Phase B: surface missing OpenSSH clearly (do not silently fail on connect only).
   await checkSshOnStartup();
+
+  await setupTransfers();
 });
+
+function formatBytes(bytes: number) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+async function setupTransfers() {
+  const panel = $("transfer-panel");
+  const toggleBtn = $("btn-transfer-toggle");
+  const listEl = $("transfer-list");
+  const countEl = $("transfer-count");
+  if (!panel || !toggleBtn || !listEl || !countEl) return;
+  
+  toggleBtn.addEventListener("click", () => {
+    panel.classList.toggle("collapsed");
+    toggleBtn.textContent = panel.classList.contains("collapsed") ? "▲" : "▼";
+  });
+
+  try {
+    const win = getCurrentWindow();
+    await win.onDragDropEvent(async (event) => {
+      if (event.payload.type === 'drop') {
+        const paths = event.payload.paths;
+        const sid = activeSessionId;
+        if (!sid || !sessions.has(sid)) {
+          showToast("请先选择一个已连接的会话标签");
+          return;
+        }
+        const view = sessions.get(sid)!;
+        if (view.state !== "connected") {
+          showToast("当前会话未连接，无法上传文件");
+          return;
+        }
+        
+        let cwd = view.cwd || "~/";
+        
+        for (const localPath of paths) {
+          const filename = localPath.split(/[\\/]/).pop();
+          const remotePath = cwd.endsWith('/') ? cwd + filename : cwd + '/' + filename;
+          
+          try {
+            const currentJobs = await invoke<any[]>("mcp_ui_transfer_list", { sessionId: null });
+            const existingJob = currentJobs.find(j => 
+              j.local_path === localPath && 
+              j.remote_path === remotePath && 
+              (j.status === "failed" || j.status === "cancelled")
+            );
+
+            await invoke("mcp_ui_transfer_start", {
+              sessionId: sid,
+              localPath,
+              remotePath,
+              direction: "upload",
+              resumeJobId: existingJob ? existingJob.job_id : null,
+              cleanupOnFail: !(document.getElementById("transfer-keep-temp") as HTMLInputElement)?.checked
+            });
+            showToast(existingJob ? `已恢复 ${filename} 的上传` : `已将 ${filename} 加入上传队列`);
+            panel.classList.remove("hidden");
+          } catch (e) {
+            showToast(`发起上传失败: ${e}`);
+          }
+        }
+      }
+    });
+  } catch (e) {
+    console.error("Failed to setup drag drop listener:", e);
+  }
+
+  // Dialog actions
+  $("btn-transfer-upload-pick").addEventListener("click", async () => {
+    try {
+      const active = getActive();
+      if (!active) return;
+      const cwd = active.cwd || "~/";
+      
+      const filePaths = await openDialog({
+        multiple: true,
+        title: "选择要上传的文件"
+      });
+      if (!filePaths || filePaths.length === 0) return;
+      
+      const currentJobs = await invoke<any[]>("mcp_ui_transfer_list", { sessionId: null });
+
+      for (const localPath of (Array.isArray(filePaths) ? filePaths : [filePaths])) {
+        const filename = localPath.split(/[\\/]/).pop();
+        const remotePath = cwd.endsWith('/') ? cwd + filename : cwd + '/' + filename;
+        const existingJob = currentJobs.find(j => 
+          j.local_path === localPath && 
+          j.remote_path === remotePath && 
+          (j.status === "failed" || j.status === "cancelled")
+        );
+        
+        await invoke("mcp_ui_transfer_start", {
+          sessionId: active.sessionId,
+          localPath,
+          remotePath,
+          direction: "upload",
+          resumeJobId: existingJob ? existingJob.job_id : null,
+          cleanupOnFail: !(document.getElementById("transfer-keep-temp") as HTMLInputElement)?.checked
+        });
+        showToast(existingJob ? `已恢复 ${filename} 的上传` : `已加入上传队列: ${filename}`);
+      }
+      panel.classList.remove("hidden");
+    } catch (e) {
+      showToast(`上传失败: ${e}`);
+    }
+  });
+
+  $("btn-transfer-download-start").addEventListener("click", async () => {
+    try {
+      const active = getActive();
+      if (!active) return;
+      const remotePathInput = $("transfer-download-path") as HTMLInputElement;
+      const remotePath = remotePathInput.value.trim();
+      if (!remotePath) {
+        showToast("请输入远端绝对路径");
+        return;
+      }
+      const defaultFilename = remotePath.split('/').pop() || "downloaded_file";
+      
+      const localPath = await saveDialog({
+        title: "选择保存位置",
+        defaultPath: defaultFilename
+      });
+      if (!localPath) return;
+
+      const currentJobs = await invoke<any[]>("mcp_ui_transfer_list", { sessionId: null });
+      const existingJob = currentJobs.find(j => 
+        j.local_path === localPath && 
+        j.remote_path === remotePath && 
+        (j.status === "failed" || j.status === "cancelled")
+      );
+
+      await invoke("mcp_ui_transfer_start", {
+        sessionId: active.sessionId,
+        localPath,
+        remotePath,
+        direction: "download",
+        resumeJobId: existingJob ? existingJob.job_id : null,
+        cleanupOnFail: !(document.getElementById("transfer-keep-temp") as HTMLInputElement)?.checked
+      });
+      showToast(existingJob ? `已恢复下载` : `已加入下载队列`);
+      panel.classList.remove("hidden");
+      remotePathInput.value = "";
+    } catch (e) {
+      showToast(`下载失败: ${e}`);
+    }
+  });
+
+  $("btn-transfer-clear-done").addEventListener("click", async () => {
+    try {
+      await invoke("mcp_ui_transfer_clear_done");
+    } catch (e) {}
+  });
+
+  const dialogListEl = $("transfer-manager-list");
+
+  setInterval(async () => {
+    try {
+      const jobs = await invoke<any[]>("mcp_ui_transfer_list", { sessionId: null });
+      if (jobs.length > 0) {
+        panel.classList.remove("hidden");
+      }
+      
+      countEl.textContent = String(jobs.length);
+      listEl.innerHTML = "";
+      if (dialogListEl) dialogListEl.innerHTML = "";
+      
+      for (const job of jobs) {
+        const el = document.createElement("div");
+        el.className = "transfer-item";
+        
+        const filename = job.direction === "upload" 
+          ? job.local_path.split(/[\\/]/).pop() 
+          : job.remote_path.split(/[\\/]/).pop();
+        
+        const header = document.createElement("div");
+        header.className = "transfer-item-header";
+        
+        const title = document.createElement("span");
+        title.className = "transfer-filename";
+        title.textContent = filename || "Unknown";
+        title.title = job.direction === "upload" ? job.local_path : job.remote_path;
+        
+        const status = document.createElement("span");
+        status.className = "transfer-status";
+        status.textContent = job.status === 'running' && job.phase ? `${job.status} (${job.phase})` : job.status;
+        
+        header.appendChild(title);
+        header.appendChild(status);
+        
+        const cancelBtn = document.createElement("button");
+        cancelBtn.className = "transfer-cancel";
+        cancelBtn.textContent = "×";
+        cancelBtn.title = "取消";
+        cancelBtn.onclick = async () => {
+          try {
+            await invoke("mcp_ui_transfer_cancel", { jobId: job.job_id });
+          } catch (e) {
+            showToast(`取消失败: ${e}`);
+          }
+        };
+        if (job.status !== 'succeeded' && job.status !== 'failed' && job.status !== 'cancelled') {
+           el.appendChild(cancelBtn);
+        } else if (job.status === 'failed' || job.status === 'cancelled') {
+           const resumeBtn = document.createElement("button");
+           resumeBtn.className = "transfer-cancel";
+           resumeBtn.textContent = "↻";
+           resumeBtn.title = "断点续传";
+           resumeBtn.style.color = "#1890ff";
+           resumeBtn.onclick = async () => {
+             try {
+               await invoke("mcp_ui_transfer_start", {
+                 sessionId: job.session_id,
+                 localPath: job.local_path,
+                 remotePath: job.remote_path,
+                 direction: job.direction,
+                 resumeJobId: job.job_id
+               });
+             } catch (e) {
+               showToast(`续传失败: ${e}`);
+             }
+           };
+           el.appendChild(resumeBtn);
+        }
+        
+        const progress = document.createElement("div");
+        progress.className = "transfer-progress-bar";
+        const fill = document.createElement("div");
+        fill.className = "transfer-progress-fill";
+        fill.style.width = (job.percent || 0) + "%";
+        if (job.status === "failed") fill.style.backgroundColor = "#ff4d4f";
+        else if (job.status === "succeeded") fill.style.backgroundColor = "#52c41a";
+        progress.appendChild(fill);
+        
+        const details = document.createElement("div");
+        details.className = "transfer-details";
+        
+        const transferred = job.bytes_transferred || 0;
+        const total = job.bytes_total;
+        const speed = job.bytes_per_sec ? `${formatBytes(job.bytes_per_sec)}/s` : "";
+        
+        let detailText = formatBytes(transferred);
+        if (total) detailText += ` / ${formatBytes(total)}`;
+        if (job.percent) detailText += ` (${job.percent.toFixed(1)}%)`;
+        
+        const speedEl = document.createElement("span");
+        speedEl.textContent = speed;
+        
+        const bytesEl = document.createElement("span");
+        bytesEl.textContent = detailText;
+        if (job.error) {
+           bytesEl.textContent = job.error;
+           bytesEl.style.color = "#ff4d4f";
+           bytesEl.title = job.error;
+        }
+
+        const metaEl = document.createElement("div");
+        metaEl.style.fontSize = "11px";
+        metaEl.style.color = "var(--text-color, #999)";
+        metaEl.style.marginTop = "2px";
+        const startStr = job.started_unix_ms ? new Date(job.started_unix_ms).toLocaleString() : '-';
+        const endStr = job.finished_unix_ms ? new Date(job.finished_unix_ms).toLocaleString() : '-';
+        const sv = sessions.get(job.session_id);
+        const sessionName = sv ? sv.title : job.session_id.substring(0,8);
+        metaEl.textContent = `ID: ${job.job_id.substring(0,8)} | 会话: ${sessionName} | 开始: ${startStr} | 结束: ${endStr}`;
+
+        const warningSpan = document.createElement("span");
+        let installBtn: HTMLButtonElement | null = null;
+        if (job.warnings && job.warnings.some((w: string) => w.includes("rsync unavailable"))) {
+           warningSpan.textContent = "⚠️ 已降级(SCP)";
+           warningSpan.title = "服务器未安装rsync，将使用基础scp协议(不支持续传且速度较慢)";
+           warningSpan.style.color = "#faad14";
+           warningSpan.style.marginLeft = "4px";
+           warningSpan.style.fontSize = "11px";
+           
+           installBtn = document.createElement("button");
+           installBtn.textContent = "安装 Rsync";
+           installBtn.style.marginLeft = "6px";
+           installBtn.style.fontSize = "10px";
+           installBtn.style.padding = "0 4px";
+           installBtn.style.cursor = "pointer";
+           installBtn.onclick = async () => {
+             try {
+               await invoke("submit_line", {
+                 sessionId: job.session_id,
+                 line: "if command -v apt-get >/dev/null; then sudo apt-get update && sudo apt-get install -y rsync; elif command -v yum >/dev/null; then sudo yum install -y rsync; elif command -v apk >/dev/null; then sudo apk add rsync; else echo 'Please install rsync manually.'; fi"
+               });
+               showToast("已向终端发送安装命令");
+               const dlg = $("dlg-transfer-manager") as HTMLDialogElement;
+               if (dlg?.open) dlg.close();
+               activate(job.session_id);
+             } catch(e) {
+               showToast("发送安装命令失败: " + String(e));
+             }
+           };
+        }
+        
+        details.appendChild(speedEl);
+        details.appendChild(bytesEl);
+        if (warningSpan.textContent) {
+           details.appendChild(warningSpan);
+           if (installBtn) details.appendChild(installBtn);
+        }
+        details.appendChild(metaEl);
+        
+        el.appendChild(header);
+        el.appendChild(progress);
+        el.appendChild(details);
+        
+        listEl.appendChild(el);
+        if (dialogListEl) {
+           const clonedEl = el.cloneNode(true) as HTMLElement;
+           dialogListEl.appendChild(clonedEl);
+           
+           const btns = clonedEl.querySelectorAll<HTMLButtonElement>(".transfer-cancel");
+           btns.forEach(btn => {
+             if (btn.textContent === "×") {
+               btn.onclick = cancelBtn.onclick;
+             } else if (btn.textContent === "↻") {
+               btn.onclick = async () => {
+                 try {
+                   await invoke("mcp_ui_transfer_start", {
+                     sessionId: job.session_id,
+                     localPath: job.local_path,
+                     remotePath: job.remote_path,
+                     direction: job.direction,
+                     resumeJobId: job.job_id
+                   });
+                 } catch (e) {
+                   showToast(`续传失败: ${e}`);
+                 }
+               };
+             }
+           });
+        }
+      }
+    } catch (e) {
+    }
+  }, 1000);
+}
 
 interface SshCheckResult {
   available: boolean;

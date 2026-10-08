@@ -18,6 +18,7 @@ mod stdio_bridge;
 mod tools;
 mod transfer;
 mod transfer_util;
+mod sftp;
 
 pub use config::McpConfig;
 pub use transfer::JobRegistry;
@@ -419,4 +420,75 @@ pub async fn mcp_apply(
 
     let guard = state.mcp.lock().map_err(|e| e.to_string())?;
     Ok(status_from_runtime(&guard))
+}
+
+#[tauri::command]
+pub async fn mcp_ui_transfer_start(
+    _app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    local_path: String,
+    remote_path: String,
+    direction: String, // "upload" or "download"
+    resume_job_id: Option<String>,
+    cleanup_on_fail: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let (rt, cfg, registry) = {
+        let rt = state.get_runtime(&session_id)
+            .map_err(|_| format!("session not found: {session_id}"))?;
+        let st = state.mcp.lock().map_err(|e| e.to_string())?;
+        (rt, st.config.clone(), st.transfer_jobs.clone())
+    };
+
+    let args = transfer::FileTransferArgs {
+        remote_path: &remote_path,
+        content: None,
+        encoding: None,
+        local_path: Some(&local_path),
+        create_dirs: true,
+        overwrite: true,
+        timeout_secs: None,
+        max_bytes: None,
+        async_mode: Some(true),
+        verify: transfer::VerifyMode::None,
+        cleanup_on_fail: cleanup_on_fail.unwrap_or(true),
+        recursive: false,
+        prefer_rsync: None,
+        resume_job_id: resume_job_id.as_deref(),
+    };
+
+    if direction == "upload" {
+        transfer::session_file_upload(rt, &cfg, &registry, args)
+            .await
+            .map_err(|e| e.message.clone())
+    } else {
+        transfer::session_file_download(rt, &cfg, &registry, args)
+            .await
+            .map_err(|e| e.message.clone())
+    }
+}
+
+#[tauri::command]
+pub fn mcp_ui_transfer_list(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+) -> Result<Vec<transfer::TransferJobSnapshot>, String> {
+    let st = state.mcp.lock().map_err(|e| e.to_string())?;
+    Ok(st.transfer_jobs.list(session_id.as_deref()))
+}
+
+#[tauri::command]
+pub fn mcp_ui_transfer_cancel(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> Result<transfer::TransferJobSnapshot, String> {
+    let st = state.mcp.lock().map_err(|e| e.to_string())?;
+    st.transfer_jobs.cancel(&job_id).map_err(|e| e.message.clone())
+}
+
+#[tauri::command]
+pub fn mcp_ui_transfer_clear_done(state: State<'_, AppState>) -> Result<(), String> {
+    let st = state.mcp.lock().map_err(|e| e.to_string())?;
+    st.transfer_jobs.clear_done();
+    Ok(())
 }

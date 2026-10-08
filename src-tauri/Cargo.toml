@@ -41,3 +41,5 @@ hex = "0.4"
 data-encoding = "2"
 # Native open/save dialogs (export path picker).
 rfd = "0.15"
+russh-sftp = "3.0.1"
+tauri-plugin-dialog = "2.8.1"
