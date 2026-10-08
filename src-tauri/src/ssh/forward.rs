@@ -780,7 +780,7 @@ fn forward_failure_is_permanent(msg: &str) -> bool {
         || l.contains("administratively prohibited")
 }
 
-async fn start_port_forward_inner(
+pub(crate) async fn start_port_forward_inner(
     app: &AppHandle,
     state: &AppState,
     req: StartPortForwardRequest,

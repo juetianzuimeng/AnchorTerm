@@ -285,6 +285,71 @@ pub fn tools_list_payload() -> Value {
                         }
                     }
                 }
+            },
+            {
+                "name": "session_forward_list",
+                "description": "查询该会话所有的内网端口转发状态列表。请优先直接使用已经存在的端口转发记录。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "会话 UUID；可省略则使用默认会话"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "session_forward_start",
+                "description": "在该会话中发起内网端口转发（如本地转发 -L，远程转发 -R）。支持通过内网跳转访问数据库或中间件。注意：如果需要临时访问内网资源，请在访问完成后使用 session_forward_stop 停止并删除你创建的转发。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "会话 UUID；可省略则使用默认会话"
+                        },
+                        "kind": {
+                            "type": "string",
+                            "description": "转发类型：'local'（本地转发 -L）或 'remote'（远程转发 -R），默认为 'local'"
+                        },
+                        "listen_port": {
+                            "type": "number",
+                            "description": "监听端口号（如 3306 或 8080）"
+                        },
+                        "dest_host": {
+                            "type": "string",
+                            "description": "目标主机地址（默认 127.0.0.1）"
+                        },
+                        "dest_port": {
+                            "type": "number",
+                            "description": "目标端口号"
+                        },
+                        "bind_address": {
+                            "type": "string",
+                            "description": "绑定地址，默认为 127.0.0.1"
+                        }
+                    },
+                    "required": ["listen_port", "dest_port"]
+                }
+            },
+            {
+                "name": "session_forward_stop",
+                "description": "停止并移除一个指定的内网端口转发规则。重要警告：你只允许删除你自己刚刚创建的临时端口转发，绝对禁止删除之前就已经存在的端口转发记录。",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "会话 UUID；可省略则使用默认会话"
+                        },
+                        "forward_id": {
+                            "type": "string",
+                            "description": "通过 session_forward_list 获取的端口转发规则的 ID"
+                        }
+                    },
+                    "required": ["forward_id"]
+                }
             }
         ]
     })
@@ -310,6 +375,9 @@ pub async fn call_tool(
         "session_file_transfer_pause" => tool_session_file_transfer_pause(app, arguments),
         "session_file_transfer_resume" => tool_session_file_transfer_resume(app, arguments),
         "session_file_transfer_list" => tool_session_file_transfer_list(app, arguments),
+        "session_forward_list" => tool_session_forward_list(app, cfg, arguments),
+        "session_forward_start" => tool_session_forward_start(app, cfg, arguments).await,
+        "session_forward_stop" => tool_session_forward_stop(app, cfg, arguments).await,
         other => Err(ToolError::invalid(format!("unknown tool: {other}"))),
     };
     let ms = t0.elapsed().as_millis();
@@ -663,4 +731,84 @@ pub fn tool_result_mcp_content(value: &Value, is_error: bool) -> Value {
         ],
         "isError": is_error
     })
+}
+
+fn tool_session_forward_list(
+    app: &AppHandle,
+    cfg: &McpConfig,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    let sid = resolve_session_id(arg_str(arguments, "session_id"), cfg)?;
+    check_session_allowed(&sid, cfg)?;
+    let st = state(app)?;
+    let rt = st
+        .get_runtime(&sid)
+        .map_err(|_| ToolError::not_found(format!("session not found: {sid}")))?;
+    
+    let forwards = rt.local_forwards.snapshot();
+    Ok(json!({
+        "session_id": sid,
+        "forwards": forwards,
+    }))
+}
+
+async fn tool_session_forward_start(
+    app: &AppHandle,
+    cfg: &McpConfig,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    let sid = resolve_session_id(arg_str(arguments, "session_id"), cfg)?;
+    check_session_allowed(&sid, cfg)?;
+    
+    let kind_str = arg_str(arguments, "kind").unwrap_or("local");
+    let kind = if kind_str.eq_ignore_ascii_case("remote") {
+        crate::ssh::forward::ForwardKind::Remote
+    } else {
+        crate::ssh::forward::ForwardKind::Local
+    };
+    
+    let listen_port = arg_u64(arguments, "listen_port")
+        .ok_or_else(|| ToolError::invalid("listen_port is required"))? as u16;
+    let dest_host = arg_str(arguments, "dest_host")
+        .unwrap_or("127.0.0.1")
+        .to_string();
+    let dest_port = arg_u64(arguments, "dest_port")
+        .ok_or_else(|| ToolError::invalid("dest_port is required"))? as u16;
+    let bind_address = arg_str(arguments, "bind_address").map(|s| s.to_string());
+
+    let req = crate::ssh::forward::StartPortForwardRequest {
+        session_id: sid.clone(),
+        kind,
+        listen_port,
+        dest_host,
+        dest_port,
+        bind_address,
+    };
+
+    let st = state(app)?;
+    let info = crate::ssh::forward::start_port_forward_inner(app, &st, req)
+        .await
+        .map_err(|e| ToolError::internal(e.to_string()))?;
+        
+    Ok(json!(info))
+}
+
+async fn tool_session_forward_stop(
+    app: &AppHandle,
+    cfg: &McpConfig,
+    arguments: &Value,
+) -> Result<Value, ToolError> {
+    let sid = resolve_session_id(arg_str(arguments, "session_id"), cfg)?;
+    check_session_allowed(&sid, cfg)?;
+    let forward_id = arg_str(arguments, "forward_id")
+        .ok_or_else(|| ToolError::invalid("forward_id is required"))?;
+
+    let st = state(app)?;
+    let sid = sid.to_string();
+    let f_id = forward_id.to_string();
+    crate::ssh::forward::stop_local_forward(app.clone(), st.clone(), sid, f_id)
+        .await
+        .map_err(|e| ToolError::internal(e.to_string()))?;
+
+    Ok(json!({ "success": true }))
 }
