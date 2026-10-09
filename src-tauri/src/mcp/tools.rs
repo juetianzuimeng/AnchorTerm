@@ -353,7 +353,7 @@ pub fn tools_list_payload() -> Value {
             },
             {
                 "name": "session_deploy_tool",
-                "description": "一键将内部运维工具部署到远端主机会话中（专供不支持 MCP Resources 的 AI 客户端使用）。内置工具包括：at-mysql（MySQL 诊断）、at-redis（Redis 诊断）、spring-connection（Spring 凭据提取）。部署成功后返回远端绝对路径。",
+                "description": "一键将内部运维工具部署到远端主机会话中（专供不支持 MCP Resources 的 AI 客户端使用）。内置工具包括：at-mysql（MySQL 诊断）、at-redis（Redis 诊断）、spring-connection（Spring 凭据提取）。部署是默认后台异步执行的，将立刻返回 job_id，你必须使用 session_file_transfer_status 工具轮询该 job_id 直至其状态变为 succeeded（此时系统已赋予执行权限），然后才能继续调用该部署好的工具。",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -372,6 +372,10 @@ pub fn tools_list_payload() -> Value {
                         "remote_dir": {
                             "type": "string",
                             "description": "远端保存的目录（强烈建议使用 /tmp 等临时目录隔离）"
+                        },
+                        "async": {
+                            "type": "boolean",
+                            "description": "（可选）默认 true。是否后台异步部署，避免超时。此时将返回 job_id，你需要轮询 session_file_transfer_status 直至 succeeded，系统会自动赋予可执行权限。设为 false 则是同步等待。"
                         }
                     },
                     "required": ["tool_name", "arch", "remote_dir"]
@@ -872,6 +876,8 @@ async fn tool_session_deploy_tool(
         .map_err(|_| ToolError::not_found(format!("session not found: {sid}")))?;
     let registry = transfer_jobs(app)?;
 
+    let async_mode = arguments.get("async").and_then(|v| v.as_bool()).unwrap_or(true);
+
     let transfer_res = transfer::session_file_upload(
         rt.clone(),
         cfg,
@@ -885,7 +891,7 @@ async fn tool_session_deploy_tool(
             overwrite: true,
             timeout_secs: Some(120),
             max_bytes: None,
-            async_mode: Some(false),
+            async_mode: Some(async_mode),
             verify: transfer::VerifyMode::Size,
             cleanup_on_fail: true,
             recursive: false,
@@ -894,13 +900,49 @@ async fn tool_session_deploy_tool(
         },
     ).await?;
     
-    // Grant execute permissions
-    session_exec(&rt, cfg, &format!("chmod +x {}", remote_path), None, Some(10)).await?;
-    
-    Ok(json!({
-        "success": true,
-        "message": format!("工具 {} 已经成功部署并赋予可执行权限", tool_name),
-        "remote_path": remote_path,
-        "transfer_info": transfer_res
-    }))
+    if async_mode {
+        let job_id = transfer_res.get("job_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !job_id.is_empty() {
+            let rt_clone = rt.clone();
+            let cfg_clone = cfg.clone();
+            let rp_clone = remote_path.clone();
+            let reg_clone = registry.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let status_opt = reg_clone.get(&job_id).map(|job| {
+                        let st = job.state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.status
+                    });
+
+                    if let Some(status) = status_opt {
+                        if status == transfer::TransferJobStatus::Succeeded {
+                            let _ = session_exec(&rt_clone, &cfg_clone, &format!("chmod +x {}", rp_clone), None, Some(10)).await;
+                            break;
+                        } else if matches!(status, transfer::TransferJobStatus::Failed | transfer::TransferJobStatus::Cancelled) {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            });
+        }
+        return Ok(json!({
+            "success": true,
+            "message": format!("工具 {} 异步部署已启动，请轮询 job_id 确认进度", tool_name),
+            "remote_path": remote_path,
+            "transfer_info": transfer_res
+        }));
+    } else {
+        // Grant execute permissions synchronously
+        session_exec(&rt, cfg, &format!("chmod +x {}", remote_path), None, Some(10)).await?;
+        
+        return Ok(json!({
+            "success": true,
+            "message": format!("工具 {} 已经成功部署并赋予可执行权限", tool_name),
+            "remote_path": remote_path,
+            "transfer_info": transfer_res
+        }));
+    }
 }

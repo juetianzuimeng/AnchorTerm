@@ -207,7 +207,7 @@ pub struct TransferJob {
 }
 
 pub struct TransferJobState {
-    status: TransferJobStatus,
+    pub status: TransferJobStatus,
     phase: Option<String>,
     bytes_total: Option<u64>,
     bytes_transferred: Option<u64>,
@@ -306,7 +306,7 @@ impl JobRegistry {
         Self::gc_locked(&mut g);
     }
 
-    fn get(&self, id: &str) -> Option<Arc<TransferJob>> {
+    pub fn get(&self, id: &str) -> Option<Arc<TransferJob>> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.get(id).cloned()
     }
@@ -2202,16 +2202,22 @@ fn spawn_path_job(
             st.updated_unix_ms = Some(now_unix_ms());
         }
 
-        let _guard = match begin_inflight(&rt) {
-            Ok(g) => g,
-            Err(e) => {
+        let _guard = loop {
+            if job_run.cancel.load(Ordering::SeqCst) {
                 let mut st = job_run.state.lock().unwrap_or_else(|e| e.into_inner());
-                st.status = TransferJobStatus::Failed;
-                st.phase = Some("failed".into());
-                st.error = Some(e.message);
+                st.status = TransferJobStatus::Cancelled;
+                st.phase = Some("cancelled".into());
                 st.finished_unix_ms = Some(now_unix_ms());
                 st.updated_unix_ms = Some(now_unix_ms());
+                st.error = Some("cancelled".into());
+                st.cleaned_up = Some(true);
                 return;
+            }
+            match begin_inflight(&rt) {
+                Ok(g) => break g,
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
             }
         };
 
